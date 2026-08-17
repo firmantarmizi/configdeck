@@ -1,0 +1,48 @@
+{% extends "app_base.html" %}
+{% block title %}Apps · ConfigDeck{% endblock %}
+{% block content %}
+<div class="page-heading catalog-heading">
+  <div><p class="eyebrow">Configurations</p><h1>Apps</h1><p class="lead">All apps and environments available to your role.</p></div>
+  {% if can_manage %}<details class="catalog-create">
+    <summary class="button-link"><svg class="icon" aria-hidden="true"><use href="#icon-plus"></use></svg>Create app</summary>
+    <div class="panel catalog-create-panel"><div class="card-heading"><div><h2>New app</h2><p class="muted">Development, Staging, and Production are created automatically.</p></div></div>
+      <form method="post" action="/services" class="metadata-form catalog-create-form">
+        <input type="hidden" name="csrf_token" value="{{ chrome.csrf_token }}">
+        <label>App name<input name="name" maxlength="100" placeholder="Membership API" required></label>
+        <label>Description <span class="field-hint">Optional</span><input name="description" maxlength="1000" placeholder="What this app owns"></label>
+        <button type="submit"><svg class="icon" aria-hidden="true"><use href="#icon-plus"></use></svg>Create app</button>
+      </form>
+    </div>
+  </details>{% endif %}
+</div>
+
+{% if !services.is_empty() %}<section class="catalog-toolbar" aria-label="App catalog controls">
+  <label class="catalog-search"><span class="sr-only">Search apps</span><svg class="icon" aria-hidden="true"><use href="#icon-search"></use></svg><input type="search" placeholder="Search apps" autocomplete="off" data-service-search></label>
+  <label class="catalog-sort"><span class="sr-only">Sort apps</span><svg class="icon" aria-hidden="true"><use href="#icon-sort"></use></svg><select data-service-sort><option value="updated">Recently updated</option><option value="name-asc">Name A–Z</option><option value="name-desc">Name Z–A</option><option value="environments">Most environments</option></select></label>
+  <div class="view-toggle" role="group" aria-label="App view">
+    <button type="button" class="view-toggle-button" data-service-view="grid" aria-pressed="true" title="Grid view"><svg class="icon" aria-hidden="true"><use href="#icon-grid"></use></svg><span class="sr-only">Grid view</span></button>
+    <button type="button" class="view-toggle-button" data-service-view="list" aria-pressed="false" title="List view"><svg class="icon" aria-hidden="true"><use href="#icon-list"></use></svg><span class="sr-only">List view</span></button>
+  </div>
+  <p class="catalog-count" data-service-count aria-live="polite"></p>
+</section>{% endif %}
+
+<section class="service-catalog" data-service-catalog data-view="grid">
+{% for service in services %}
+  <article class="service-card resource-card{% if service.archived_at.is_some() %} archived{% endif %}" data-service-card data-service-name="{{ service.name }}" data-service-description="{% match service.description %}{% when Some with (description) %}{{ description }}{% when None %}{% endmatch %}" data-service-updated="{{ service.updated_at }}" data-service-environments="{{ service.environment_count }}" data-service-archived="{% if service.archived_at.is_some() %}1{% else %}0{% endif %}">
+    <div class="resource-card-header">
+      <div class="resource-identity"><div><h2><a class="card-primary-link" href="/services/{{ service.id }}/environments">{{ service.name }}</a></h2><p class="resource-meta">App configuration</p></div></div>
+      <div class="resource-card-tools">{% if service.archived_at.is_some() %}<span class="status-badge">Archived</span>{% else %}<span class="status-badge status-active">Active</span>{% endif %}
+      {% if can_manage %}<a class="icon-button card-tool" href="/services/{{ service.id }}/access" aria-label="Manage access for {{ service.name }}" title="Manage access"><svg class="icon" aria-hidden="true"><use href="#icon-users"></use></svg></a>
+      <details class="card-tool-popover"><summary class="icon-button card-tool" aria-label="Edit {{ service.name }}" title="Edit app"><svg class="icon" aria-hidden="true"><use href="#icon-edit"></use></svg></summary><div class="panel card-tool-panel"><h3>Edit app</h3><form method="post" action="/services/{{ service.id }}/update" class="stack"><input type="hidden" name="csrf_token" value="{{ chrome.csrf_token }}"><label>Name<input name="name" value="{{ service.name }}" maxlength="100" required></label><label>Description<input name="description" maxlength="1000" value="{% match service.description %}{% when Some with (description) %}{{ description }}{% when None %}{% endmatch %}"></label><button type="submit">Save changes</button></form></div></details>
+      {% if service.archived_at.is_some() %}<form method="post" action="/services/{{ service.id }}/restore" class="card-tool-form"><input type="hidden" name="csrf_token" value="{{ chrome.csrf_token }}"><button type="submit" class="icon-button card-tool" aria-label="Restore {{ service.name }}" title="Restore app"><svg class="icon" aria-hidden="true"><use href="#icon-check"></use></svg></button></form>{% else %}<details class="card-tool-popover"><summary class="icon-button card-tool danger-tool" aria-label="Archive {{ service.name }}" title="Archive app"><svg class="icon" aria-hidden="true"><use href="#icon-trash"></use></svg></summary><div class="panel card-tool-panel compact-confirm"><strong>Archive {{ service.name }}?</strong><p>The app and its configuration history remain available for restore.</p><form method="post" action="/services/{{ service.id }}/archive"><input type="hidden" name="csrf_token" value="{{ chrome.csrf_token }}"><button type="submit" class="danger"><svg class="icon" aria-hidden="true"><use href="#icon-trash"></use></svg>Archive app</button></form></div></details>{% endif %}{% endif %}</div>
+    </div>
+    {% match service.description %}{% when Some with (description) %}<p class="card-description">{{ description }}</p>{% when None %}<p class="card-description muted">No description provided.</p>{% endmatch %}
+    <div class="service-metrics">
+      <div><svg class="icon" aria-hidden="true"><use href="#icon-users"></use></svg><span><strong>{{ service.contributor_count }}</strong><small>Contributors</small></span></div>
+      <div><svg class="icon" aria-hidden="true"><use href="#icon-layers"></use></svg><span><strong>{{ service.environment_count }}</strong><small>Environments</small></span></div>
+    </div>
+  </article>
+{% endfor %}
+{% if services.is_empty() %}<div class="empty-state full-span"><span class="empty-icon"><svg class="icon" aria-hidden="true"><use href="#icon-plus"></use></svg></span><div><strong>No apps yet</strong><p>Create your first app. Its three standard environments will be ready immediately.</p></div></div>{% else %}<div class="empty-state full-span catalog-empty" data-service-empty hidden><span class="empty-icon"><svg class="icon" aria-hidden="true"><use href="#icon-search"></use></svg></span><div><strong>No matching apps</strong><p>Try another search term.</p></div></div>{% endif %}
+</section>
+{% endblock %}

@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Restricted value · ConfigDeck</title>
+  <meta name="color-scheme" content="light dark">
+  <link rel="icon" type="image/svg+xml" href="/static/configdeck-logo.svg">
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/theme.js"></script>
+</head>
+<body class="auth-body">
+  <main class="auth-card">
+    <p class="eyebrow">Restricted value</p>
+    <h1>{{ key }}</h1>
+    {% match version %}{% when Some with (number) %}<p>Version {{ number }}</p>{% when None %}{% endmatch %}
+    <code class="secret break">{{ value }}</code>
+    <p class="notice">This value is sensitive. Close this page when finished.</p>
+    <p><a href="/services">Return to apps</a></p>
+  </main>
+</body>
+</html>

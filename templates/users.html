@@ -1,0 +1,31 @@
+{% extends "app_base.html" %}
+{% block title %}Users & Access · ConfigDeck{% endblock %}
+{% block content %}
+<div class="hero-heading compact-heading"><div><p class="eyebrow">Administration</p><h1>Users &amp; Access</h1><p class="lead">Create accounts, maintain roles, and revoke access without leaving stale sessions active.</p></div></div>
+
+<div class="notice security-notice"><strong>Identity checks happen when needed</strong><span>Role, access status, and TOTP changes ask you to confirm your password and TOTP when you submit the action. Verification stays active for five minutes.</span></div>
+
+<details class="panel create-panel">
+  <summary>Create a user</summary>
+  <div class="card-heading"><div><h2>New account</h2><p class="muted">Share the initial password through a separate secure channel. The user must replace it at first sign-in.</p></div></div>
+  <form method="post" action="/users" class="form-grid user-create-form">
+    <input type="hidden" name="csrf_token" value="{{ chrome.csrf_token }}">
+    <label>Email<input name="email" type="email" autocomplete="off" maxlength="320" required></label>
+    <label>Role<select name="role" required><option value="CONTRIBUTOR">Contributor</option><option value="OPERATOR">Operator</option><option value="ADMINISTRATOR">Administrator</option></select></label>
+    <label>Initial password <span class="field-hint">At least 12 characters; stored only as an Argon2id hash.</span><input name="initial_password" type="password" minlength="12" maxlength="1024" autocomplete="new-password" required></label>
+    <div class="form-actions span-two"><button type="submit"><svg class="icon" aria-hidden="true"><use href="#icon-plus"></use></svg>Create user</button></div>
+  </form>
+</details>
+
+<section class="panel-table table-wrap">
+  <table class="user-table"><thead><tr><th>User</th><th>Role</th><th>Access</th><th>Security</th><th>Last sign-in</th><th>Actions</th></tr></thead>
+  <tbody>{% for user in users %}<tr>
+    <td><strong>{{ user.email }}</strong>{% if user.is_self %}<small>You</small>{% else %}<small>Created {{ user.created_at }}</small>{% endif %}</td>
+    <td>{% if !user.is_self %}<form method="post" action="/users/{{ user.id }}/role" class="inline-form role-form"><input type="hidden" name="csrf_token" value="{{ chrome.csrf_token }}"><select name="role" aria-label="Role for {{ user.email }}"><option value="CONTRIBUTOR"{% if user.role == "CONTRIBUTOR" %} selected{% endif %}>Contributor</option><option value="OPERATOR"{% if user.role == "OPERATOR" %} selected{% endif %}>Operator</option><option value="ADMINISTRATOR"{% if user.role == "ADMINISTRATOR" %} selected{% endif %}>Administrator</option></select><button class="secondary compact-button" type="submit">Save</button></form>{% else %}<span class="badge">{{ user.role }}</span>{% endif %}</td>
+    <td>{% if user.active %}<span class="status-badge status-active">Active</span>{% else %}<span class="status-badge">Inactive</span>{% endif %}{% if user.must_change_password %}<small>Initial password pending</small>{% endif %}</td>
+    <td>{% if user.totp_enabled %}<span class="status-badge status-active">TOTP enabled</span>{% else %}<span class="status-badge">TOTP not enrolled</span>{% endif %}</td>
+    <td>{% match user.last_login_at %}{% when Some with (last_login) %}{{ last_login }}{% when None %}<span class="muted">Never</span>{% endmatch %}</td>
+    <td>{% if !user.is_self %}<div class="user-actions"><form method="post" action="/users/{{ user.id }}/active" class="inline-form"><input type="hidden" name="csrf_token" value="{{ chrome.csrf_token }}"><input type="hidden" name="active" value="{% if user.active %}false{% else %}true{% endif %}"><button type="submit" class="compact-button {% if user.active %}ghost{% else %}secondary{% endif %}">{% if user.active %}Deactivate{% else %}Activate{% endif %}</button></form>{% if user.totp_enabled %}<form method="post" action="/users/{{ user.id }}/totp-reset" class="inline-form"><input type="hidden" name="csrf_token" value="{{ chrome.csrf_token }}"><button type="submit" class="secondary compact-button">Reset TOTP</button></form>{% endif %}</div>{% else %}<span class="muted">Managed by another admin</span>{% endif %}</td>
+  </tr>{% endfor %}</tbody></table>
+</section>
+{% endblock %}

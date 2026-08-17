@@ -1,0 +1,50 @@
+services:
+  configdeck:
+    build: .
+    restart: unless-stopped
+    environment:
+      CONFIGDECK_ENV: production
+      CONFIGDECK_BIND: 0.0.0.0:3000
+      CONFIGDECK_DATABASE_URL: sqlite:///data/configdeck.db
+      CONFIGDECK_ADMIN_EMAIL: ${CONFIGDECK_ADMIN_EMAIL:-}
+      CONFIGDECK_ADMIN_PASSWORD: ${CONFIGDECK_ADMIN_PASSWORD:-}
+      CONFIGDECK_DB_MAX_CONNECTIONS: ${CONFIGDECK_DB_MAX_CONNECTIONS:-5}
+      CONFIGDECK_TRUSTED_PROXIES: ${CONFIGDECK_TRUSTED_PROXIES:-}
+      RUST_LOG: ${RUST_LOG:-configdeck=info,tower_http=info}
+    ports:
+      - "127.0.0.1:${CONFIGDECK_PORT:-3000}:3000"
+    volumes:
+      - configdeck_data:/data
+      - configdeck_backup:/backup
+    secrets:
+      - configdeck_master_key
+    read_only: true
+    pids_limit: 128
+    mem_limit: 256m
+    cpus: 0.50
+    stop_grace_period: 20s
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/configdeck", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  configdeck_data:
+  configdeck_backup:
+
+secrets:
+  configdeck_master_key:
+    file: ./secrets/configdeck_master_key

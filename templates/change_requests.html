@@ -1,0 +1,12 @@
+{% extends "app_base.html" %}
+{% block title %}Changes · ConfigDeck{% endblock %}
+{% block content %}
+<div class="page-heading"><div><p class="eyebrow">Workflow</p><h1>Changes</h1><p class="lead">Review proposed configuration work, prepare the resulting .env, and record what has been deployed.</p></div></div>
+{% for group in groups %}<section class="panel stack change-group">
+  <div class="card-heading"><div><p class="eyebrow">Environment</p><h2><a href="/environments/{{ group.environment_id }}/variables">{{ group.service_name }} / {{ group.environment_name }}</a></h2></div>{% if can_review %}{% if chrome.recent_active %}<span class="muted">Select compatible ready requests below</span>{% else %}<a href="/auth/recent?return_to=/change-requests">Verify to preview changes</a>{% endif %}{% endif %}</div>
+  {% if can_review && chrome.recent_active %}<form method="post" action="/change-requests/preview" class="stack"><input type="hidden" name="csrf_token" value="{{ chrome.csrf_token }}">{% endif %}
+  <div class="table-wrap"><table><thead><tr>{% if can_review && chrome.recent_active %}<th>Select</th>{% endif %}<th>Request</th><th>Status</th><th>Items</th><th>Requested</th></tr></thead><tbody>{% for request in group.requests %}<tr>{% if can_review && chrome.recent_active %}<td>{% if request.status == "READY_TO_APPLY" %}<input type="checkbox" name="request_{{ request.id }}" value="{{ request.id }}" aria-label="Select request">{% else %}<span class="muted">—</span>{% endif %}</td>{% endif %}<td><a class="row-title" href="/change-requests/{{ request.id }}">{% match request.title %}{% when Some with (title) %}{{ title }}{% when None %}{{ request.reason }}{% endmatch %}</a><small>{{ request.reason }}</small></td><td><span class="status-badge status-{{ request.status|lower }}">{{ request.status }}</span></td><td>{{ request.item_count }}</td><td>{{ request.requested_at }}</td></tr>{% endfor %}</tbody></table></div>
+  {% if can_review && chrome.recent_active %}<div class="action-row"><button type="submit">Preview selected changes</button><span class="muted">Overlapping keys are rejected.</span></div></form>{% endif %}
+</section>{% endfor %}
+{% if groups.is_empty() %}<div class="friendly-empty panel"><span class="empty-icon">⇄</span><div><strong>No change requests yet</strong><p>Open an environment and request a change from a variable row or use the multi-variable builder.</p></div></div>{% endif %}
+{% endblock %}

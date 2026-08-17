@@ -1,0 +1,54 @@
+{% extends "app_base.html" %}
+{% block title %}Maintenance · ConfigDeck{% endblock %}
+{% block content %}
+<div class="page-heading">
+  <div><p class="eyebrow">Operations</p><h1>Maintenance</h1><p class="lead">Create verified backups, prepare offline recovery, and rotate encryption keys safely.</p></div>
+</div>
+
+{% match restore_intent %}{% when Some with (intent) %}
+<section class="panel restore-intent-panel">
+  <div class="card-heading"><div><p class="eyebrow">Active restore intent</p><h2>{{ intent.backup_identifier }}</h2></div><span class="status-badge status-warning">Container stop required</span></div>
+  <p>{{ intent.reason }}</p>
+  <dl class="metadata-list"><div><dt>Requested</dt><dd>{{ intent.requested_at }}</dd></div><div><dt>Snapshot size</dt><dd>{{ intent.backup_size_bytes }} bytes</dd></div><div><dt>SHA-256</dt><dd><code>{{ intent.backup_sha256 }}</code></dd></div></dl>
+  <div class="notice danger-notice"><div><strong>ConfigDeck will not replace the live database.</strong><span>Stop the container and follow the offline restore runbook. The marker is removed only after the restored database passes startup validation and the RESTORE_BACKUP audit event is committed.</span></div></div>
+  <ol class="runbook-steps"><li>Stop the ConfigDeck container.</li><li>Preserve the current database as a safety copy.</li><li>Verify the selected backup checksum, then atomically replace the database file while ConfigDeck is stopped.</li><li>Keep the matching master key mounted and start ConfigDeck.</li><li>Confirm readiness and the RESTORE_BACKUP event in Audit log.</li></ol>
+</section>
+{% when None %}{% endmatch %}
+
+<div class="maintenance-grid">
+  <section class="panel">
+    <div class="card-heading"><div><h2>Database snapshots</h2><p>Snapshots are written only to the configured backup volume using SQLite VACUUM INTO.</p></div>
+    <form method="post" action="/maintenance/backups"><input type="hidden" name="csrf_token" value="{{ chrome.csrf_token }}"><button type="submit" class="button-link"><svg class="icon" aria-hidden="true"><use href="#icon-download"></use></svg>Create backup</button></form></div>
+    {% if backups.is_empty() %}<div class="friendly-empty"><span class="empty-icon" aria-hidden="true">+</span><div><strong>No backups yet</strong><p>Create the first verified snapshot before making production changes.</p></div></div>
+    {% else %}<div class="backup-list">{% for backup in backups %}<article class="backup-row"><div><strong>{{ backup.identifier }}</strong><small>{{ backup.created_display }} · {{ backup.size_bytes }} bytes</small></div>{% match backup.sha256 %}{% when Some with (checksum) %}<code>{{ checksum }}</code>{% when None %}{% endmatch %}</article>{% endfor %}</div>{% endif %}
+  </section>
+
+  <section class="panel">
+    <div class="card-heading"><div><h2>Prepare offline restore</h2><p>This creates a durable intent marker; it does not modify the live database.</p></div></div>
+    {% match restore_intent %}{% when Some with (_) %}<div class="notice"><div><strong>An intent is already active</strong><span>Complete or recover the current offline procedure before creating another intent.</span></div></div>{% when None %}
+    {% if backups.is_empty() %}<p class="muted">Create a valid backup before preparing a restore.</p>{% else %}<form method="post" action="/maintenance/restore-intent" class="stack"><input type="hidden" name="csrf_token" value="{{ chrome.csrf_token }}"><label>Backup<select name="backup_identifier" required>{% for backup in backups %}<option value="{{ backup.identifier }}">{{ backup.identifier }}</option>{% endfor %}</select></label><label>Reason <span class="field-hint">Do not include credentials or configuration values.</span><textarea name="reason" maxlength="1000" required placeholder="Why is this restore necessary?"></textarea></label><button type="submit" class="danger"><svg class="icon" aria-hidden="true"><use href="#icon-upload"></use></svg>Create restore intent</button></form>{% endif %}{% endmatch %}
+  </section>
+</div>
+
+<section class="panel rotation-panel">
+  <div class="card-heading"><div><p class="eyebrow">Encryption maintenance</p><h2>Key rotation</h2><p>KEK rotation re-wraps environment keys and re-encrypts TOTP seeds. DEK rotation re-encrypts every current, historical, and proposed value for one environment.</p></div><span class="status-badge">Active KEK v{{ rotations.active_kek_version }}</span></div>
+  <div class="rotation-grid">
+    <div class="rotation-action">
+      <h3>Rotate master key (KEK)</h3>
+      {% if rotations.kek_rotation_ready %}
+      <div class="notice danger-notice"><div><strong>New and previous keys detected</strong><span>Writes remain paused until the atomic re-wrap succeeds. Keep both secret files mounted until post-rotation verification passes.</span></div></div>
+      <form method="post" action="/maintenance/rotate-kek" class="stack"><input type="hidden" name="csrf_token" value="{{ chrome.csrf_token }}"><label>Reason<textarea name="reason" maxlength="1000" required placeholder="Why is the master key being rotated?"></textarea></label><button type="submit" class="danger"><svg class="icon" aria-hidden="true"><use href="#icon-maintenance"></use></svg>Rotate KEK</button></form>
+      {% else %}
+      <p class="muted">Mount a different new key at the primary secret path and the current key at the previous-key path, then restart ConfigDeck. The action becomes available only after both fingerprints validate.</p>
+      {% if rotations.previous_key_mounted %}<p class="field-hint">A previous key file is mounted, but no pending KEK change is detected. Remove it after confirming the last rotation.</p>{% endif %}
+      {% endif %}
+    </div>
+    <div class="rotation-action">
+      <h3>Rotate an environment key (DEK)</h3>
+      <p class="muted">Run during a maintenance window. ConfigDeck checkpoints batches and can resume an interrupted operation.</p>
+      <div class="dek-list">{% for environment in rotations.environments %}<details><summary><span>{{ environment.app_name }} / {{ environment.environment_name }}</span><span>DEK v{{ environment.active_dek_version }}</span></summary><form method="post" action="/maintenance/environments/{{ environment.id }}/rotate-dek" class="stack"><input type="hidden" name="csrf_token" value="{{ chrome.csrf_token }}"><label>Reason<textarea name="reason" maxlength="1000" required placeholder="Why is this environment key being rotated?"></textarea></label><button type="submit" class="danger">Rotate DEK</button></form></details>{% endfor %}</div>
+    </div>
+  </div>
+  {% if !rotations.operations.is_empty() %}<div class="rotation-history"><h3>Recent rotation operations</h3><div class="table-wrap"><table><thead><tr><th>Type</th><th>Target</th><th>Status</th><th>Progress</th><th>Updated</th></tr></thead><tbody>{% for operation in rotations.operations %}<tr><td>{{ operation.rotation_type }}</td><td>{% match operation.target_name %}{% when Some with (target) %}{{ target }}{% when None %}All environments{% endmatch %}</td><td><span class="status-badge">{{ operation.status }}</span>{% match operation.failure_code %}{% when Some with (code) %}<small class="rotation-issue">Retry available · {{ code }}</small>{% when None %}{% endmatch %}</td><td>{{ operation.processed_records }} / {{ operation.total_records }}</td><td>{{ operation.updated_display }}</td></tr>{% endfor %}</tbody></table></div></div>{% endif %}
+</section>
+{% endblock %}

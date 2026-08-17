@@ -1,0 +1,17 @@
+target
+.git
+.github
+.gitignore
+.dockerignore
+.env
+data
+backup
+secrets
+docs
+README.md
+AGENTS.md
+CONTRIBUTING.md
+ROADMAP.md
+SECURITY.md
+LICENSE
+docker-compose*.yml

@@ -1,0 +1,21 @@
+{% extends "app_base.html" %}
+{% block title %}Resulting configuration · ConfigDeck{% endblock %}
+{% block content %}
+<nav class="breadcrumbs" aria-label="Breadcrumb"><a href="/change-requests">Changes</a><span>/</span><span>Resulting configuration</span></nav>
+<div class="page-heading"><div><p class="eyebrow">Deployment checkpoint</p><h1>{{ environment.service_name }} / {{ environment.name }}</h1><p class="lead">This is the exact configuration that will exist after the selected approved changes.</p></div><span class="status-badge status-ready_to_apply">{{ item_count }} change items</span></div>
+<div class="notice security-notice"><div><strong>Apply this exact content in your deployment platform first</strong><span>Values shown here can include restricted plaintext. Do not save or share this page, and close it when finished.</span></div></div>
+<section class="panel stack">
+  <textarea id="resulting-dotenv" class="dotenv-output" rows="18" readonly spellcheck="false">{{ dotenv }}</textarea>
+  <div class="action-row"><button type="button" data-copy-all="#resulting-dotenv"><svg class="icon" aria-hidden="true"><use href="#icon-copy"></use></svg>Copy resulting .env</button><span class="copy-status" aria-live="polite"></span></div>
+</section>
+<section class="panel stack">
+  <div><p class="eyebrow">Final confirmation</p><h2>Have you applied this exact configuration?</h2><p class="muted">ConfigDeck does not deploy it for you. Confirm only after the external deployment succeeded.</p></div>
+  <form method="post" action="/change-requests/apply" class="stack">
+    <input type="hidden" name="csrf_token" value="{{ chrome.csrf_token }}">
+    <input type="hidden" name="request_ids" value="{{ request_ids }}">
+    <input type="hidden" name="fingerprint" value="{{ fingerprint }}">
+    <label class="confirmation-check"><input type="checkbox" required> I confirm this exact configuration is active in the deployment platform.</label>
+    <div class="action-row"><button type="submit"><svg class="icon" aria-hidden="true"><use href="#icon-check"></use></svg>Mark selected changes as applied</button><a class="button-link secondary" href="/change-requests"><svg class="icon" aria-hidden="true"><use href="#icon-x"></use></svg>Cancel</a></div>
+  </form>
+</section>
+{% endblock %}

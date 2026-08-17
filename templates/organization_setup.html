@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Set up your workspace · ConfigDeck</title>
+  <link rel="icon" type="image/svg+xml" href="/static/configdeck-logo.svg">
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/theme.js"></script>
+  <script src="/static/app.js" defer></script>
+</head>
+<body class="onboarding-body">
+  <main class="onboarding-shell">
+    <section class="onboarding-intro">
+      <a class="auth-brand" href="/dashboard"><img class="brand-logo" src="/static/configdeck-logo.svg" alt=""><span><strong>ConfigDeck</strong><small>Configuration Management Platform</small></span></a>
+      <div><p class="eyebrow">First-time setup</p><h1>Make ConfigDeck yours.</h1><p class="lead">Name this workspace and optionally add your organization logo. You can start managing access after this step.</p></div>
+      <p class="security-footnote">Your organization logo stays inside ConfigDeck. Remote image URLs and uploaded SVG files are not accepted.</p>
+    </section>
+    <section class="onboarding-form panel">
+      <div><p class="eyebrow">Organization</p><h2>Workspace identity</h2><p class="muted">This name appears on the overview and helps users confirm they are in the right workspace.</p></div>
+      <form method="post" action="/setup/organization" enctype="multipart/form-data">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <label>Organization name<input name="organization_name" value="{{ current_name }}" minlength="1" maxlength="100" autocomplete="organization" required autofocus></label>
+        <label>Organization logo <span class="field-hint">Optional PNG or WebP, maximum 256 KiB.</span><input name="logo" type="file" accept="image/png,image/webp" data-logo-input></label>
+        <div class="logo-preview" data-logo-preview-wrap hidden><img data-logo-preview alt="Selected organization logo preview"><span>Local preview</span></div>
+        <button type="submit">Finish workspace setup</button>
+      </form>
+    </section>
+  </main>
+</body>
+</html>

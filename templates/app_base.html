@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>{% block title %}ConfigDeck{% endblock %}</title>
+  <link rel="icon" type="image/svg+xml" href="/static/configdeck-logo.svg">
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/theme.js"></script>
+  <script src="/static/app.js" defer></script>
+</head>
+<body class="app-body">
+  <svg class="icon-sprite" aria-hidden="true" focusable="false">
+    <defs>
+      <symbol id="icon-edit" viewBox="0 0 24 24"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4Z"/></symbol>
+      <symbol id="icon-trash" viewBox="0 0 24 24"><path d="M3 6h18"/><path d="M8 6V4h8v2M19 6l-1 14H6L5 6M10 11v5M14 11v5"/></symbol>
+      <symbol id="icon-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M15 9V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h3"/></symbol>
+      <symbol id="icon-eye" viewBox="0 0 24 24"><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12Z"/><circle cx="12" cy="12" r="2.5"/></symbol>
+      <symbol id="icon-download" viewBox="0 0 24 24"><path d="M12 3v12M7 10l5 5 5-5M4 20h16"/></symbol>
+      <symbol id="icon-upload" viewBox="0 0 24 24"><path d="M12 16V4M7 9l5-5 5 5M4 20h16"/></symbol>
+      <symbol id="icon-file" viewBox="0 0 24 24"><path d="M6 2h8l4 4v16H6Z"/><path d="M14 2v5h5M9 13h6M9 17h6"/></symbol>
+      <symbol id="icon-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+      <symbol id="icon-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
+      <symbol id="icon-x" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></symbol>
+      <symbol id="icon-arrow-right" viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></symbol>
+      <symbol id="icon-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></symbol>
+      <symbol id="icon-sort" viewBox="0 0 24 24"><path d="M8 6h11M8 12h8M8 18h5M4 4v16M2 18l2 2 2-2"/></symbol>
+      <symbol id="icon-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></symbol>
+      <symbol id="icon-list" viewBox="0 0 24 24"><path d="M9 6h12M9 12h12M9 18h12"/><circle cx="4" cy="6" r="1"/><circle cx="4" cy="12" r="1"/><circle cx="4" cy="18" r="1"/></symbol>
+      <symbol id="icon-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+      <symbol id="icon-layers" viewBox="0 0 24 24"><path d="m12 2 9 5-9 5-9-5 9-5Z"/><path d="m3 12 9 5 9-5M3 17l9 5 9-5"/></symbol>
+      <symbol id="icon-more" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/></symbol>
+      <symbol id="icon-home" viewBox="0 0 24 24"><path d="m3 11 9-8 9 8"/><path d="M5 10v11h14V10M9 21v-7h6v7"/></symbol>
+      <symbol id="icon-changes" viewBox="0 0 24 24"><path d="M4 7h13M14 4l3 3-3 3M20 17H7M10 14l-3 3 3 3"/></symbol>
+      <symbol id="icon-audit" viewBox="0 0 24 24"><path d="M8 6h13M8 12h13M8 18h13"/><circle cx="3.5" cy="6" r=".5"/><circle cx="3.5" cy="12" r=".5"/><circle cx="3.5" cy="18" r=".5"/></symbol>
+      <symbol id="icon-maintenance" viewBox="0 0 24 24"><path d="M4 7h16M7 4v6M4 17h16M17 14v6"/></symbol>
+      <symbol id="icon-sidebar" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16M14 9l-3 3 3 3"/></symbol>
+      <symbol id="icon-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.5"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></symbol>
+      <symbol id="icon-moon" viewBox="0 0 24 24"><path d="M20 15.2A8.5 8.5 0 0 1 8.8 4 8.5 8.5 0 1 0 20 15.2Z"/></symbol>
+      <symbol id="icon-chevron-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
+    </defs>
+  </svg>
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="Primary navigation">
+      <a class="brand" href="/dashboard"><img class="brand-logo" src="/static/configdeck-logo.svg" alt=""><span class="brand-copy"><strong>ConfigDeck</strong><small>Configuration Management Platform</small></span></a>
+      <nav class="primary-nav">
+        <a href="/dashboard" class="nav-item{% if chrome.active_nav == "overview" %} is-active{% endif %}" title="Overview"><span class="nav-icon" aria-hidden="true"><svg class="icon"><use href="#icon-home"></use></svg></span><span class="nav-copy"><strong>Overview</strong><small>Workspace summary</small></span></a>
+        <a href="/services" class="nav-item{% if chrome.active_nav == "configurations" %} is-active{% endif %}" title="Configurations"><span class="nav-icon" aria-hidden="true"><svg class="icon"><use href="#icon-layers"></use></svg></span><span class="nav-copy"><strong>Configurations</strong><small>Apps and variables</small></span></a>
+        <a href="/change-requests" class="nav-item{% if chrome.active_nav == "changes" %} is-active{% endif %}" title="Changes"><span class="nav-icon" aria-hidden="true"><svg class="icon"><use href="#icon-changes"></use></svg></span><span class="nav-copy"><strong>Changes</strong><small>Request workflow</small></span></a>
+        {% if chrome.permissions.can_manage_users %}<a href="/users" class="nav-item{% if chrome.active_nav == "users" %} is-active{% endif %}" title="Users &amp; Access"><span class="nav-icon" aria-hidden="true"><svg class="icon"><use href="#icon-users"></use></svg></span><span class="nav-copy"><strong>Users &amp; Access</strong><small>Accounts and roles</small></span></a>{% endif %}
+        {% if chrome.permissions.can_view_audit %}<a href="/audit" class="nav-item{% if chrome.active_nav == "audit" %} is-active{% endif %}" title="Audit log"><span class="nav-icon" aria-hidden="true"><svg class="icon"><use href="#icon-audit"></use></svg></span><span class="nav-copy"><strong>Audit log</strong><small>Security and activity</small></span></a>{% endif %}
+        {% if chrome.permissions.can_manage_system %}<a href="/maintenance" class="nav-item{% if chrome.active_nav == "maintenance" %} is-active{% endif %}" title="Maintenance"><span class="nav-icon" aria-hidden="true"><svg class="icon"><use href="#icon-maintenance"></use></svg></span><span class="nav-copy"><strong>Maintenance</strong><small>Backup and recovery</small></span></a>{% endif %}
+      </nav>
+      <div class="sidebar-footer">
+        <button type="button" class="sidebar-collapse" data-sidebar-toggle aria-expanded="true" aria-label="Collapse sidebar" title="Collapse sidebar"><svg class="icon" aria-hidden="true"><use href="#icon-sidebar"></use></svg></button>
+      </div>
+    </aside>
+    <main class="app-main">
+      <header class="app-topbar">
+        <div class="topbar-path" data-context-breadcrumbs><strong>{{ chrome.section_label }}</strong></div>
+        <div class="global-search" data-global-search><svg class="icon" aria-hidden="true"><use href="#icon-search"></use></svg><label class="sr-only" for="global-key-search">Search authorized configuration keys</label><input id="global-key-search" type="search" maxlength="100" placeholder="Look up configuration keys…" autocomplete="off" aria-autocomplete="list" aria-controls="global-key-search-results" aria-expanded="false" data-global-search-input><kbd>Ctrl K</kbd><div class="global-search-panel" id="global-key-search-results" role="listbox" data-global-search-results hidden><p>Type at least two characters to search authorized key metadata.</p></div></div>
+        <div class="topbar-actions">
+          <button type="button" class="topbar-icon theme-icon-button" data-theme-toggle aria-pressed="true" aria-label="Switch to light theme" title="Change theme"><svg class="icon theme-icon-sun" aria-hidden="true"><use href="#icon-sun"></use></svg><svg class="icon theme-icon-moon" aria-hidden="true"><use href="#icon-moon"></use></svg></button>
+          <details class="account-menu topbar-account">
+            <summary aria-label="Open account menu for {{ chrome.user_email }}"><span class="account-avatar" aria-hidden="true">●</span><span class="account-copy"><strong>{{ chrome.user_email }}</strong><small>{{ chrome.user_role }}</small></span><svg class="icon account-chevron" aria-hidden="true"><use href="#icon-chevron-down"></use></svg></summary>
+            <div class="account-popover">
+              {% if chrome.recent_active %}<p class="security-state is-active"><span></span>Sensitive actions unlocked briefly</p>{% endif %}
+              <form method="post" action="/logout" class="account-logout"><input type="hidden" name="csrf_token" value="{{ chrome.csrf_token }}"><button type="submit" class="menu-button">Sign out</button></form>
+            </div>
+          </details>
+        </div>
+      </header>
+      <div class="content-wrap">{% block content %}{% endblock %}</div>
+    </main>
+  </div>
+</body>
+</html>

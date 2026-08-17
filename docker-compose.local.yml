@@ -1,0 +1,4 @@
+services:
+  configdeck:
+    environment:
+      CONFIGDECK_ENV: development

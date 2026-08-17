@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Set up TOTP · ConfigDeck</title>
+  <meta name="color-scheme" content="light dark">
+  <link rel="icon" type="image/svg+xml" href="/static/configdeck-logo.svg">
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/theme.js"></script>
+</head>
+<body class="auth-body">
+  <main class="auth-card">
+    <a class="auth-brand" href="/dashboard"><img class="brand-logo" src="/static/configdeck-logo.svg" alt=""><span><strong>ConfigDeck</strong><small>Configuration Management Platform</small></span></a>
+    <h1>Set up two-factor authentication</h1>
+    <p>Scan this QR code with Google Authenticator or another TOTP application.</p>
+    <div class="qr-code">
+      <img src="{{ qr_code_data_uri }}" width="256" height="256" alt="QR code for ConfigDeck TOTP enrollment">
+    </div>
+    <details>
+      <summary>Enter a setup key manually</summary>
+      <p class="muted">Choose a time-based key in your authenticator.</p>
+      <code class="secret">{{ encoded_secret }}</code>
+    </details>
+    <details><summary>Advanced: provisioning URI</summary><code class="break">{{ provisioning_uri }}</code></details>
+    <p class="muted">The QR code and setup key are sensitive. Do not share or save a screenshot.</p>
+    <form method="post" action="/auth/totp/setup">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <label>Six-digit code<input name="code" inputmode="numeric" pattern="[0-9]{6}" autocomplete="one-time-code" required autofocus></label>
+      <button type="submit">Confirm TOTP</button>
+    </form>
+  </main>
+</body>
+</html>

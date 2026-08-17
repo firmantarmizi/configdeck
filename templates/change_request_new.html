@@ -1,0 +1,23 @@
+{% extends "app_base.html" %}
+{% block title %}New change request · ConfigDeck{% endblock %}
+{% block content %}
+<nav class="breadcrumbs" aria-label="Breadcrumb"><a href="/services">Configurations</a><span>/</span><a href="/environments/{{ environment.id }}/variables">{{ environment.service_name }} / {{ environment.name }}</a><span>/</span><span>New request</span></nav>
+<div class="hero-heading compact-heading"><div><p class="eyebrow">New change request</p><h1>Describe the configuration change</h1><p class="lead">Group related additions, updates, or deletions into one traceable request.</p></div></div>
+<div class="notice"><strong>How values are handled</strong><span>“I provide it” encrypts the value immediately. “Operator provides it” leaves the request waiting for secure input. Restricted values become write-only after submission.</span></div>
+<form method="post" action="/environments/{{ environment.id }}/change-requests" class="stack request-builder">
+  <input type="hidden" name="csrf_token" value="{{ chrome.csrf_token }}">
+  <section class="panel form-grid"><label>Title <span class="field-hint">Optional</span><input name="title" maxlength="200" placeholder="Example: Configure payment gateway"></label><label>Why is this change needed?<textarea name="reason" maxlength="1000" rows="3" required placeholder="Give reviewers enough context to understand the change."></textarea></label></section>
+  {% for index in 0..5 %}
+  <fieldset class="panel request-item"><legend>Change item {{ index + 1 }}</legend>
+    <label>Action<select name="action_{{ index }}"><option value="">Unused row</option><option value="ADD">Add</option><option value="UPDATE">Update</option><option value="DELETE">Delete</option></select></label>
+    <label>Variable key<input name="key_{{ index }}" maxlength="255" pattern="[A-Za-z_][A-Za-z0-9_]*" placeholder="DATABASE_URL"></label>
+    <label>Who supplies the value?<select name="value_source_{{ index }}"><option value="REQUESTER_PROVIDED">I provide it</option><option value="OPERATOR_PROVIDED">Operator provides it</option></select></label>
+    <label>Value<textarea name="value_{{ index }}" maxlength="32768" rows="2"></textarea></label>
+    <label>Visibility<select name="visibility_{{ index }}"><option value="restricted">Restricted</option><option value="public">Public</option></select></label>
+    <label>Type<select name="value_type_{{ index }}"><option value="string">String</option><option value="boolean">Boolean</option><option value="integer">Integer</option><option value="url">URL</option><option value="multiline">Multiline</option></select></label>
+    <label class="span-two">Description <span class="field-hint">Optional</span><textarea name="description_{{ index }}" maxlength="1000" rows="2"></textarea></label>
+  </fieldset>
+  {% endfor %}
+  <div class="form-actions"><a class="button-link tertiary" href="/environments/{{ environment.id }}/variables">Cancel</a><button type="submit">Submit change request</button></div>
+</form>
+{% endblock %}

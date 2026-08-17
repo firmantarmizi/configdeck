@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>{{ title }} · ConfigDeck</title>
+  <link rel="icon" type="image/svg+xml" href="/static/configdeck-logo.svg">
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/theme.js"></script>
+</head>
+<body class="auth-body">
+  <main class="auth-card error-card">
+    <a class="auth-brand" href="{{ back_href }}"><img class="brand-logo" src="/static/configdeck-logo.svg" alt=""><span><strong>ConfigDeck</strong><small>Configuration Management Platform</small></span></a>
+    <p class="eyebrow">Error {{ code }}</p>
+    <h1>{{ title }}</h1>
+    <p class="lead">{{ message }}</p>
+    <a class="button-link" href="{{ back_href }}">{{ back_label }}</a>
+    <p class="security-footnote">Sensitive values and internal error details are never displayed here.</p>
+  </main>
+</body>
+</html>

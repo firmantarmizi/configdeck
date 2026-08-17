@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in · ConfigDeck</title>
+  <meta name="color-scheme" content="light dark">
+  <link rel="icon" type="image/svg+xml" href="/static/configdeck-logo.svg">
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/theme.js"></script>
+</head>
+<body class="auth-body">
+  <main class="auth-card">
+    <a class="auth-brand" href="/login"><img class="brand-logo" src="/static/configdeck-logo.svg" alt=""><span><strong>ConfigDeck</strong><small>Configuration Management Platform</small></span></a>
+    <h1>Sign in</h1>
+    <p>Manage configuration safely across your environments.</p>
+    <form method="post" action="/login">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <label>Email<input name="email" type="email" autocomplete="username" required autofocus></label>
+      <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
+      <label>TOTP code<input name="totp_code" inputmode="numeric" pattern="[0-9]{6}" autocomplete="one-time-code"></label>
+      <button type="submit">Sign in</button>
+    </form>
+  </main>
+</body>
+</html>

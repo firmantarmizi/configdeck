@@ -1,0 +1,47 @@
+{% extends "app_base.html" %}
+{% block title %}{{ workspace.service.name }} · ConfigDeck{% endblock %}
+{% block content %}
+<nav class="breadcrumbs" aria-label="Breadcrumb"><a href="/services">Configurations</a><span>/</span><span>{{ workspace.service.name }}</span></nav>
+<div class="page-heading app-workspace-heading">
+  <div><p class="eyebrow">App workspace</p><h1>{{ workspace.service.name }}</h1><p class="lead">Compare key coverage and change status across environments. Values stay in their environment pages.</p></div>
+  {% if can_manage %}<a class="button-link secondary" href="/services/{{ workspace.service.id }}/access"><svg class="icon" aria-hidden="true"><use href="#icon-users"></use></svg>Manage access</a>{% endif %}
+</div>
+{% if workspace.service.archived_at.is_some() %}<p class="notice">This app is archived. Restore it before changing environments.</p>{% endif %}
+
+{% if !workspace.environments.is_empty() %}
+<section class="comparison-toolbar" aria-label="Comparison controls">
+  <label class="catalog-search"><span class="sr-only">Search keys</span><svg class="icon" aria-hidden="true"><use href="#icon-search"></use></svg><input type="search" placeholder="Search keys" autocomplete="off" data-comparison-search></label>
+  <label class="catalog-sort"><span class="sr-only">Filter comparison</span><select data-comparison-filter><option value="all">All keys</option><option value="pending">Pending changes</option><option value="missing">Missing somewhere</option><option value="present">Present somewhere</option></select></label>
+  <label class="catalog-sort"><span class="sr-only">Sort keys</span><svg class="icon" aria-hidden="true"><use href="#icon-sort"></use></svg><select data-comparison-sort><option value="key-asc">Key A–Z</option><option value="key-desc">Key Z–A</option><option value="attention">Needs attention</option></select></label>
+  <div class="comparison-expand-actions"><button class="comparison-symbol-button" type="button" data-comparison-expand aria-label="Expand all key details" title="Expand all"><span aria-hidden="true">»</span></button><button class="comparison-symbol-button" type="button" data-comparison-collapse aria-label="Collapse all key details" title="Collapse all"><span aria-hidden="true">«</span></button></div>
+</section>
+
+<div class="comparison-legend" aria-label="Status legend"><span><i class="comparison-dot present"></i>Present</span><span><i class="comparison-dot pending"></i>Pending or not applied</span><span><i class="comparison-dot missing"></i>Missing</span><strong data-comparison-count>{{ workspace.keys.len() }} keys</strong></div>
+
+<section class="comparison-panel" aria-labelledby="comparison-title">
+  <h2 class="sr-only" id="comparison-title">Environment key comparison</h2>
+  <div class="table-scroll">
+    <table class="comparison-table">
+      <thead><tr><th scope="col">Key</th>{% for environment in workspace.environments %}<th scope="col"><a class="environment-tab" href="/environments/{{ environment.id }}/variables"><span>{{ environment.name }}</span><span aria-hidden="true">→</span></a><small>{{ environment.variable_count }} active</small></th>{% endfor %}</tr></thead>
+      <tbody data-comparison-rows>
+      {% for row in workspace.keys %}
+        <tr class="comparison-row" data-comparison-row data-key="{{ row.key }}" data-present="{{ row.has_present }}" data-pending="{{ row.has_pending }}" data-missing="{{ row.has_missing }}">
+          <th scope="row"><button class="comparison-key" type="button" aria-expanded="false" aria-controls="comparison-detail-{{ loop.index }}" data-comparison-toggle="comparison-detail-{{ loop.index }}"><svg class="icon" aria-hidden="true"><use href="#icon-chevron-down"></use></svg><span>{{ row.key }}</span></button></th>
+          {% for cell in row.cells %}<td class="comparison-cell"><a class="comparison-state {{ cell.status_class }}" href="/environments/{{ cell.environment_id }}/variables?q={{ row.key }}" aria-label="{{ cell.status_label }} in {{ cell.environment_name }}. Open the environment filtered to {{ row.key }}."><i class="comparison-dot {{ cell.status_class }}"></i><span class="comparison-state-popover"><strong>{{ cell.status_label }}</strong><small>Open {{ cell.environment_name }} →</small></span></a></td>{% endfor %}
+        </tr>
+        <tr class="comparison-detail" id="comparison-detail-{{ loop.index }}" data-comparison-detail hidden><td colspan="{{ workspace.column_count }}"><div class="comparison-detail-grid">
+          {% for cell in row.cells %}<article><div><strong>{{ cell.environment_name }}</strong><span class="comparison-state {{ cell.status_class }}"><i class="comparison-dot {{ cell.status_class }}"></i>{{ cell.status_label }}</span></div>{% match cell.visibility %}{% when Some with (visibility) %}<dl><div><dt>Visibility</dt><dd>{{ visibility }}</dd></div><div><dt>Type</dt><dd>{% match cell.value_type %}{% when Some with (value_type) %}{{ value_type }}{% when None %}—{% endmatch %}</dd></div><div><dt>Version</dt><dd>{% match cell.version %}{% when Some with (version) %}{{ version }}{% when None %}—{% endmatch %}</dd></div></dl>{% when None %}<p>No applied variable metadata.</p>{% endmatch %}<a href="/environments/{{ cell.environment_id }}/variables?q={{ row.key }}">Open environment <span aria-hidden="true">→</span></a></article>{% endfor %}
+        </div></td></tr>
+      {% endfor %}
+      {% if workspace.keys.is_empty() %}<tr><td colspan="{{ workspace.column_count }}"><div class="empty-state"><span class="empty-icon">!</span><div><strong>No configuration keys yet</strong><p>Open an environment to import or record its first configuration.</p></div></div></td></tr>{% endif %}
+      </tbody>
+    </table>
+  </div>
+  <div class="empty-state comparison-no-match" data-comparison-empty hidden><span class="empty-icon"><svg class="icon" aria-hidden="true"><use href="#icon-search"></use></svg></span><div><strong>No matching keys</strong><p>Change the search or status filter.</p></div></div>
+</section>
+{% else %}
+<div class="empty-state"><span class="empty-icon">!</span><div><strong>No active environments</strong><p>Add an environment below before managing configuration.</p></div></div>
+{% endif %}
+
+{% if can_manage && workspace.service.archived_at.is_none() %}<details class="panel create-panel secondary-create"><summary>Add a custom environment</summary><p class="muted">New Apps already receive Development, Staging, and Production. Use this for an additional target such as QA, Preview, or Sandbox.</p><form method="post" action="/services/{{ workspace.service.id }}/environments" class="metadata-form"><input type="hidden" name="csrf_token" value="{{ chrome.csrf_token }}"><label>Name<input name="name" maxlength="100" placeholder="QA" required></label><label>Description <span class="field-hint">Optional</span><input name="description" maxlength="1000" placeholder="Purpose of this environment"></label><button type="submit">Add environment</button></form></details>{% endif %}
+{% endblock %}

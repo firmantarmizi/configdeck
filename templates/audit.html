@@ -1,0 +1,25 @@
+{% extends "app_base.html" %}
+{% block title %}Audit log · ConfigDeck{% endblock %}
+{% block content %}
+<div class="hero-heading compact-heading"><div><p class="eyebrow">Operations</p><h1>Audit log</h1><p class="lead">Review privileged and configuration activity. The newest 200 matching events are shown.</p></div></div>
+
+<section class="panel compact-panel">
+  <form method="get" action="/audit" class="audit-filter-form">
+    <label>Action<select name="action"><option value="">All actions</option>{% for option in actions %}<option value="{{ option }}"{% if filter.action == *option %} selected{% endif %}>{{ option }}</option>{% endfor %}</select></label>
+    <label>Outcome<select name="outcome"><option value="">All outcomes</option><option value="SUCCESS"{% if filter.outcome == "SUCCESS" %} selected{% endif %}>Success</option><option value="DENIED"{% if filter.outcome == "DENIED" %} selected{% endif %}>Denied</option><option value="FAILED"{% if filter.outcome == "FAILED" %} selected{% endif %}>Failed</option></select></label>
+    <label>Actor email<input name="actor" type="search" value="{{ filter.actor }}" maxlength="320" placeholder="operator@example.com"></label>
+    <button type="submit">Filter</button><a href="/audit">Reset</a>
+  </form>
+</section>
+
+<section class="panel-table table-wrap audit-table-wrap">
+  <table class="audit-table"><thead><tr><th>Time</th><th>Event</th><th>Actor</th><th>Target</th><th>Details</th></tr></thead>
+  <tbody>{% for event in entries %}<tr>
+    <td><time>{{ event.occurred_display }}</time><small>#{{ event.id }}</small></td>
+    <td><strong>{{ event.action }}</strong><small><span class="status-badge status-{{ event.outcome.to_lowercase() }}">{{ event.outcome }}</span></small></td>
+    <td>{% match event.actor_email %}{% when Some with (email) %}<span class="break">{{ email }}</span>{% when None %}<span class="muted">System</span>{% endmatch %}{% match event.client_ip %}{% when Some with (ip) %}<small>{{ ip }}</small>{% when None %}{% endmatch %}</td>
+    <td>{% match event.service_name %}{% when Some with (name) %}<strong>{{ name }}</strong>{% when None %}<span class="muted">Organization</span>{% endmatch %}{% match event.environment_name %}{% when Some with (name) %}<small>{{ name }}</small>{% when None %}{% endmatch %}{% match event.variable_key %}{% when Some with (key) %}<small><code>{{ key }}</code></small>{% when None %}{% endmatch %}</td>
+    <td>{% if event.metadata.is_empty() %}<span class="muted">No additional details</span>{% else %}<dl class="audit-metadata">{% for item in event.metadata %}<div><dt>{{ item.key }}</dt><dd>{{ item.value }}</dd></div>{% endfor %}</dl>{% endif %}{% match event.change_request_id %}{% when Some with (id) %}<small>Request <code>{{ id }}</code></small>{% when None %}{% endmatch %}</td>
+  </tr>{% endfor %}{% if entries.is_empty() %}<tr><td colspan="5"><div class="empty-state"><span class="empty-icon">i</span><div><strong>No matching events</strong><p>Adjust the filters to see more activity.</p></div></div></td></tr>{% endif %}</tbody></table>
+</section>
+{% endblock %}
