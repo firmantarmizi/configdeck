@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::{
     auth::AuthenticatedSession,
-    crypto::CryptoManager,
+    crypto::{CryptoManager, CurrentValueContext},
     db::now_rfc3339,
     error::AppError,
     services::{map_write_error, validate_description, validate_name},
@@ -20,6 +20,7 @@ pub struct EnvironmentRecord {
     pub description: Option<String>,
     pub archived_at: Option<String>,
     pub variable_count: i64,
+    pub is_standard: bool,
 }
 
 #[derive(Clone, Debug, FromRow, Serialize)]
@@ -39,6 +40,7 @@ pub struct EnvironmentInput {
 pub struct ComparisonWorkspace {
     pub service: ServiceContext,
     pub environments: Vec<EnvironmentRecord>,
+    pub archived_environments: Vec<EnvironmentRecord>,
     pub keys: Vec<ComparisonKey>,
     pub column_count: usize,
 }
@@ -47,6 +49,8 @@ pub struct ComparisonWorkspace {
 pub struct ComparisonKey {
     pub key: String,
     pub cells: Vec<ComparisonCell>,
+    pub visibility_label: String,
+    pub value_type_label: String,
     pub has_present: bool,
     pub has_pending: bool,
     pub has_missing: bool,
@@ -56,19 +60,40 @@ pub struct ComparisonKey {
 pub struct ComparisonCell {
     pub environment_id: String,
     pub environment_name: String,
+    pub variable_id: Option<String>,
     pub status_label: &'static str,
     pub status_class: &'static str,
+    pub value: Option<String>,
     pub visibility: Option<String>,
     pub value_type: Option<String>,
+    pub description: Option<String>,
     pub version: Option<i64>,
 }
 
 #[derive(Clone, Debug, FromRow)]
-struct VariableMetadata {
+struct ComparisonVariableRow {
+    id: String,
     environment_id: String,
     key: String,
+    encrypted_value: Vec<u8>,
+    value_nonce: Vec<u8>,
+    dek_version: i64,
     visibility: String,
     value_type: String,
+    description: Option<String>,
+    version: i64,
+    deployment_status: String,
+}
+
+#[derive(Clone, Debug)]
+struct VariableMetadata {
+    id: String,
+    environment_id: String,
+    key: String,
+    value: Option<String>,
+    visibility: String,
+    value_type: String,
+    description: Option<String>,
     version: i64,
     deployment_status: String,
 }
@@ -77,6 +102,131 @@ struct VariableMetadata {
 struct PendingKey {
     environment_id: String,
     key: String,
+}
+
+async fn load_comparison_variables(
+    pool: &SqlitePool,
+    crypto: &CryptoManager,
+    service_id: &str,
+) -> Result<Vec<VariableMetadata>, AppError> {
+    let rows = sqlx::query_as::<_, ComparisonVariableRow>(
+        "SELECT v.id, v.environment_id, v.key, v.encrypted_value, v.value_nonce, v.dek_version, \
+                v.visibility, v.value_type, v.description, v.version, v.deployment_status \
+         FROM variables v \
+         JOIN environments e ON e.id = v.environment_id \
+         WHERE e.service_id = ? AND e.archived_at IS NULL AND v.lifecycle_status = 'ACTIVE' \
+         ORDER BY v.key, e.name_normalized",
+    )
+    .bind(service_id)
+    .fetch_all(pool)
+    .await?;
+    let mut variables = Vec::with_capacity(rows.len());
+    let mut deks = HashMap::new();
+    for row in rows {
+        let value = if row.visibility == "public" {
+            let dek_version = u64::try_from(row.dek_version).map_err(|_| AppError::Crypto)?;
+            let cache_key = (row.environment_id.clone(), row.dek_version);
+            if !deks.contains_key(&cache_key) {
+                let dek = dek_by_version(pool, crypto, &row.environment_id, dek_version).await?;
+                deks.insert(cache_key.clone(), dek);
+            }
+            let dek = deks.get(&cache_key).ok_or(AppError::Crypto)?;
+            let plaintext = crypto
+                .decrypt_current_value(
+                    dek,
+                    &CurrentValueContext {
+                        service_id,
+                        environment_id: &row.environment_id,
+                        variable_id: &row.id,
+                        version: u64::try_from(row.version).map_err(|_| AppError::Crypto)?,
+                        dek_version,
+                    },
+                    &row.encrypted_value,
+                    &row.value_nonce,
+                )
+                .map_err(|_| AppError::Crypto)?;
+            Some(String::from_utf8(plaintext.to_vec()).map_err(|_| AppError::Crypto)?)
+        } else {
+            None
+        };
+        variables.push(VariableMetadata {
+            id: row.id,
+            environment_id: row.environment_id,
+            key: row.key,
+            value,
+            visibility: row.visibility,
+            value_type: row.value_type,
+            description: row.description,
+            version: row.version,
+            deployment_status: row.deployment_status,
+        });
+    }
+    Ok(variables)
+}
+
+fn comparison_key(
+    key: String,
+    metadata: &HashMap<String, VariableMetadata>,
+    environments: &[EnvironmentRecord],
+    pending: &HashMap<String, HashSet<String>>,
+) -> ComparisonKey {
+    let cells: Vec<_> = environments
+        .iter()
+        .map(|environment| {
+            let variable = metadata.get(&environment.id);
+            let has_pending = pending
+                .get(&environment.id)
+                .is_some_and(|keys| keys.contains(&key));
+            let (status_label, status_class) = match (variable, has_pending) {
+                (Some(_), true) => ("Pending change", "pending"),
+                (Some(variable), false) if variable.deployment_status == "NOT_APPLIED" => {
+                    ("Not applied", "pending")
+                }
+                (Some(_), false) => ("Present", "present"),
+                (None, true) => ("Proposed", "pending"),
+                (None, false) => ("Missing", "missing"),
+            };
+            ComparisonCell {
+                environment_id: environment.id.clone(),
+                environment_name: environment.name.clone(),
+                variable_id: variable.map(|value| value.id.clone()),
+                status_label,
+                status_class,
+                value: variable.and_then(|value| value.value.clone()),
+                visibility: variable.map(|value| value.visibility.clone()),
+                value_type: variable.map(|value| value.value_type.clone()),
+                description: variable.and_then(|value| value.description.clone()),
+                version: variable.map(|value| value.version),
+            }
+        })
+        .collect();
+    let visibilities: HashSet<_> = cells
+        .iter()
+        .filter_map(|cell| cell.visibility.as_deref())
+        .collect();
+    let value_types: HashSet<_> = cells
+        .iter()
+        .filter_map(|cell| cell.value_type.as_deref())
+        .collect();
+    let visibility_label = match visibilities.len() {
+        0 => "Missing".to_owned(),
+        1 => (*visibilities.iter().next().expect("one visibility")).to_owned(),
+        _ => "Mixed visibility".to_owned(),
+    };
+    let value_type_label = match value_types.len() {
+        0 => "No type".to_owned(),
+        1 => (*value_types.iter().next().expect("one value type")).to_owned(),
+        _ => "Mixed type".to_owned(),
+    };
+    ComparisonKey {
+        key,
+        visibility_label,
+        value_type_label,
+        has_present: cells.iter().any(|cell| cell.status_class == "present"),
+        has_pending: cells.iter().any(|cell| cell.status_class == "pending"),
+        has_missing: cells.iter().any(|cell| cell.status_class == "missing"),
+        cells,
+    }
 }
 
 #[derive(Clone, Debug, FromRow, Serialize)]
@@ -98,11 +248,12 @@ pub async fn list_for_service(
     let service = service_context(pool, session, service_id).await?;
     let rows = sqlx::query_as::<_, EnvironmentRecord>(
         "SELECT e.id, e.name, e.description, e.archived_at, \
-                COUNT(v.id) AS variable_count \
+                COUNT(v.id) AS variable_count, \
+                e.name_normalized IN ('development', 'staging', 'production') AS is_standard \
          FROM environments e \
          LEFT JOIN variables v ON v.environment_id = e.id AND v.lifecycle_status = 'ACTIVE' \
          WHERE e.service_id = ? \
-         GROUP BY e.id, e.name, e.description, e.archived_at \
+         GROUP BY e.id, e.name, e.name_normalized, e.description, e.archived_at \
          ORDER BY e.archived_at IS NOT NULL, CASE e.name_normalized WHEN 'development' THEN 1 WHEN 'staging' THEN 2 WHEN 'production' THEN 3 ELSE 4 END, e.name_normalized",
     )
     .bind(service_id)
@@ -112,28 +263,20 @@ pub async fn list_for_service(
 }
 
 /// Returns only configuration metadata needed by the cross-environment workspace.
-/// Encrypted values, nonces, and ciphertext are deliberately excluded from both queries.
+/// Restricted plaintext is never decrypted. Public values are decrypted only after the
+/// service-scope authorization check and are used for the inline comparison details.
 pub async fn comparison_for_service(
     pool: &SqlitePool,
+    crypto: &CryptoManager,
     session: &AuthenticatedSession,
     service_id: &str,
 ) -> Result<ComparisonWorkspace, AppError> {
     let (service, all_environments) = list_for_service(pool, session, service_id).await?;
-    let environments: Vec<_> = all_environments
+    let (environments, archived_environments): (Vec<_>, Vec<_>) = all_environments
         .into_iter()
-        .filter(|environment| environment.archived_at.is_none())
-        .collect();
+        .partition(|environment| environment.archived_at.is_none());
 
-    let variables = sqlx::query_as::<_, VariableMetadata>(
-        "SELECT v.environment_id, v.key, v.visibility, v.value_type, v.version, v.deployment_status \
-         FROM variables v \
-         JOIN environments e ON e.id = v.environment_id \
-         WHERE e.service_id = ? AND e.archived_at IS NULL AND v.lifecycle_status = 'ACTIVE' \
-         ORDER BY v.key, e.name_normalized",
-    )
-    .bind(service_id)
-    .fetch_all(pool)
-    .await?;
+    let variables = load_comparison_variables(pool, crypto, &service.id).await?;
     let pending = sqlx::query_as::<_, PendingKey>(
         "SELECT DISTINCT r.environment_id, i.key \
          FROM change_requests r \
@@ -154,49 +297,19 @@ pub async fn comparison_for_service(
             .or_default()
             .insert(variable.environment_id.clone(), variable);
     }
-    let pending: HashSet<_> = pending
-        .into_iter()
-        .map(|item| (item.environment_id, item.key))
-        .collect();
-    for (_, key) in &pending {
-        by_key.entry(key.clone()).or_default();
+    let mut pending_by_environment: HashMap<String, HashSet<String>> = HashMap::new();
+    for item in pending {
+        by_key.entry(item.key.clone()).or_default();
+        pending_by_environment
+            .entry(item.environment_id)
+            .or_default()
+            .insert(item.key);
     }
 
     let keys = by_key
         .into_iter()
         .map(|(key, metadata)| {
-            let cells: Vec<_> = environments
-                .iter()
-                .map(|environment| {
-                    let variable = metadata.get(&environment.id);
-                    let has_pending = pending.contains(&(environment.id.clone(), key.clone()));
-                    let (status_label, status_class) = match (variable, has_pending) {
-                        (Some(_), true) => ("Pending change", "pending"),
-                        (Some(variable), false) if variable.deployment_status == "NOT_APPLIED" => {
-                            ("Not applied", "pending")
-                        }
-                        (Some(_), false) => ("Present", "present"),
-                        (None, true) => ("Proposed", "pending"),
-                        (None, false) => ("Missing", "missing"),
-                    };
-                    ComparisonCell {
-                        environment_id: environment.id.clone(),
-                        environment_name: environment.name.clone(),
-                        status_label,
-                        status_class,
-                        visibility: variable.map(|value| value.visibility.clone()),
-                        value_type: variable.map(|value| value.value_type.clone()),
-                        version: variable.map(|value| value.version),
-                    }
-                })
-                .collect();
-            ComparisonKey {
-                key,
-                has_present: cells.iter().any(|cell| cell.status_class == "present"),
-                has_pending: cells.iter().any(|cell| cell.status_class == "pending"),
-                has_missing: cells.iter().any(|cell| cell.status_class == "missing"),
-                cells,
-            }
+            comparison_key(key, &metadata, &environments, &pending_by_environment)
         })
         .collect();
 
@@ -204,6 +317,7 @@ pub async fn comparison_for_service(
         service,
         column_count: environments.len() + 1,
         environments,
+        archived_environments,
         keys,
     })
 }
@@ -554,11 +668,12 @@ mod tests {
         error::AppError,
         services::{self, ServiceInput},
         users::Role,
+        variables::{self, AppliedVariableInput},
     };
 
     use super::{
         EnvironmentInput, active_dek, comparison_for_service, create, list_for_service,
-        search_accessible_keys,
+        search_accessible_keys, set_archived,
     };
 
     #[tokio::test]
@@ -597,6 +712,7 @@ mod tests {
         assert_eq!(dek.len(), 32);
         let (_, environments) = list_for_service(&pool, &admin, &service_id).await.unwrap();
         assert_eq!(environments[0].name, "Staging");
+        assert!(environments[0].is_standard);
 
         let contributor = session("contributor", Role::Contributor);
         assert!(matches!(
@@ -636,7 +752,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn comparison_is_access_scoped_and_contains_metadata_only() {
+    async fn custom_environment_archive_is_visible_for_restore_but_not_comparison() {
+        let pool = test_pool().await;
+        seed_identity(&pool).await;
+        let crypto = CryptoManager::new(Zeroizing::new([32; 32]));
+        initialize_and_validate_key_registry(&pool, &crypto)
+            .await
+            .unwrap();
+        let admin = session("admin", Role::Administrator);
+        let service_id = services::create(
+            &pool,
+            &admin,
+            ServiceInput {
+                name: "Custom targets".into(),
+                description: None,
+            },
+        )
+        .await
+        .unwrap();
+        let qa_id = create(
+            &pool,
+            &crypto,
+            &admin,
+            &service_id,
+            EnvironmentInput {
+                name: "QA".into(),
+                description: Some("Custom test target".into()),
+            },
+        )
+        .await
+        .unwrap();
+        let (_, environments) = list_for_service(&pool, &admin, &service_id).await.unwrap();
+        assert!(
+            environments
+                .iter()
+                .any(|environment| environment.id == qa_id && !environment.is_standard)
+        );
+
+        set_archived(&pool, &admin, &qa_id, true).await.unwrap();
+        let comparison = comparison_for_service(&pool, &crypto, &admin, &service_id)
+            .await
+            .unwrap();
+        assert!(
+            comparison
+                .environments
+                .iter()
+                .all(|environment| environment.id != qa_id)
+        );
+        assert!(
+            comparison
+                .archived_environments
+                .iter()
+                .any(|environment| environment.id == qa_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn comparison_is_access_scoped_and_masks_restricted_values() {
         let pool = test_pool().await;
         seed_identity(&pool).await;
         let crypto = CryptoManager::new(Zeroizing::new([19; 32]));
@@ -695,7 +867,7 @@ mod tests {
         .unwrap();
 
         assert!(matches!(
-            comparison_for_service(&pool, &contributor, &service_id).await,
+            comparison_for_service(&pool, &crypto, &contributor, &service_id).await,
             Err(AppError::NotFound)
         ));
         assert!(
@@ -713,7 +885,7 @@ mod tests {
         .await
         .unwrap();
 
-        let workspace = comparison_for_service(&pool, &contributor, &service_id)
+        let workspace = comparison_for_service(&pool, &crypto, &contributor, &service_id)
             .await
             .unwrap();
         assert_eq!(workspace.keys.len(), 1);
@@ -732,6 +904,68 @@ mod tests {
         assert_eq!(results[0].key, "API_TOKEN");
         assert_eq!(results[0].visibility, "restricted");
         assert!(!format!("{results:?}").contains("classified-value"));
+    }
+
+    #[tokio::test]
+    async fn comparison_decrypts_public_value_after_service_authorization() {
+        let pool = test_pool().await;
+        seed_identity(&pool).await;
+        let crypto = CryptoManager::new(Zeroizing::new([21; 32]));
+        initialize_and_validate_key_registry(&pool, &crypto)
+            .await
+            .unwrap();
+        let admin = session("admin", Role::Administrator);
+        let service_id = services::create(
+            &pool,
+            &admin,
+            ServiceInput {
+                name: "Public Comparison".into(),
+                description: None,
+            },
+        )
+        .await
+        .unwrap();
+        let environment_id = create(
+            &pool,
+            &crypto,
+            &admin,
+            &service_id,
+            EnvironmentInput {
+                name: "Development".into(),
+                description: None,
+            },
+        )
+        .await
+        .unwrap();
+        variables::record_applied(
+            &pool,
+            &crypto,
+            &admin,
+            &environment_id,
+            AppliedVariableInput {
+                key: "PUBLIC_HOST".into(),
+                value: "example.internal".into(),
+                visibility: "public".into(),
+                value_type: "string".into(),
+                description: Some("Public endpoint".into()),
+                reason: "seed comparison".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let workspace = comparison_for_service(&pool, &crypto, &admin, &service_id)
+            .await
+            .unwrap();
+        assert_eq!(workspace.keys.len(), 1);
+        assert_eq!(
+            workspace.keys[0].cells[0].value.as_deref(),
+            Some("example.internal")
+        );
+        assert_eq!(
+            workspace.keys[0].cells[0].description.as_deref(),
+            Some("Public endpoint")
+        );
     }
 
     async fn seed_identity(pool: &sqlx::SqlitePool) {

@@ -183,6 +183,30 @@ mod tests {
                 .try_get("count")
                 .unwrap();
         assert!(count >= 17);
+        for removed_table in ["backups", "restore_intents"] {
+            let exists: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = ?",
+            )
+            .bind(removed_table)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(exists, 0);
+        }
+        for required_index in [
+            "ix_login_attempts_time",
+            "ix_audit_action_time",
+            "ix_audit_outcome_time",
+        ] {
+            let exists: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'index' AND name = ?",
+            )
+            .bind(required_index)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(exists, 1);
+        }
     }
 
     #[tokio::test]

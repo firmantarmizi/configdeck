@@ -389,6 +389,58 @@ pub async fn change_own_password(
     Ok(())
 }
 
+pub async fn reset_password(
+    pool: &SqlitePool,
+    passwords: &PasswordService,
+    sessions: &SessionManager,
+    session: &AuthenticatedSession,
+    user_id: &str,
+    temporary_password: Zeroizing<String>,
+) -> Result<(), AppError> {
+    require_recent_admin(sessions, session)?;
+    if user_id == session.user.id {
+        return Err(AppError::Forbidden);
+    }
+    let _target = managed_user(pool, session, user_id).await?;
+    if temporary_password.len() < 12 || temporary_password.len() > 1_024 {
+        return Err(AppError::InvalidRequest);
+    }
+    let replacement = passwords
+        .hash(temporary_password)
+        .await
+        .map_err(|error| AppError::Internal(anyhow::anyhow!(error)))?;
+    let now = now_rfc3339()?;
+    let mut transaction = pool.begin().await?;
+    let changed = sqlx::query(
+        "UPDATE users SET password_hash = ?, password_changed_at = ?, must_change_password = 1, \
+                auth_version = auth_version + 1, updated_at = ? \
+         WHERE id = ? AND organization_id = ?",
+    )
+    .bind(replacement)
+    .bind(&now)
+    .bind(&now)
+    .bind(user_id)
+    .bind(&session.user.organization_id)
+    .execute(&mut *transaction)
+    .await?
+    .rows_affected();
+    if changed != 1 {
+        return Err(AppError::NotFound);
+    }
+    revoke_and_audit(
+        &mut transaction,
+        session,
+        user_id,
+        "password_reset",
+        "RESET_USER_PASSWORD",
+        serde_json::json!({"target_user_id": user_id, "must_change_password": true}),
+        &now,
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(())
+}
+
 pub async fn update_role(
     pool: &SqlitePool,
     sessions: &SessionManager,
@@ -453,6 +505,12 @@ pub async fn set_active(
     }
     let target = managed_user(pool, session, user_id).await?;
     if target.active == active {
+        if !active {
+            sqlx::query("DELETE FROM user_service_access WHERE user_id = ?")
+                .bind(user_id)
+                .execute(pool)
+                .await?;
+        }
         return Ok(());
     }
     let now = now_rfc3339()?;
@@ -472,6 +530,10 @@ pub async fn set_active(
     if changed != 1 {
         return Err(AppError::Conflict);
     }
+    sqlx::query("DELETE FROM user_service_access WHERE user_id = ?")
+        .bind(user_id)
+        .execute(&mut *transaction)
+        .await?;
     revoke_and_audit(
         &mut transaction,
         session,
@@ -595,7 +657,7 @@ mod tests {
 
     use super::{
         Capability, Role, UserCreateInput, can_access_service, change_own_password, create_user,
-        reset_totp, set_active, set_service_access, update_role,
+        reset_password, reset_totp, set_active, set_service_access, update_role,
     };
 
     #[test]
@@ -864,6 +926,144 @@ mod tests {
         assert_eq!(role, "OPERATOR");
         assert_eq!(version, 2);
         assert!(revoked.is_some());
+    }
+
+    #[tokio::test]
+    async fn administrator_password_reset_is_temporary_audited_and_revokes_sessions() {
+        let pool = test_pool().await;
+        seed_admin(&pool).await;
+        let now = "2026-08-15T00:00:00Z";
+        sqlx::query("INSERT INTO users(id, organization_id, email, email_normalized, password_hash, role, password_changed_at, created_at, updated_at) VALUES('operator', 'org', 'operator@example.test', 'operator@example.test', 'old-hash', 'OPERATOR', ?, ?, ?)")
+            .bind(now).bind(now).bind(now).execute(&pool).await.unwrap();
+        seed_session(&pool, "operator").await;
+        let passwords = PasswordService::for_tests();
+        let manager = session_manager(pool.clone());
+        reset_password(
+            &pool,
+            &passwords,
+            &manager,
+            &recent_session("admin", Role::Administrator),
+            "operator",
+            Zeroizing::new("temporary-password".into()),
+        )
+        .await
+        .unwrap();
+
+        let (hash, must_change, version): (String, bool, i64) = sqlx::query_as(
+            "SELECT password_hash, must_change_password, auth_version FROM users WHERE id = 'operator'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(must_change);
+        assert_eq!(version, 2);
+        assert!(
+            passwords
+                .verify(Zeroizing::new("temporary-password".into()), hash)
+                .await
+                .unwrap()
+        );
+        let revoked: Option<String> =
+            sqlx::query_scalar("SELECT revoked_at FROM sessions WHERE id = 'session-operator'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(revoked.is_some());
+        let audits: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_logs WHERE action = 'RESET_USER_PASSWORD' AND actor_user_id = 'admin'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(audits, 1);
+    }
+
+    #[tokio::test]
+    async fn password_reset_requires_recent_admin_and_cannot_target_self() {
+        let pool = test_pool().await;
+        seed_admin(&pool).await;
+        let passwords = PasswordService::for_tests();
+        let manager = session_manager(pool.clone());
+        assert!(
+            reset_password(
+                &pool,
+                &passwords,
+                &manager,
+                &session("admin", Role::Administrator),
+                "missing",
+                Zeroizing::new("temporary-password".into()),
+            )
+            .await
+            .is_err()
+        );
+        assert!(matches!(
+            reset_password(
+                &pool,
+                &passwords,
+                &manager,
+                &recent_session("admin", Role::Administrator),
+                "admin",
+                Zeroizing::new("temporary-password".into()),
+            )
+            .await,
+            Err(crate::error::AppError::Forbidden)
+        ));
+    }
+
+    #[tokio::test]
+    async fn deactivation_revokes_sessions_and_removes_all_app_grants() {
+        let pool = test_pool().await;
+        seed_admin(&pool).await;
+        let now = "2026-08-15T00:00:00Z";
+        sqlx::query("INSERT INTO users(id, organization_id, email, email_normalized, password_hash, role, password_changed_at, created_at, updated_at) VALUES('contributor', 'org', 'contributor@example.test', 'contributor@example.test', 'hash', 'CONTRIBUTOR', ?, ?, ?)")
+            .bind(now).bind(now).bind(now).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO services(id, organization_id, name, name_normalized, created_at, updated_at, created_by, updated_by) VALUES('service', 'org', 'App', 'app', ?, ?, 'admin', 'admin')")
+            .bind(now).bind(now).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO user_service_access(user_id, service_id, granted_at, granted_by) VALUES('contributor', 'service', ?, 'admin')")
+            .bind(now).execute(&pool).await.unwrap();
+        seed_session(&pool, "contributor").await;
+
+        set_active(
+            &pool,
+            &session_manager(pool.clone()),
+            &recent_session("admin", Role::Administrator),
+            "contributor",
+            false,
+        )
+        .await
+        .unwrap();
+        let grants: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM user_service_access WHERE user_id = 'contributor'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let revoked: Option<String> =
+            sqlx::query_scalar("SELECT revoked_at FROM sessions WHERE id = 'session-contributor'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(grants, 0);
+        assert!(revoked.is_some());
+
+        sqlx::query("INSERT INTO user_service_access(user_id, service_id, granted_at, granted_by) VALUES('contributor', 'service', ?, 'admin')")
+            .bind(now).execute(&pool).await.unwrap();
+        set_active(
+            &pool,
+            &session_manager(pool.clone()),
+            &recent_session("admin", Role::Administrator),
+            "contributor",
+            true,
+        )
+        .await
+        .unwrap();
+        let grants_after_reactivation: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM user_service_access WHERE user_id = 'contributor'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(grants_after_reactivation, 0);
     }
 
     #[tokio::test]

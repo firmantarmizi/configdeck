@@ -1,3 +1,8 @@
+use std::sync::{
+    Arc,
+    atomic::{AtomicI64, Ordering},
+};
+
 use anyhow::{Context, anyhow};
 use sqlx::{FromRow, Row, SqlitePool};
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
@@ -16,6 +21,10 @@ use super::{
     SessionManager, SessionTokens, bootstrap::normalize_email, session::SessionUser, totp,
 };
 
+const HOUSEKEEPING_INTERVAL_SECONDS: i64 = 24 * 60 * 60;
+const LOGIN_ATTEMPT_RETENTION: Duration = Duration::hours(24);
+const SESSION_RETENTION_AFTER_EXPIRY: Duration = Duration::days(30);
+
 #[derive(Clone)]
 pub struct AuthService {
     pool: SqlitePool,
@@ -23,6 +32,7 @@ pub struct AuthService {
     passwords: PasswordService,
     sessions: SessionManager,
     dummy_password_hash: String,
+    last_housekeeping_unix: Arc<AtomicI64>,
 }
 
 #[derive(Debug)]
@@ -75,6 +85,7 @@ impl AuthService {
             passwords,
             sessions,
             dummy_password_hash,
+            last_housekeeping_unix: Arc::new(AtomicI64::new(0)),
         })
     }
 
@@ -86,6 +97,7 @@ impl AuthService {
         client_identity: &str,
         user_agent: Option<&str>,
     ) -> Result<AuthOutcome, AppError> {
+        self.maybe_prune_ephemeral_auth_state().await;
         let normalized = normalize_email(email).map_err(|_| AppError::Authentication)?;
         let account_hash = self
             .crypto
@@ -461,6 +473,26 @@ impl AuthService {
         Ok(last.is_some_and(|at| OffsetDateTime::now_utc() < at + Duration::seconds(delay)))
     }
 
+    async fn maybe_prune_ephemeral_auth_state(&self) {
+        let now = OffsetDateTime::now_utc();
+        let now_unix = now.unix_timestamp();
+        let previous = self.last_housekeeping_unix.load(Ordering::Relaxed);
+        if now_unix.saturating_sub(previous) < HOUSEKEEPING_INTERVAL_SECONDS {
+            return;
+        }
+        if self
+            .last_housekeeping_unix
+            .compare_exchange(previous, now_unix, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        if let Err(error) = prune_ephemeral_auth_state(&self.pool, now).await {
+            self.last_housekeeping_unix.store(0, Ordering::Release);
+            tracing::warn!(error = %error, "ephemeral authentication state cleanup failed");
+        }
+    }
+
     async fn record_attempt(
         &self,
         account_hash: &[u8],
@@ -506,10 +538,33 @@ impl AuthService {
     }
 }
 
+async fn prune_ephemeral_auth_state(
+    pool: &SqlitePool,
+    now: OffsetDateTime,
+) -> Result<(), AppError> {
+    let login_cutoff = (now - LOGIN_ATTEMPT_RETENTION)
+        .format(&Rfc3339)
+        .map_err(|error| AppError::Internal(error.into()))?;
+    let session_cutoff = (now - SESSION_RETENTION_AFTER_EXPIRY)
+        .format(&Rfc3339)
+        .map_err(|error| AppError::Internal(error.into()))?;
+    let mut transaction = pool.begin().await?;
+    sqlx::query("DELETE FROM login_attempts WHERE attempted_at < ?")
+        .bind(login_cutoff)
+        .execute(&mut *transaction)
+        .await?;
+    sqlx::query("DELETE FROM sessions WHERE absolute_expires_at < ?")
+        .bind(session_cutoff)
+        .execute(&mut *transaction)
+        .await?;
+    transaction.commit().await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use data_encoding::BASE32_NOPAD;
-    use time::Duration;
+    use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
     use zeroize::Zeroizing;
 
     use crate::{
@@ -522,7 +577,7 @@ mod tests {
         error::AppError,
     };
 
-    use super::AuthService;
+    use super::{AuthService, prune_ephemeral_auth_state};
 
     #[tokio::test]
     async fn bootstrap_admin_is_limited_until_totp_is_confirmed() {
@@ -644,5 +699,78 @@ mod tests {
             )
             .await;
         assert!(matches!(result, Err(AppError::RateLimited)));
+    }
+
+    #[tokio::test]
+    async fn ephemeral_authentication_rows_are_pruned_without_touching_recent_state() {
+        let pool = test_pool().await;
+        let crypto = CryptoManager::new(Zeroizing::new([13; 32]));
+        initialize_and_validate_key_registry(&pool, &crypto)
+            .await
+            .unwrap();
+        let passwords = PasswordService::for_tests();
+        bootstrap_initial_admin(
+            &pool,
+            &crypto,
+            &passwords,
+            &BootstrapSettings {
+                admin_email: Some("admin@example.test".into()),
+                admin_password: Some(Zeroizing::new("bootstrap-password".into())),
+            },
+        )
+        .await
+        .unwrap();
+        let user_id: String = sqlx::query_scalar("SELECT id FROM users LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        for (attempted_at, marker) in [
+            ("2026-08-16T00:00:00Z", 1_u8),
+            ("2026-08-17T12:00:00Z", 2_u8),
+        ] {
+            sqlx::query(
+                "INSERT INTO login_attempts(account_key_hash, client_identity_hash, attempted_at, succeeded) \
+                 VALUES(?, ?, ?, 0)",
+            )
+            .bind(vec![marker; 32])
+            .bind(vec![marker + 10; 32])
+            .bind(attempted_at)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        for (id, absolute_expires_at, marker) in [
+            ("old", "2026-06-01T00:00:00Z", 21_u8),
+            ("recent", "2026-08-17T18:00:00Z", 22_u8),
+        ] {
+            sqlx::query(
+                "INSERT INTO sessions(id, token_hash, csrf_token_hash, user_id, auth_version, \
+                 created_at, last_seen_at, idle_expires_at, absolute_expires_at) \
+                 VALUES(?, ?, ?, ?, 1, '2026-06-01T00:00:00Z', '2026-06-01T00:00:00Z', ?, ?)",
+            )
+            .bind(id)
+            .bind(vec![marker; 32])
+            .bind(vec![marker + 10; 32])
+            .bind(&user_id)
+            .bind(absolute_expires_at)
+            .bind(absolute_expires_at)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let now = OffsetDateTime::parse("2026-08-18T00:00:00Z", &Rfc3339).unwrap();
+        prune_ephemeral_auth_state(&pool, now).await.unwrap();
+
+        let attempts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM login_attempts")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(attempts, 1);
+        assert_eq!(sessions, 1);
     }
 }

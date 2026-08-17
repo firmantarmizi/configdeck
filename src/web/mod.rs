@@ -90,8 +90,7 @@ struct UsersTemplate<'a> {
 #[template(path = "audit.html")]
 struct AuditTemplate<'a> {
     chrome: AppChrome<'a>,
-    entries: &'a [audit::AuditEntry],
-    actions: &'a [String],
+    page: &'a audit::AuditPage,
     filter: &'a audit::AuditFilter,
 }
 
@@ -124,6 +123,7 @@ struct ServicesTemplate<'a> {
 struct EnvironmentsTemplate<'a> {
     chrome: AppChrome<'a>,
     can_manage: bool,
+    can_create_request: bool,
     workspace: &'a environments::ComparisonWorkspace,
 }
 
@@ -160,6 +160,7 @@ struct ChangeRequestNewTemplate<'a> {
 struct ChangeRequestsTemplate<'a> {
     chrome: AppChrome<'a>,
     groups: &'a [ChangeRequestGroup],
+    page: &'a requests::ChangeRequestPage,
     can_review: bool,
 }
 
@@ -317,6 +318,12 @@ struct RecentAuthQuery {
     level: String,
 }
 
+#[derive(Default, Deserialize)]
+struct PageQuery {
+    #[serde(default)]
+    page: u32,
+}
+
 #[derive(Deserialize)]
 struct MetadataForm {
     name: String,
@@ -365,6 +372,25 @@ struct UserRoleForm {
 #[derive(Deserialize)]
 struct UserActiveForm {
     active: bool,
+    csrf_token: String,
+}
+
+#[derive(Deserialize)]
+struct UserPasswordResetForm {
+    temporary_password: String,
+    confirm_password: String,
+    csrf_token: String,
+}
+
+#[derive(Deserialize)]
+struct InlineVariableEditForm {
+    new_key: String,
+    value: String,
+    value_source: String,
+    visibility: String,
+    value_type: String,
+    description: Option<String>,
+    reason: String,
     csrf_token: String,
 }
 
@@ -501,6 +527,7 @@ fn core_routes() -> Router<AppState> {
         .route("/users/{id}/role", post(user_role_update))
         .route("/users/{id}/active", post(user_active_update))
         .route("/users/{id}/totp-reset", post(user_totp_reset))
+        .route("/users/{id}/password-reset", post(user_password_reset))
         .route(
             "/account/password",
             get(password_change_page).post(password_change),
@@ -538,6 +565,10 @@ fn configuration_routes() -> Router<AppState> {
         .route(
             "/environments/{id}/variables",
             get(variable_list).post(variable_record_applied),
+        )
+        .route(
+            "/environments/{environment_id}/variables/{variable_id}/request-edit",
+            post(variable_request_edit),
         )
         .route("/environments/{id}/import", get(import_page))
         .route("/environments/{id}/import/preview", post(import_preview))
@@ -1144,6 +1175,35 @@ async fn user_totp_reset(
     Ok(Redirect::to("/users").into_response())
 }
 
+async fn user_password_reset(
+    State(state): State<AppState>,
+    Path(user_id): Path<String>,
+    headers: HeaderMap,
+    Form(form): Form<UserPasswordResetForm>,
+) -> Result<Response, AppError> {
+    let (_, session) = authenticated(&state, &headers).await?;
+    state.sessions.verify_csrf(&session, &form.csrf_token)?;
+    if !state
+        .sessions
+        .has_recent_auth(&session, PrivilegedAuthLevel::Standard)
+    {
+        return Ok(Redirect::to("/auth/recent?return_to=/users").into_response());
+    }
+    if form.temporary_password != form.confirm_password {
+        return Err(AppError::InvalidRequest);
+    }
+    users::reset_password(
+        &state.pool,
+        &state.passwords,
+        &state.sessions,
+        &session,
+        &user_id,
+        Zeroizing::new(form.temporary_password),
+    )
+    .await?;
+    Ok(Redirect::to("/users").into_response())
+}
+
 async fn password_change_page(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1200,12 +1260,11 @@ async fn audit_list(
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
     let (_, session, csrf) = authenticated_full_with_csrf(&state, &headers).await?;
-    let (entries, actions) = audit::list(&state.pool, &session, &filter).await?;
+    let page = audit::list(&state.pool, &session, &filter).await?;
     Ok(Html(
         AuditTemplate {
             chrome: app_chrome(&state, &session, &csrf, "audit"),
-            entries: &entries,
-            actions: &actions,
+            page: &page,
             filter: &filter,
         }
         .render()?,
@@ -1347,17 +1406,47 @@ async fn environment_list(
 ) -> Result<Response, AppError> {
     let (_, session, csrf) = authenticated_full_with_csrf(&state, &headers).await?;
     let workspace =
-        environments::comparison_for_service(&state.pool, &session, &service_id).await?;
+        environments::comparison_for_service(&state.pool, &state.crypto, &session, &service_id)
+            .await?;
     let html = EnvironmentsTemplate {
         chrome: app_chrome(&state, &session, &csrf, "configurations"),
         can_manage: session
             .user
             .role
             .allows(crate::users::Capability::ManageMetadata),
+        can_create_request: session.user.role.allows(Capability::CreateChangeRequest),
         workspace: &workspace,
     }
     .render()?;
     Ok(Html(html).into_response())
+}
+
+async fn variable_request_edit(
+    State(state): State<AppState>,
+    Path((environment_id, variable_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Form(form): Form<InlineVariableEditForm>,
+) -> Result<Response, AppError> {
+    let (_, session) = authenticated(&state, &headers).await?;
+    state.sessions.verify_csrf(&session, &form.csrf_token)?;
+    let request_id = requests::create_inline_edit(
+        &state.pool,
+        &state.crypto,
+        &session,
+        &environment_id,
+        requests::InlineEditInput {
+            variable_id,
+            new_key: form.new_key,
+            value: form.value,
+            value_source: form.value_source,
+            visibility: form.visibility,
+            value_type: form.value_type,
+            description: form.description,
+            reason: form.reason,
+        },
+    )
+    .await?;
+    Ok(Redirect::to(&format!("/change-requests/{request_id}")).into_response())
 }
 
 async fn environment_create(
@@ -1511,15 +1600,17 @@ async fn change_request_create(
 
 async fn change_request_list(
     State(state): State<AppState>,
+    Query(query): Query<PageQuery>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
     let (_, session, csrf) = authenticated_full_with_csrf(&state, &headers).await?;
-    let records = requests::list_visible(&state.pool, &session).await?;
-    let groups = group_change_requests(records);
+    let page = requests::list_visible_page(&state.pool, &session, query.page.min(100_000)).await?;
+    let groups = group_change_requests(page.records.clone());
     Ok(Html(
         ChangeRequestsTemplate {
             chrome: app_chrome(&state, &session, &csrf, "changes"),
             groups: &groups,
+            page: &page,
             can_review: session.user.role.allows(Capability::ReviewRequest),
         }
         .render()?,

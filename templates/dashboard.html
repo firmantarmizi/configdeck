@@ -2,8 +2,8 @@
 {% block title %}Overview · ConfigDeck{% endblock %}
 {% block content %}
 <div class="hero-heading">
-  <div class="workspace-heading">{% if branding.logo_present %}<img class="organization-logo" src="/organization/logo" alt="{{ branding.name }} logo">{% endif %}<div><p class="eyebrow">{{ branding.name }} · Workspace overview</p><h1>Configuration operations, at a glance</h1><p class="lead">See what is configured, what is changing, and what needs attention.</p></div></div>
-  <div class="hero-actions"><a class="button-link" href="/services">Browse configurations</a><a class="button-link secondary" href="/change-requests">View changes</a></div>
+  <div class="workspace-heading">{% if branding.logo_present %}<img class="organization-logo" src="/organization/logo" alt="{{ branding.name }} logo">{% endif %}<div><p class="eyebrow">{{ branding.name }}</p><h1>Overview</h1><p class="lead">Configuration status and pending work.</p></div></div>
+  <div class="hero-actions"><a class="button-link" href="/services">Open apps</a><a class="button-link secondary" href="/change-requests">View changes</a></div>
 </div>
 
 <section class="metric-grid" aria-label="Configuration summary">
@@ -15,15 +15,15 @@
 
 <div class="dashboard-grid">
   <section class="panel attention-panel">
-    <div class="section-heading"><div><p class="eyebrow">Needs attention</p><h2>Open configuration changes</h2></div><a class="compact-pill" href="/change-requests">View all<svg class="icon" aria-hidden="true"><use href="#icon-arrow-right"></use></svg></a></div>
-    {% if overview.attention.is_empty() %}<div class="friendly-empty"><span class="empty-icon">✓</span><div><strong>Nothing needs attention</strong><p>Open change requests will appear here.</p></div></div>{% else %}
+    <div class="section-heading"><div><h2>Open changes</h2></div><a class="compact-pill" href="/change-requests">View all<svg class="icon" aria-hidden="true"><use href="#icon-arrow-right"></use></svg></a></div>
+    {% if overview.attention.is_empty() %}<div class="friendly-empty"><span class="empty-icon">✓</span><div><strong>All clear</strong><p>No open changes need attention.</p></div></div>{% else %}
     <div class="attention-list">{% for request in overview.attention %}<a href="/change-requests/{{ request.id }}" class="attention-item"><span><strong>{% match request.title %}{% when Some with (title) %}{{ title }}{% when None %}{{ request.reason }}{% endmatch %}</strong><small>{{ request.service_name }} / {{ request.environment_name }} · {{ request.item_count }} item(s)</small></span><span class="status-badge status-{{ request.status|lower }}">{{ request.status }}</span></a>{% endfor %}</div>{% endif %}
   </section>
   <aside class="panel getting-started">
-    <p class="eyebrow">Quick guide</p><h2>Where should I go?</h2>
-    <a href="/services"><strong>Configurations</strong><span>Browse apps, environments, and their current variables.</span></a>
-    <a href="/change-requests"><strong>Changes</strong><span>Create a request or track work waiting for review and input.</span></a>
-    <div class="security-tip"><strong>Sensitive action?</strong><span>ConfigDeck will ask you to confirm your identity only when needed.</span></div>
+    <h2>Shortcuts</h2>
+    <a href="/services"><strong>Configurations</strong><span>Apps, environments, and variables</span></a>
+    <a href="/change-requests"><strong>Changes</strong><span>Requests, reviews, and deployment records</span></a>
+    <div class="security-tip"><strong>Sensitive actions</strong><span>Identity confirmation appears only when required.</span></div>
   </aside>
 </div>
 {% endblock %}

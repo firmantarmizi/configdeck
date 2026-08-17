@@ -6,10 +6,3 @@
 *.db-shm
 *.db-wal
 configdeck_master_key*
-
-# Local project-management records (not part of the public distribution)
-/AGENTS.md
-/docs/implementation-plan.md
-/docs/progress.md
-/docs/release-evidence.md
-/docs/ui-backlog.md

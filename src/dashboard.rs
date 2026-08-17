@@ -1,11 +1,8 @@
 use serde::Serialize;
-use sqlx::SqlitePool;
+use sqlx::{FromRow, SqlitePool};
 
 use crate::{
-    auth::AuthenticatedSession,
-    error::AppError,
-    requests::{self, ChangeRequestSummary},
-    services,
+    auth::AuthenticatedSession, error::AppError, requests::ChangeRequestSummary, services,
     users::Role,
 };
 
@@ -14,9 +11,15 @@ pub struct DashboardOverview {
     pub service_count: usize,
     pub environment_count: i64,
     pub variable_count: i64,
-    pub open_request_count: usize,
-    pub needs_input_count: usize,
+    pub open_request_count: i64,
+    pub needs_input_count: i64,
     pub attention: Vec<ChangeRequestSummary>,
+}
+
+#[derive(FromRow)]
+struct RequestCounts {
+    open_request_count: i64,
+    needs_input_count: i64,
 }
 
 pub async fn overview(
@@ -29,20 +32,34 @@ pub async fn overview(
         .iter()
         .map(|service| service.environment_count)
         .sum();
-    let requests = requests::list_visible(pool, session).await?;
-    let open_request_count = requests
-        .iter()
-        .filter(|request| !matches!(request.status.as_str(), "APPLIED" | "REJECTED"))
-        .count();
-    let needs_input_count = requests
-        .iter()
-        .filter(|request| request.status == "NEEDS_INPUT")
-        .count();
-    let attention = requests
-        .into_iter()
-        .filter(|request| !matches!(request.status.as_str(), "APPLIED" | "REJECTED"))
-        .take(5)
-        .collect();
+    let request_counts = sqlx::query_as::<_, RequestCounts>(
+        "SELECT COUNT(*) AS open_request_count, \
+                COALESCE(SUM(r.status = 'NEEDS_INPUT'), 0) AS needs_input_count \
+         FROM change_requests r JOIN services s ON s.id = r.service_id \
+         WHERE s.organization_id = ? AND (? <> 'CONTRIBUTOR' OR r.requested_by = ?) \
+           AND r.status NOT IN ('APPLIED', 'REJECTED')",
+    )
+    .bind(&session.user.organization_id)
+    .bind(session.user.role.as_str())
+    .bind(&session.user.id)
+    .fetch_one(pool)
+    .await?;
+    let attention = sqlx::query_as::<_, ChangeRequestSummary>(
+        "SELECT r.id, r.environment_id, s.name AS service_name, e.name AS environment_name, \
+                r.title, r.reason, r.status, r.requested_at, COUNT(i.id) AS item_count \
+         FROM change_requests r \
+         JOIN services s ON s.id = r.service_id \
+         JOIN environments e ON e.id = r.environment_id \
+         JOIN change_request_items i ON i.change_request_id = r.id \
+         WHERE s.organization_id = ? AND (? <> 'CONTRIBUTOR' OR r.requested_by = ?) \
+           AND r.status NOT IN ('APPLIED', 'REJECTED') \
+         GROUP BY r.id ORDER BY r.requested_at DESC, r.id DESC LIMIT 5",
+    )
+    .bind(&session.user.organization_id)
+    .bind(session.user.role.as_str())
+    .bind(&session.user.id)
+    .fetch_all(pool)
+    .await?;
     let variable_count: i64 = if session.user.role == Role::Contributor {
         sqlx::query_scalar(
             "SELECT COUNT(*) FROM variables v JOIN environments e ON e.id = v.environment_id \
@@ -68,8 +85,8 @@ pub async fn overview(
         service_count: services.len(),
         environment_count,
         variable_count,
-        open_request_count,
-        needs_input_count,
+        open_request_count: request_counts.open_request_count,
+        needs_input_count: request_counts.needs_input_count,
         attention,
     })
 }

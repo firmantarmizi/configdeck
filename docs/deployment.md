@@ -1,37 +1,116 @@
-# Build, Publish, and Deploy
+# Deployment
 
-ConfigDeck separates public artifact production from environment-specific deployment.
+ConfigDeck runs as one container with a persistent SQLite data volume and a separate backup volume. Deploy it behind HTTPS and a private, VPN, or identity-aware access layer.
 
-## Public repository workflows
+## Published images
 
-- `.github/workflows/ci.yml` validates Rust formatting, lint, tests, MSRV, dependencies, and the container build. It never publishes an image and has read-only permissions by default.
-- `.github/workflows/release.yml` runs only for version tags matching `v*.*.*`. It publishes `ghcr.io/<repository-owner>/<repository-name>` with semantic-version and commit tags, an SBOM, provenance, and a GitHub attestation.
-- GitHub Actions are pinned to full commit SHAs. Dependabot proposes updates for Cargo, Docker, and action dependencies.
+Pushes and pull requests run `.github/workflows/ci.yml`. Version tags matching `v*.*.*` run `.github/workflows/release.yml`, which publishes:
 
-The release workflow uses the repository-provided `GITHUB_TOKEN`; no registry password is required. Protect release tags and require CI before a tag is created.
-
-## Deployment boundary
-
-The public source repository does not contain notification-service credentials, server addresses, SSH keys, or deployment webhooks. A production operator should deploy an immutable image digest from a separate protected environment or private deployment repository.
-
-A downstream deployment flow typically:
-
-1. receives or selects a released image digest;
-2. updates the protected platform or Compose configuration;
-3. preserves `/data`, `/backup`, and the existing master-key secret;
-4. waits for `/health` and `/ready`;
-5. performs the smoke checks in `release-checklist.md`;
-6. records the deployed digest and backup identifier.
-
-If a deployment platform supports a webhook, store it as an environment secret in the private deployment workflow. Do not treat a missing webhook as a successful production deployment, and do not interpolate commit messages or other untrusted event text into shell commands.
-
-## Dockerfile location
-
-The Dockerfile intentionally remains at the repository root. ConfigDeck has one Rust runtime image and no separate Nginx, Supervisor, PHP-FPM, or frontend build configuration tree. The root location keeps Compose, local builds, and GitHub Actions conventional:
-
-```bash
-docker build -t configdeck:local .
-docker compose build
+```text
+ghcr.io/<repository-owner>/<repository-name>:<version>
 ```
 
-If future deployment assets grow into several platform-specific files, they can be grouped under `deployment/` without changing the application architecture.
+The release includes an SBOM, provenance, and GitHub attestation. Production deployments should pin the immutable image digest rather than a mutable tag. Environment-specific credentials, hosts, and webhooks belong in protected deployment configuration, not this repository.
+
+## Prerequisites
+
+- Docker Engine 24+ with Compose v2, or an equivalent container platform.
+- Persistent writable storage mounted at `/data` and `/backup`.
+- A DNS name and HTTPS reverse proxy.
+- A private network path or identity-aware access layer.
+- An off-host destination for verified backups.
+
+Do not use a shared network filesystem for SQLite and do not run multiple ConfigDeck replicas against the same database.
+
+## First deployment with Docker Compose
+
+Copy the environment template and generate the master key once:
+
+```bash
+cp .env.example .env
+mkdir -p secrets
+umask 077
+openssl rand -base64 32 > secrets/configdeck_master_key
+chmod 600 secrets/configdeck_master_key
+```
+
+Set a unique bootstrap Administrator email and password in `.env`, then start:
+
+```bash
+docker compose config --quiet
+docker compose build --pull
+docker compose up -d
+docker compose ps
+curl -fsS http://127.0.0.1:3000/health
+curl -fsS http://127.0.0.1:3000/ready
+```
+
+The master-key file must decode from standard base64 to exactly 32 bytes. Preserve it for the lifetime of the database and back it up separately. Replacing it on an existing database causes ConfigDeck to fail closed.
+
+Complete TOTP enrollment, replace the initial password, finish organization setup, and create a second Administrator. Remove `CONFIGDECK_ADMIN_EMAIL` and `CONFIGDECK_ADMIN_PASSWORD` from the deployment after bootstrap, then recreate only the container. Never remove the data volume during a normal redeploy.
+
+## Required production configuration
+
+```env
+CONFIGDECK_ENV=production
+CONFIGDECK_BIND=0.0.0.0:3000
+CONFIGDECK_DATABASE_URL=sqlite:///data/configdeck.db
+CONFIGDECK_DB_MAX_CONNECTIONS=5
+CONFIGDECK_TRUSTED_PROXIES=
+```
+
+Production reads the KEK from:
+
+```text
+/run/secrets/configdeck_master_key
+```
+
+Keep `CONFIGDECK_TRUSTED_PROXIES` empty unless ConfigDeck is behind a known proxy network. When used, set only the exact proxy CIDR ranges.
+
+## Reverse proxy
+
+- Terminate TLS at the proxy and forward to port `3000` on a private container network or loopback interface.
+- Preserve the original `Host` and HTTPS scheme.
+- Do not cache authenticated responses.
+- Restrict access at the network or identity layer; ConfigDeck login is not a reason to expose the portal directly to the public Internet.
+
+## Runtime baseline
+
+The supplied Compose file provides:
+
+- non-root UID/GID `10001`;
+- a read-only root filesystem;
+- all Linux capabilities dropped and `no-new-privileges`;
+- separate `/data` and `/backup` volumes and a small `/tmp` tmpfs;
+- limits of 0.5 CPU, 256 MiB memory, and 128 processes;
+- loopback-only host publishing and bounded local container logs;
+- `/health` and `/ready` probes.
+
+Monitor health/readiness, restart count, CPU, memory, data/backup free space, backup age, failed authentication, administrative audit events, active restore intent, and nonterminal key rotation.
+
+## Upgrades
+
+1. Create a verified backup and copy it off-host.
+2. Preserve the exact active master-key file.
+3. Record the currently deployed image digest.
+4. Test migrations against a disposable backup copy for major upgrades.
+5. Deploy the new immutable image without deleting volumes.
+6. Verify health, readiness, login/TOTP, App comparison, a restricted reveal, and audit activity.
+
+Rollback to an older image only when schema compatibility is documented. Otherwise restore the pre-upgrade snapshot using the offline procedure in [Operations](operations.md).
+
+## Production acceptance
+
+Before storing real configuration, confirm:
+
+- HTTPS and private/identity-aware access are active;
+- trusted proxy ranges are exact;
+- bootstrap variables have been removed;
+- at least two Administrators can authenticate with TOTP;
+- the master-key backup is protected separately from database backups;
+- backup, offline restore, and key-rotation drills have been completed with synthetic data;
+- data and backup free-space alerts are active;
+- audit and backup retention are documented;
+- the deployed image digest and operational owners are recorded outside ConfigDeck.
+
+See [Operations](operations.md) for backup, restore, retention, and key rotation.

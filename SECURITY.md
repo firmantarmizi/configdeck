@@ -19,6 +19,6 @@ Never include real configuration values, passwords, TOTP seeds or codes, cookies
 
 ## Security model
 
-ConfigDeck is intended for private/internal access behind HTTPS and a private or identity-aware access layer. Review `docs/threat-model.md`, `docs/auth-design.md`, `docs/key-rotation-design.md`, and `docs/production-runbook.md` before production use.
+ConfigDeck is intended for private/internal access behind HTTPS and a private or identity-aware access layer. Review `docs/security-model.md`, `docs/deployment.md`, and `docs/operations.md` before production use.
 
 Security reports will be assessed before public disclosure. A coordinated advisory and patched release should be prepared before exploit details are published.

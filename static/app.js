@@ -32,8 +32,6 @@ function setSidebarCollapsed(collapsed, persist) {
     button.setAttribute("aria-expanded", String(!collapsed));
     button.setAttribute("aria-label", collapsed ? "Expand sidebar" : "Collapse sidebar");
     button.setAttribute("title", collapsed ? "Expand sidebar" : "Collapse sidebar");
-    const label = button.querySelector("span");
-    if (label) label.textContent = collapsed ? "Expand sidebar" : "Collapse sidebar";
   });
   if (!persist) return;
   try {
@@ -53,7 +51,7 @@ function initializeApplicationShell() {
   }
 }
 
-function valueControl(type, value) {
+function valueControl(type, value, name = "value_0") {
   let control;
   if (type === "boolean") {
     control = document.createElement("select");
@@ -76,8 +74,138 @@ function valueControl(type, value) {
     control.value = value;
     control.required = type === "integer" || type === "url";
   }
-  control.name = "value_0";
+  control.name = name;
+  control.dataset.valueInput = "";
   return control;
+}
+
+function updateValueSource(select) {
+  const form = select.closest("form");
+  const field = form?.querySelector(".comparison-value-field");
+  if (!field) return;
+  const operatorProvides = select.value === "OPERATOR_PROVIDED";
+  field.hidden = operatorProvides;
+  const hint = field.querySelector("[data-value-hint]");
+  if (hint) hint.textContent = operatorProvides
+    ? "The operator will provide this value securely during review."
+    : "Restricted values are write-only here.";
+}
+
+function initializeValueSources() {
+  document.querySelectorAll("[data-value-source]").forEach(updateValueSource);
+}
+
+let openSelectMenu;
+const customSelectInstances = new WeakMap();
+
+function closeCustomSelect() {
+  if (!openSelectMenu) return;
+  openSelectMenu.menu.hidden = true;
+  openSelectMenu.trigger.setAttribute("aria-expanded", "false");
+  openSelectMenu = undefined;
+}
+
+function positionCustomSelect(trigger, menu) {
+  const rect = trigger.getBoundingClientRect();
+  menu.style.width = `${rect.width}px`;
+  menu.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - rect.width - 8))}px`;
+  menu.hidden = false;
+  const menuHeight = menu.offsetHeight;
+  const below = window.innerHeight - rect.bottom;
+  menu.style.top = below >= Math.min(menuHeight + 6, 240)
+    ? `${rect.bottom + 4}px`
+    : `${Math.max(8, rect.top - menuHeight - 4)}px`;
+}
+
+function enhanceComparisonSelect(select) {
+  if (select.dataset.customSelectReady !== undefined) return;
+  select.dataset.customSelectReady = "";
+  select.classList.add("native-select-hidden");
+  select.setAttribute("aria-hidden", "true");
+  select.tabIndex = -1;
+
+  const trigger = document.createElement("button");
+  trigger.type = "button";
+  trigger.className = "custom-select-trigger";
+  trigger.setAttribute("aria-haspopup", "listbox");
+  trigger.setAttribute("aria-expanded", "false");
+  const label = document.createElement("span");
+  const arrow = document.createElement("span");
+  arrow.className = "custom-select-arrow";
+  arrow.textContent = "⌄";
+  trigger.append(label, arrow);
+  select.insertAdjacentElement("afterend", trigger);
+
+  const menu = document.createElement("div");
+  menu.className = "custom-select-menu";
+  menu.setAttribute("role", "listbox");
+  menu.hidden = true;
+  document.body.append(menu);
+
+  const sync = () => {
+    const selected = select.options[select.selectedIndex];
+    label.textContent = selected?.textContent || "Select";
+    menu.replaceChildren();
+    Array.from(select.options).forEach((option) => {
+      const item = document.createElement("button");
+      item.type = "button";
+      item.className = "custom-select-option";
+      item.textContent = option.textContent;
+      item.disabled = option.disabled;
+      item.setAttribute("role", "option");
+      item.setAttribute("aria-selected", String(option.selected));
+      if (option.selected) item.classList.add("is-selected");
+      item.addEventListener("click", () => {
+        select.value = option.value;
+        select.dispatchEvent(new Event("change", { bubbles: true }));
+        sync();
+        closeCustomSelect();
+        trigger.focus();
+      });
+      menu.append(item);
+    });
+  };
+
+  const open = () => {
+    closeCustomSelect();
+    sync();
+    positionCustomSelect(trigger, menu);
+    trigger.setAttribute("aria-expanded", "true");
+    openSelectMenu = { trigger, menu };
+  };
+  trigger.addEventListener("click", () => {
+    if (openSelectMenu?.trigger === trigger) closeCustomSelect();
+    else open();
+  });
+  trigger.addEventListener("keydown", (event) => {
+    if (["ArrowDown", "ArrowUp", "Enter", " "].includes(event.key)) {
+      event.preventDefault();
+      open();
+      const options = Array.from(menu.querySelectorAll(".custom-select-option:not(:disabled)"));
+      (options.find((option) => option.classList.contains("is-selected")) || options[0])?.focus();
+    } else if (event.key === "Escape") {
+      closeCustomSelect();
+    }
+  });
+  menu.addEventListener("keydown", (event) => {
+    const options = Array.from(menu.querySelectorAll(".custom-select-option:not(:disabled)"));
+    const index = options.indexOf(document.activeElement);
+    if (event.key === "Escape") {
+      closeCustomSelect();
+      trigger.focus();
+    } else if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      const offset = event.key === "ArrowDown" ? 1 : -1;
+      options[(index + offset + options.length) % options.length]?.focus();
+    }
+  });
+  select.addEventListener("change", sync);
+  customSelectInstances.set(select, { trigger, menu });
+  sync();
+}
+
+function initializeCustomSelects(root = document) {
+  root.querySelectorAll(".comparison-landscape-form select").forEach(enhanceComparisonSelect);
 }
 
 async function writeClipboard(text, status) {
@@ -110,6 +238,7 @@ function updateServiceCatalog() {
   const cards = Array.from(catalog.querySelectorAll("[data-service-card]"));
   const query = document.querySelector("[data-service-search]")?.value.trim().toLowerCase() || "";
   const sort = document.querySelector("[data-service-sort]")?.value || "updated";
+  const status = document.querySelector("[data-service-status]")?.value || "active";
   const compare = (left, right) => {
     const archived = Number(left.dataset.serviceArchived) - Number(right.dataset.serviceArchived);
     if (archived !== 0) return archived;
@@ -129,7 +258,10 @@ function updateServiceCatalog() {
   let visible = 0;
   cards.forEach((card) => {
     const searchable = `${card.dataset.serviceName} ${card.dataset.serviceDescription}`.toLowerCase();
-    const matches = !query || searchable.includes(query);
+    const lifecycleMatches = status === "all"
+      || (status === "archived" && card.dataset.serviceArchived === "1")
+      || (status === "active" && card.dataset.serviceArchived === "0");
+    const matches = lifecycleMatches && (!query || searchable.includes(query));
     card.hidden = !matches;
     if (matches) visible += 1;
   });
@@ -156,7 +288,36 @@ function setComparisonExpanded(row, expanded) {
   const detail = button ? document.getElementById(button.dataset.comparisonToggle) : null;
   if (!button || !detail) return;
   button.setAttribute("aria-expanded", String(expanded));
+  row.classList.toggle("is-expanded", expanded);
   detail.hidden = !expanded;
+}
+
+function updateEnvironmentSelection(changedToggle) {
+  const root = document.querySelector("[data-environment-selector]");
+  if (!root) return;
+  const toggles = Array.from(root.querySelectorAll("[data-environment-toggle]"));
+  const allToggle = root.querySelector("[data-environment-toggle-all]");
+  if (toggles.length === 0) return;
+  if (!toggles.some((toggle) => toggle.checked)) {
+    (changedToggle || toggles[0]).checked = true;
+  }
+  const selected = new Set(toggles.filter((toggle) => toggle.checked).map((toggle) => toggle.value));
+  document.querySelectorAll("[data-comparison-environment]").forEach((element) => {
+    element.hidden = !selected.has(element.dataset.comparisonEnvironment);
+  });
+  document.querySelectorAll("[data-comparison-environment-card]").forEach((element) => {
+    element.hidden = !selected.has(element.dataset.comparisonEnvironmentCard);
+  });
+  if (allToggle) {
+    allToggle.checked = selected.size === toggles.length;
+    allToggle.indeterminate = selected.size > 0 && selected.size < toggles.length;
+  }
+  const count = root.querySelector("[data-environment-count]");
+  if (count) count.textContent = `${selected.size} of ${toggles.length} selected`;
+}
+
+function initializeEnvironmentSelector() {
+  updateEnvironmentSelection();
 }
 
 function updateComparison() {
@@ -185,9 +346,14 @@ function updateComparison() {
     row.hidden = !matches;
     if (detail && !matches) {
       detail.hidden = true;
+      row.classList.remove("is-expanded");
       row.querySelector("[data-comparison-toggle]")?.setAttribute("aria-expanded", "false");
     }
-    if (matches) visible += 1;
+    if (matches) {
+      visible += 1;
+      const index = row.querySelector("[data-comparison-index]");
+      if (index) index.textContent = String(visible);
+    }
   });
   const count = document.querySelector("[data-comparison-count]");
   if (count) count.textContent = `${visible} of ${rows.length} keys`;
@@ -249,7 +415,7 @@ function initializeGlobalSearch() {
     const query = input.value.trim();
     if (query.length < 2) {
       controller?.abort();
-      message("Type at least two characters to search authorized key metadata.");
+      message("Type at least two characters.");
       return;
     }
     controller?.abort();
@@ -306,6 +472,11 @@ function initializeGlobalSearch() {
 }
 
 document.addEventListener("click", (event) => {
+  if (openSelectMenu
+      && !openSelectMenu.trigger.contains(event.target)
+      && !openSelectMenu.menu.contains(event.target)) {
+    closeCustomSelect();
+  }
   const themeButton = event.target.closest("[data-theme-toggle]");
   if (themeButton) {
     setTheme(currentTheme() === "dark" ? "light" : "dark");
@@ -325,6 +496,23 @@ document.addEventListener("click", (event) => {
   if (comparisonToggle) {
     const row = comparisonToggle.closest("[data-comparison-row]");
     if (row) setComparisonExpanded(row, comparisonToggle.getAttribute("aria-expanded") !== "true");
+    return;
+  }
+  const comparisonAction = event.target.closest("[data-comparison-action]");
+  if (comparisonAction) {
+    const row = comparisonAction.closest("[data-comparison-row]");
+    if (!row) return;
+    setComparisonExpanded(row, true);
+    const detailId = row.querySelector("[data-comparison-toggle]")?.dataset.comparisonToggle;
+    const detail = detailId ? document.getElementById(detailId) : null;
+    const selector = comparisonAction.dataset.comparisonAction === "delete"
+      ? "[data-comparison-delete]"
+      : "[data-comparison-edit]";
+    const action = detail?.querySelector(selector);
+    if (action) {
+      action.open = true;
+      action.querySelector("summary")?.focus();
+    }
     return;
   }
   const expandAll = event.target.closest("[data-comparison-expand]");
@@ -407,7 +595,19 @@ document.addEventListener("submit", (event) => {
 });
 
 document.addEventListener("change", (event) => {
-  const serviceSort = event.target.closest("[data-service-sort]");
+  const environmentAll = event.target.closest("[data-environment-toggle-all]");
+  if (environmentAll) {
+    const toggles = Array.from(document.querySelectorAll("[data-environment-toggle]"));
+    toggles.forEach((toggle, index) => { toggle.checked = environmentAll.checked || index === 0; });
+    updateEnvironmentSelection(toggles[0]);
+    return;
+  }
+  const environmentToggle = event.target.closest("[data-environment-toggle]");
+  if (environmentToggle) {
+    updateEnvironmentSelection(environmentToggle);
+    return;
+  }
+  const serviceSort = event.target.closest("[data-service-sort], [data-service-status]");
   if (serviceSort) {
     updateServiceCatalog();
     return;
@@ -415,6 +615,11 @@ document.addEventListener("change", (event) => {
   const comparisonControl = event.target.closest("[data-comparison-filter], [data-comparison-sort]");
   if (comparisonControl) {
     updateComparison();
+    return;
+  }
+  const valueSource = event.target.closest("[data-value-source]");
+  if (valueSource) {
+    updateValueSource(valueSource);
     return;
   }
   const logoInput = event.target.closest("[data-logo-input]");
@@ -436,14 +641,23 @@ document.addEventListener("change", (event) => {
     wrapper.hidden = false;
     return;
   }
-  const typeSelect = event.target.closest('select[name="value_type_0"]');
+  const typeSelect = event.target.closest('select[name="value_type_0"], [data-value-type]');
   if (!typeSelect) return;
   const form = typeSelect.closest("form");
-  const current = form?.querySelector('[name="value_0"]');
+  const current = typeSelect.dataset.valueType !== undefined
+    ? form?.querySelector("[data-value-input]")
+    : form?.querySelector('[name="value_0"]');
   if (!current) return;
-  const replacement = valueControl(typeSelect.value, current.value);
+  const replacement = valueControl(typeSelect.value, current.value, current.name);
+  const customSelect = customSelectInstances.get(current);
+  if (customSelect) {
+    if (openSelectMenu?.trigger === customSelect.trigger) closeCustomSelect();
+    customSelect.trigger.remove();
+    customSelect.menu.remove();
+  }
   current.replaceWith(replacement);
-  replacement.focus();
+  initializeCustomSelects(form);
+  (customSelectInstances.get(replacement)?.trigger || replacement).focus();
 });
 
 document.addEventListener("input", (event) => {
@@ -476,6 +690,12 @@ document.addEventListener("DOMContentLoaded", () => {
   initializeApplicationShell();
   initializeGlobalSearch();
   initializeServiceCatalog();
+  initializeEnvironmentSelector();
+  initializeValueSources();
+  initializeCustomSelects();
   updateComparison();
 });
+
+window.addEventListener("resize", closeCustomSelect);
+window.addEventListener("scroll", closeCustomSelect, true);
 }());

@@ -23,6 +23,7 @@ use crate::{
 
 const MAX_ITEMS: usize = 50;
 const MAX_TITLE_CHARS: usize = 200;
+const LIST_PAGE_SIZE: i64 = 25;
 
 #[derive(Clone, Deserialize)]
 pub struct ChangeRequestInput {
@@ -43,6 +44,18 @@ pub struct ChangeRequestItemInput {
     pub description: Option<String>,
 }
 
+#[derive(Clone)]
+pub struct InlineEditInput {
+    pub variable_id: String,
+    pub new_key: String,
+    pub value: String,
+    pub value_source: String,
+    pub visibility: String,
+    pub value_type: String,
+    pub description: Option<String>,
+    pub reason: String,
+}
+
 #[derive(Clone, Debug, FromRow, Serialize)]
 pub struct ChangeRequestSummary {
     pub id: String,
@@ -54,6 +67,18 @@ pub struct ChangeRequestSummary {
     pub status: String,
     pub requested_at: String,
     pub item_count: i64,
+}
+
+#[derive(Debug)]
+pub struct ChangeRequestPage {
+    pub records: Vec<ChangeRequestSummary>,
+    pub current_page: u32,
+    pub total_pages: u32,
+    pub total_items: i64,
+    pub has_previous: bool,
+    pub has_next: bool,
+    pub previous_page: u32,
+    pub next_page: u32,
 }
 
 #[derive(Clone, Debug, FromRow, Serialize)]
@@ -311,6 +336,80 @@ pub async fn create(
     Ok(request_id)
 }
 
+/// Creates one safe per-environment inline edit. A key change is represented as an
+/// atomic DELETE + ADD change set so immutable variable history is never rewritten.
+pub async fn create_inline_edit(
+    pool: &SqlitePool,
+    crypto: &CryptoManager,
+    session: &AuthenticatedSession,
+    environment_id: &str,
+    input: InlineEditInput,
+) -> Result<String, AppError> {
+    let current_key: String = sqlx::query_scalar(
+        "SELECT v.key FROM variables v \
+         JOIN environments e ON e.id = v.environment_id \
+         JOIN services s ON s.id = e.service_id \
+         WHERE v.id = ? AND v.environment_id = ? AND v.lifecycle_status = 'ACTIVE' \
+           AND s.organization_id = ?",
+    )
+    .bind(&input.variable_id)
+    .bind(environment_id)
+    .bind(&session.user.organization_id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or(AppError::NotFound)?;
+    let new_key = validate_key(&input.new_key)?;
+    let value = if input.value_source == "OPERATOR_PROVIDED" {
+        None
+    } else {
+        Some(input.value)
+    };
+    let proposed = ChangeRequestItemInput {
+        action: if new_key == current_key {
+            "UPDATE".to_owned()
+        } else {
+            "ADD".to_owned()
+        },
+        key: new_key.clone(),
+        value,
+        value_source: Some(input.value_source),
+        visibility: Some(input.visibility),
+        value_type: Some(input.value_type),
+        description: input.description,
+    };
+    let (title, items) = if new_key == current_key {
+        (format!("Update {current_key}"), vec![proposed])
+    } else {
+        (
+            format!("Rename {current_key} to {new_key}"),
+            vec![
+                ChangeRequestItemInput {
+                    action: "DELETE".to_owned(),
+                    key: current_key,
+                    value: None,
+                    value_source: None,
+                    visibility: None,
+                    value_type: None,
+                    description: None,
+                },
+                proposed,
+            ],
+        )
+    };
+    create(
+        pool,
+        crypto,
+        session,
+        ChangeRequestInput {
+            environment_id: environment_id.to_owned(),
+            title: Some(title),
+            reason: input.reason,
+            items,
+        },
+    )
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prepare_item(
     crypto: &CryptoManager,
@@ -415,22 +514,49 @@ fn prepare_item(
     })
 }
 
-pub async fn list_visible(
+pub async fn list_visible_page(
     pool: &SqlitePool,
     session: &AuthenticatedSession,
-) -> Result<Vec<ChangeRequestSummary>, AppError> {
+    requested_page: u32,
+) -> Result<ChangeRequestPage, AppError> {
     session.require_full()?;
-    Ok(sqlx::query_as::<_, ChangeRequestSummary>(
-        "SELECT r.id, r.environment_id, s.name AS service_name, e.name AS environment_name, r.title, r.reason, r.status, r.requested_at, COUNT(i.id) AS item_count \
-         FROM change_requests r JOIN services s ON s.id = r.service_id JOIN environments e ON e.id = r.environment_id \
-         JOIN change_request_items i ON i.change_request_id = r.id \
-         WHERE s.organization_id = ? AND (? <> 'CONTRIBUTOR' OR r.requested_by = ?) GROUP BY r.id ORDER BY r.requested_at DESC",
+    let total_items: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM change_requests r JOIN services s ON s.id = r.service_id \
+         WHERE s.organization_id = ? AND (? <> 'CONTRIBUTOR' OR r.requested_by = ?)",
     )
     .bind(&session.user.organization_id)
     .bind(session.user.role.as_str())
     .bind(&session.user.id)
+    .fetch_one(pool)
+    .await?;
+    let total_pages = u32::try_from(((total_items + LIST_PAGE_SIZE - 1) / LIST_PAGE_SIZE).max(1))
+        .map_err(|_| AppError::InvalidRequest)?;
+    let current_page = requested_page.max(1).min(total_pages);
+    let offset = i64::from(current_page - 1) * LIST_PAGE_SIZE;
+    let records = sqlx::query_as::<_, ChangeRequestSummary>(
+        "SELECT r.id, r.environment_id, s.name AS service_name, e.name AS environment_name, r.title, r.reason, r.status, r.requested_at, COUNT(i.id) AS item_count \
+         FROM change_requests r JOIN services s ON s.id = r.service_id JOIN environments e ON e.id = r.environment_id \
+         JOIN change_request_items i ON i.change_request_id = r.id \
+         WHERE s.organization_id = ? AND (? <> 'CONTRIBUTOR' OR r.requested_by = ?) \
+         GROUP BY r.id ORDER BY r.requested_at DESC, r.id DESC LIMIT ? OFFSET ?",
+    )
+    .bind(&session.user.organization_id)
+    .bind(session.user.role.as_str())
+    .bind(&session.user.id)
+    .bind(LIST_PAGE_SIZE)
+    .bind(offset)
     .fetch_all(pool)
-    .await?)
+    .await?;
+    Ok(ChangeRequestPage {
+        records,
+        current_page,
+        total_pages,
+        total_items,
+        has_previous: current_page > 1,
+        has_next: current_page < total_pages,
+        previous_page: current_page.saturating_sub(1).max(1),
+        next_page: (current_page + 1).min(total_pages),
+    })
 }
 
 pub async fn fulfill_value(
@@ -1502,8 +1628,9 @@ mod tests {
     };
 
     use super::{
-        ChangeRequestInput, ChangeRequestItemInput, approve, create, detail, fulfill_value,
-        list_visible, mark_applied, preview_resulting,
+        ChangeRequestInput, ChangeRequestItemInput, InlineEditInput, approve, create,
+        create_inline_edit, detail, fulfill_value, list_visible_page, mark_applied,
+        preview_resulting,
     };
 
     #[tokio::test]
@@ -1594,8 +1721,20 @@ mod tests {
         create(&pool, &crypto, &admin, request(&environment_id))
             .await
             .unwrap();
-        assert_eq!(list_visible(&pool, &contributor).await.unwrap().len(), 1);
-        assert_eq!(list_visible(&pool, &admin).await.unwrap().len(), 2);
+        assert_eq!(
+            list_visible_page(&pool, &contributor, 1)
+                .await
+                .unwrap()
+                .records
+                .len(),
+            1
+        );
+        let page = list_visible_page(&pool, &admin, 1).await.unwrap();
+        assert_eq!(page.records.len(), 2);
+        assert_eq!(page.total_items, 2);
+        assert_eq!(page.total_pages, 1);
+        assert!(!page.has_previous);
+        assert!(!page.has_next);
     }
 
     #[tokio::test]
@@ -1656,6 +1795,164 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn inline_key_rename_creates_one_atomic_delete_and_add_request() {
+        let pool = test_pool().await;
+        seed_identity(&pool).await;
+        let crypto = CryptoManager::new(Zeroizing::new([88; 32]));
+        initialize_and_validate_key_registry(&pool, &crypto)
+            .await
+            .unwrap();
+        let admin = session("admin", Role::Administrator);
+        let service_id = services::create(
+            &pool,
+            &admin,
+            ServiceInput {
+                name: "Inline App".into(),
+                description: None,
+            },
+        )
+        .await
+        .unwrap();
+        let environment_id = environments::create(
+            &pool,
+            &crypto,
+            &admin,
+            &service_id,
+            EnvironmentInput {
+                name: "development".into(),
+                description: None,
+            },
+        )
+        .await
+        .unwrap();
+        let variable_id = variables::record_applied(
+            &pool,
+            &crypto,
+            &admin,
+            &environment_id,
+            AppliedVariableInput {
+                key: "OLD_KEY".into(),
+                value: "old-value".into(),
+                visibility: "public".into(),
+                value_type: "string".into(),
+                description: Some("Original".into()),
+                reason: "seed current configuration".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let request_id = create_inline_edit(
+            &pool,
+            &crypto,
+            &admin,
+            &environment_id,
+            InlineEditInput {
+                variable_id,
+                new_key: "NEW_KEY".into(),
+                value: "replacement".into(),
+                value_source: "REQUESTER_PROVIDED".into(),
+                visibility: "public".into(),
+                value_type: "string".into(),
+                description: Some("Renamed".into()),
+                reason: "rename configuration key".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let items: Vec<(String, String)> = sqlx::query_as(
+            "SELECT action, key FROM change_request_items WHERE change_request_id = ? ORDER BY action DESC",
+        )
+        .bind(&request_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(items.len(), 2);
+        assert!(items.contains(&("DELETE".into(), "OLD_KEY".into())));
+        assert!(items.contains(&("ADD".into(), "NEW_KEY".into())));
+        let current_key: String =
+            sqlx::query_scalar("SELECT key FROM variables WHERE id = (SELECT variable_id FROM change_request_items WHERE change_request_id = ? AND action = 'DELETE')")
+                .bind(&request_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(current_key, "OLD_KEY");
+    }
+
+    #[tokio::test]
+    async fn inline_restricted_operator_value_never_stores_plaintext() {
+        let pool = test_pool().await;
+        seed_identity(&pool).await;
+        let crypto = CryptoManager::new(Zeroizing::new([89; 32]));
+        initialize_and_validate_key_registry(&pool, &crypto)
+            .await
+            .unwrap();
+        let admin = session("admin", Role::Administrator);
+        let service_id = services::create(
+            &pool,
+            &admin,
+            ServiceInput {
+                name: "Restricted Inline".into(),
+                description: None,
+            },
+        )
+        .await
+        .unwrap();
+        let environment_id = environments::create(
+            &pool,
+            &crypto,
+            &admin,
+            &service_id,
+            EnvironmentInput {
+                name: "production".into(),
+                description: None,
+            },
+        )
+        .await
+        .unwrap();
+        let variable_id = variables::record_applied(
+            &pool,
+            &crypto,
+            &admin,
+            &environment_id,
+            AppliedVariableInput {
+                key: "SECRET_KEY".into(),
+                value: "existing-secret".into(),
+                visibility: "restricted".into(),
+                value_type: "string".into(),
+                description: None,
+                reason: "seed restricted value".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let request_id = create_inline_edit(
+            &pool,
+            &crypto,
+            &admin,
+            &environment_id,
+            InlineEditInput {
+                variable_id,
+                new_key: "SECRET_KEY".into(),
+                value: "must-be-ignored".into(),
+                value_source: "OPERATOR_PROVIDED".into(),
+                visibility: "restricted".into(),
+                value_type: "string".into(),
+                description: None,
+                reason: "rotate restricted value".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let (status, encrypted): (String, Option<Vec<u8>>) = sqlx::query_as(
+            "SELECT cr.status, cri.encrypted_proposed_value FROM change_requests cr JOIN change_request_items cri ON cri.change_request_id = cr.id WHERE cr.id = ?",
+        )
+        .bind(request_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "NEEDS_INPUT");
+        assert!(encrypted.is_none());
     }
 
     #[tokio::test]

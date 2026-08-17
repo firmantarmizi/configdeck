@@ -48,7 +48,7 @@ docker compose run --rm configdeck migrate
 
 Data and backups use separate named volumes. The container is non-root, drops capabilities, uses `no-new-privileges`, and has a read-only root filesystem.
 
-For a real deployment, follow [`docs/production-runbook.md`](docs/production-runbook.md) and complete [`docs/release-checklist.md`](docs/release-checklist.md). The supplied Compose baseline constrains the runtime to 0.5 CPU, 256 MiB memory, 128 processes, loopback-only publishing, bounded local logs, and separate data/backup volumes. Put ConfigDeck behind HTTPS plus a private or identity-aware access layer.
+For a real deployment, follow [`docs/deployment.md`](docs/deployment.md). The supplied Compose baseline constrains the runtime to 0.5 CPU, 256 MiB memory, 128 processes, loopback-only publishing, bounded local logs, and separate data/backup volumes. Put ConfigDeck behind HTTPS plus a private or identity-aware access layer.
 
 ### Manual smoke test from WSL
 
@@ -79,13 +79,13 @@ curl -fsS http://127.0.0.1:3000/ready
 
 Both `curl` commands must succeed, and `docker compose ps` must eventually show the service as healthy. Open `http://127.0.0.1:3000` from Windows to complete the first login and TOTP enrollment. Never commit `.env` or the generated `secrets/` directory.
 
-After login, open **Configurations**. Creating a service atomically provisions **Development**, **Staging**, and **Production** with independent encrypted environment keys; custom environments remain available for cases such as QA or preview. Administrator can archive services and environments. Operator and Administrator can record a variable only after its exact value has already been applied in the target deployment platform. Restricted values are masked in list/history responses and require recent authentication for an explicit reveal. Recording a deletion means confirming that the key was already removed from the deployment platform; it creates a tombstone and immutable encrypted history instead of erasing the record.
+After login, open **Configurations**. Creating an App atomically provisions **Development**, **Staging**, and **Production** with independent encrypted environment keys; custom environments remain available for cases such as QA or preview. The App workspace provides a numbered cross-environment matrix with a view-only environment selector. Each expanded key lists selected environments vertically with directly editable fields: public values can be reviewed inline, restricted values remain masked, and every submit creates a traceable request instead of mutating current state. A key rename becomes one atomic delete-and-add change set so immutable history remains intact. Administrator can reversibly archive custom environments, Apps, and existing environment metadata; archived items remain restorable and do not erase history. Operator and Administrator can record a variable only after its exact value has already been applied in the target deployment platform. Recording a deletion means confirming that the key was already removed from that platform; it creates a tombstone and immutable encrypted history instead of erasing the record.
 
-Accounts created from **Users & Access** must replace their initial password at first sign-in. Administrator role/status/TOTP changes require recent identity confirmation, revoke the target's sessions, and cannot remove the last active Administrator. Operator and Administrator can inspect the filtered **Audit log**; only explicitly allowlisted non-secret metadata is rendered.
+Accounts created from **Users & Access** must replace their initial password at first sign-in. Administrator role/status/password/TOTP changes require recent identity confirmation and cannot target the Administrator's own destructive identity controls. Password reset sets a temporary password, revokes all target sessions, and forces replacement at next sign-in. Removing a user safely deactivates the account and revokes every session and App grant while preserving audit/history; reactivation does not restore prior grants. The last active Administrator remains protected. Operator and Administrator can inspect the filtered **Audit log**; only explicitly allowlisted non-secret metadata is rendered.
 
-Administrators use **Maintenance → Backup & recovery** to create verified SQLite snapshots and prepare offline restore intents. Both writes require recent identity confirmation. The application never replaces a live database; follow [`docs/backup-restore-runbook.md`](docs/backup-restore-runbook.md) after creating an intent.
+Administrators use **Maintenance → Backup & recovery** to create verified SQLite snapshots and prepare offline restore intents. Both writes require recent identity confirmation. The application never replaces a live database; follow [`docs/operations.md`](docs/operations.md) after creating an intent.
 
-**Maintenance → Key rotation** supports atomic KEK re-wrap/TOTP re-encryption and synchronous resumable per-environment DEK rotation. Both require high-impact identity confirmation. Follow [`docs/key-rotation-runbook.md`](docs/key-rotation-runbook.md); never replace the active master-key file without first preserving it as the temporary previous-key secret.
+**Maintenance → Key rotation** supports atomic KEK re-wrap/TOTP re-encryption and synchronous resumable per-environment DEK rotation. Both require high-impact identity confirmation. Follow [`docs/operations.md`](docs/operations.md); never replace the active master-key file without first preserving it as the temporary previous-key secret.
 
 For initial migration, refresh privileged authentication and select **Import .env**. The preview never repeats plaintext values and defaults every row to `restricted`; search/filter keys, apply bulk visibility only to the currently visible rows, and review the suggested type before confirming. **Preview .env** decrypts the complete current environment only after recent authentication and supports Copy `.env`, Copy Selected, and download. Close the preview after use because it contains plaintext restricted values.
 
@@ -120,6 +120,7 @@ Pull requests and pushes are checked by [`.github/workflows/ci.yml`](.github/wor
 - Read [`CONTRIBUTING.md`](CONTRIBUTING.md) before opening a pull request.
 - Report vulnerabilities privately according to [`SECURITY.md`](SECURITY.md); do not open a public issue containing exploit details or real configuration values.
 - Planned improvements and explicitly deferred scope are listed in [`ROADMAP.md`](ROADMAP.md).
+- Public technical documentation is intentionally concise: [Architecture](docs/architecture.md), [Security model](docs/security-model.md), [Deployment](docs/deployment.md), and [Operations](docs/operations.md).
 
 ## Security and production checklist
 
@@ -129,6 +130,7 @@ Pull requests and pushes are checked by [`.github/workflows/ci.yml`](.github/wor
 - Test backup restore and key rotation on disposable data before relying on them operationally.
 - Treat Preview/Download `.env` and restricted reveal as sensitive browser surfaces; finish the task and close them.
 - Review audit events and copy important backups off-host.
+- Define audit and backup retention before production. Authentication housekeeping is bounded automatically, while audit/history/archive and verified snapshots are never deleted silently.
 
 ## Current limitations
 
