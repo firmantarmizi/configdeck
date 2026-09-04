@@ -1,0 +1,22 @@
+{% extends "app_base.html" %}
+{% block title %}Review .env request · ConfigDeck{% endblock %}
+{% block content %}
+<nav class="breadcrumbs" aria-label="Breadcrumb"><a href="/services">Configurations</a><span>/</span><a href="/services/{{ environment.service_id }}/environments">{{ environment.service_name }}</a><span>/</span><span>{{ environment.name }}</span><span>/</span><span>Review request</span></nav>
+<div class="hero-heading compact-heading"><div><p class="eyebrow">Bulk request preview</p><h1>Review {{ entries.len() }} configuration keys</h1><p class="lead">Values remain encrypted and are not repeated on this page.</p></div></div>
+<div class="notice"><strong>Check the detected action</strong><span>New keys are marked Add. Existing keys are marked Update and keep their current value until this request is reviewed and applied.</span></div>
+<form method="post" action="/environments/{{ environment.id }}/change-requests/import/commit" class="stack">
+  <input type="hidden" name="csrf_token" value="{{ chrome.csrf_token }}"><input type="hidden" name="preview_token" value="{{ preview_token }}">
+  <section class="panel request-overview">
+    <label>Request name <span class="field-hint">Optional</span><input name="title" maxlength="200" placeholder="Example: Add payment gateway settings"></label>
+    <label>{% if requires_reason %}Change reason{% else %}Notes <span class="field-hint">Optional</span>{% endif %}<input name="reason" maxlength="1000"{% if requires_reason %} required placeholder="Why are the existing keys being updated?"{% else %} placeholder="Context for the reviewer"{% endif %}></label>
+  </section>
+  <section class="panel import-review-toolbar">
+    <label>Find keys<input type="search" placeholder="Filter by key" data-import-search></label>
+    <label>Set visible rows to<select data-import-bulk-visibility><option value="restricted">Restricted</option><option value="public">Public</option></select></label>
+    <button type="button" class="secondary" data-import-apply-visible>Apply to visible</button>
+    <span class="copy-status" data-import-status aria-live="polite">Showing {{ entries.len() }} of {{ entries.len() }}</span>
+  </section>
+  <div class="table-wrap panel-table import-review-table"><table><thead><tr><th>Action / key</th><th>Description</th><th>Group</th><th>Visibility</th><th>Type</th></tr></thead><tbody>{% for entry in entries %}<tr data-import-row data-import-key="{{ entry.key }}"{% if entry.starts_group %} class="import-group-start"{% endif %}><td><span class="status-badge request-action-{{ entry.action|lower }}">{{ entry.action }}</span><code>{{ entry.key }}</code></td><td><input name="description_{{ loop.index0 }}" maxlength="1000" placeholder="Optional" value="{% match entry.description %}{% when Some with (description) %}{{ description }}{% when None %}{% endmatch %}"></td><td><input name="group_name_{{ loop.index0 }}" maxlength="80" placeholder="Ungrouped" value="{% match entry.group_name %}{% when Some with (group) %}{{ group }}{% when None %}{% endmatch %}"></td><td><select name="visibility_{{ loop.index0 }}" data-import-visibility><option value="restricted" selected>Restricted</option><option value="public">Public</option></select></td><td><select name="value_type_{{ loop.index0 }}"><option value="string"{% if entry.suggested_type == "string" %} selected{% endif %}>String</option><option value="boolean"{% if entry.suggested_type == "boolean" %} selected{% endif %}>Boolean</option><option value="integer"{% if entry.suggested_type == "integer" %} selected{% endif %}>Integer</option><option value="url"{% if entry.suggested_type == "url" %} selected{% endif %}>URL</option><option value="multiline"{% if entry.suggested_type == "multiline" %} selected{% endif %}>Multiline</option></select></td></tr>{% endfor %}</tbody></table></div>
+  <div class="form-actions"><a class="button-link tertiary" href="/environments/{{ environment.id }}/change-requests/import">Start over</a><button type="submit"><svg class="icon" aria-hidden="true"><use href="#icon-check"></use></svg>Submit request</button></div>
+</form>
+{% endblock %}

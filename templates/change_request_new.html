@@ -1,23 +1,29 @@
 {% extends "app_base.html" %}
-{% block title %}New change request · ConfigDeck{% endblock %}
+{% block title %}Add configuration keys · ConfigDeck{% endblock %}
 {% block content %}
-<nav class="breadcrumbs" aria-label="Breadcrumb"><a href="/services">Configurations</a><span>/</span><a href="/environments/{{ environment.id }}/variables">{{ environment.service_name }} / {{ environment.name }}</a><span>/</span><span>New request</span></nav>
-<div class="hero-heading compact-heading"><div><p class="eyebrow">New change request</p><h1>Describe the configuration change</h1><p class="lead">Group related additions, updates, or deletions into one traceable request.</p></div></div>
-<div class="notice"><strong>How values are handled</strong><span>“I provide it” encrypts the value immediately. “Operator provides it” leaves the request waiting for secure input. Restricted values become write-only after submission.</span></div>
-<form method="post" action="/environments/{{ environment.id }}/change-requests" class="stack request-builder">
+<nav class="breadcrumbs" aria-label="Breadcrumb"><a href="/services">Configurations</a><span>/</span><a href="/services/{{ environment.service_id }}/environments">{{ environment.service_name }}</a><span>/</span><span>{{ environment.name }}</span><span>/</span><span>Add keys</span></nav>
+<div class="hero-heading compact-heading request-builder-heading"><div><p class="eyebrow">New request</p><h1>Add configuration keys</h1><p class="lead">Start with one key and add more when they belong in the same review.</p></div><a class="button-link secondary" href="/environments/{{ environment.id }}/change-requests/import"><svg class="icon" aria-hidden="true"><use href="#icon-file"></use></svg>Paste .env</a></div>
+<div class="notice"><strong>Values stay protected</strong><span>Choose “I provide it” to encrypt a value immediately, or leave secure fulfillment to an Operator. Restricted values are write-only after submission.</span></div>
+<form method="post" action="/environments/{{ environment.id }}/change-requests" class="stack request-builder" data-request-builder>
   <input type="hidden" name="csrf_token" value="{{ chrome.csrf_token }}">
-  <section class="panel form-grid"><label>Title <span class="field-hint">Optional</span><input name="title" maxlength="200" placeholder="Example: Configure payment gateway"></label><label>Why is this change needed?<textarea name="reason" maxlength="1000" rows="3" required placeholder="Give reviewers enough context to understand the change."></textarea></label></section>
-  {% for index in 0..5 %}
-  <fieldset class="panel request-item"><legend>Change item {{ index + 1 }}</legend>
-    <label>Action<select name="action_{{ index }}"><option value="">Unused row</option><option value="ADD">Add</option><option value="UPDATE">Update</option><option value="DELETE">Delete</option></select></label>
-    <label>Variable key<input name="key_{{ index }}" maxlength="255" pattern="[A-Za-z_][A-Za-z0-9_]*" placeholder="DATABASE_URL"></label>
-    <label>Who supplies the value?<select name="value_source_{{ index }}"><option value="REQUESTER_PROVIDED">I provide it</option><option value="OPERATOR_PROVIDED">Operator provides it</option></select></label>
-    <label>Value<textarea name="value_{{ index }}" maxlength="32768" rows="2"></textarea></label>
-    <label>Visibility<select name="visibility_{{ index }}"><option value="restricted">Restricted</option><option value="public">Public</option></select></label>
-    <label>Type<select name="value_type_{{ index }}"><option value="string">String</option><option value="boolean">Boolean</option><option value="integer">Integer</option><option value="url">URL</option><option value="multiline">Multiline</option></select></label>
-    <label class="span-two">Description <span class="field-hint">Optional</span><textarea name="description_{{ index }}" maxlength="1000" rows="2"></textarea></label>
-  </fieldset>
-  {% endfor %}
-  <div class="form-actions"><a class="button-link tertiary" href="/environments/{{ environment.id }}/variables">Cancel</a><button type="submit">Submit change request</button></div>
+  <section class="panel request-overview">
+    <label>Request name <span class="field-hint">Optional</span><input name="title" maxlength="200" placeholder="Example: Add payment gateway settings"></label>
+    <label>Notes <span class="field-hint">Optional</span><input name="reason" maxlength="1000" placeholder="Context for the reviewer"></label>
+  </section>
+  <div class="request-item-list" data-request-item-list>
+    <fieldset class="panel request-item" data-request-item data-request-index="0"><legend>Key 1</legend>
+      <input type="hidden" name="action_0" value="ADD">
+      <button type="button" class="icon-button request-item-remove" data-request-remove title="Remove this key" aria-label="Remove this key" hidden><svg class="icon" aria-hidden="true"><use href="#icon-trash"></use></svg></button>
+      <label>Variable key<input name="key_0" maxlength="255" pattern="[A-Za-z_][A-Za-z0-9_]*" placeholder="DATABASE_URL" required></label>
+      <label>Who supplies the value?<select name="value_source_0" data-value-source><option value="REQUESTER_PROVIDED">I provide it</option><option value="OPERATOR_PROVIDED">Operator provides it</option></select></label>
+      <label class="request-value-field" data-value-field>Value<input name="value_0" maxlength="32768" data-value-input><small>Restricted values become write-only after submission.</small></label>
+      <label>Visibility<select name="visibility_0"><option value="restricted">Restricted</option><option value="public">Public</option></select></label>
+      <label>Type<select name="value_type_0" data-value-type><option value="string">String</option><option value="boolean">Boolean</option><option value="integer">Integer</option><option value="url">URL</option><option value="multiline">Multiline</option></select></label>
+      <label>Group <span class="field-hint">Optional</span><input name="group_name_0" maxlength="80" placeholder="Database"></label>
+      <label class="span-two">Description <span class="field-hint">Optional</span><input name="description_0" maxlength="1000" placeholder="What this key controls"></label>
+    </fieldset>
+  </div>
+  <button type="button" class="secondary request-add-item" data-request-add><svg class="icon" aria-hidden="true"><use href="#icon-plus"></use></svg>Add another key</button>
+  <div class="form-actions"><a class="button-link tertiary" href="/services/{{ environment.service_id }}/environments">Cancel</a><button type="submit"><svg class="icon" aria-hidden="true"><use href="#icon-check"></use></svg>Submit request</button></div>
 </form>
 {% endblock %}

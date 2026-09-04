@@ -80,11 +80,16 @@ function valueControl(type, value, name = "value_0") {
 }
 
 function updateValueSource(select) {
-  const form = select.closest("form");
-  const field = form?.querySelector(".comparison-value-field");
+  const scope = select.closest("[data-value-scope]") || select.closest("[data-request-item]") || select.closest("form");
+  const field = scope?.querySelector(".comparison-value-field, [data-value-field]");
   if (!field) return;
   const operatorProvides = select.value === "OPERATOR_PROVIDED";
   field.hidden = operatorProvides;
+  const currentMask = scope?.querySelector("[data-current-mask]");
+  if (currentMask) currentMask.hidden = !operatorProvides;
+  field.querySelectorAll("input, textarea, select").forEach((control) => {
+    control.disabled = operatorProvides;
+  });
   const hint = field.querySelector("[data-value-hint]");
   if (hint) hint.textContent = operatorProvides
     ? "The operator will provide this value securely during review."
@@ -93,6 +98,86 @@ function updateValueSource(select) {
 
 function initializeValueSources() {
   document.querySelectorAll("[data-value-source]").forEach(updateValueSource);
+}
+
+function syncSharedMetadata(select) {
+  const formId = select.getAttribute("form");
+  const detail = formId
+    ? document.querySelector(`[data-shared-form="${CSS.escape(formId)}"]`)
+    : null;
+  if (!detail) return;
+  const target = select.dataset.sharedVisibility !== undefined
+    ? "[data-inherit-visibility]"
+    : "[data-inherit-type]";
+  detail.querySelectorAll(target).forEach((input) => { input.value = select.value; });
+  if (select.dataset.sharedValueType !== undefined && select.value) {
+    detail.querySelectorAll("[data-missing-add-form]").forEach((form) => {
+      const current = form.querySelector("[data-value-input]");
+      if (!current) return;
+      const replacement = valueControl(select.value, current.value, current.name);
+      replacement.disabled = current.disabled;
+      replacement.placeholder = current.placeholder;
+      const customSelect = customSelectInstances.get(current);
+      if (customSelect) {
+        if (openSelectMenu?.trigger === customSelect.trigger) closeCustomSelect();
+        customSelect.trigger.remove();
+        customSelect.menu.remove();
+      }
+      current.replaceWith(replacement);
+    });
+  }
+  detail.querySelectorAll("[data-missing-add-form]").forEach((form) => {
+    const complete = form.querySelector("[data-inherit-visibility]")?.value
+      && form.querySelector("[data-inherit-type]")?.value;
+    const submit = form.querySelector("[data-missing-add-submit]");
+    if (submit) submit.disabled = !complete;
+  });
+}
+
+function initializeSharedMetadata() {
+  document.querySelectorAll("[data-shared-visibility], [data-shared-value-type]").forEach(syncSharedMetadata);
+}
+
+function refreshRequestBuilder(builder) {
+  const items = Array.from(builder.querySelectorAll("[data-request-item]"));
+  items.forEach((item, index) => {
+    item.dataset.requestIndex = String(index);
+    const legend = item.querySelector("legend");
+    if (legend) legend.textContent = `Key ${index + 1}`;
+    item.querySelectorAll("[name]").forEach((control) => {
+      control.name = control.name.replace(/_\d+$/, `_${index}`);
+    });
+    const remove = item.querySelector("[data-request-remove]");
+    if (remove) remove.hidden = items.length === 1;
+  });
+  const add = builder.querySelector("[data-request-add]");
+  if (add) {
+    add.disabled = items.length >= 50;
+    add.hidden = items.length >= 50;
+  }
+}
+
+function addRequestItem(builder) {
+  const list = builder.querySelector("[data-request-item-list]");
+  const source = list?.querySelector("[data-request-item]");
+  const count = list?.querySelectorAll("[data-request-item]").length || 0;
+  if (!list || !source || count >= 50) return;
+  const item = source.cloneNode(true);
+  item.querySelectorAll("input, textarea").forEach((control) => {
+    if (control.type !== "hidden") control.value = "";
+  });
+  item.querySelectorAll("select").forEach((select) => { select.selectedIndex = 0; });
+  const currentValue = item.querySelector("[data-value-input]");
+  if (currentValue) currentValue.replaceWith(valueControl("string", "", `value_${count}`));
+  list.append(item);
+  refreshRequestBuilder(builder);
+  const sourceSelect = item.querySelector("[data-value-source]");
+  if (sourceSelect) updateValueSource(sourceSelect);
+  item.querySelector('[name^="key_"]')?.focus();
+}
+
+function initializeRequestBuilders() {
+  document.querySelectorAll("[data-request-builder]").forEach(refreshRequestBuilder);
 }
 
 let openSelectMenu;
@@ -205,7 +290,7 @@ function enhanceComparisonSelect(select) {
 }
 
 function initializeCustomSelects(root = document) {
-  root.querySelectorAll(".comparison-landscape-form select").forEach(enhanceComparisonSelect);
+  root.querySelectorAll(".comparison-shared-fields select, .comparison-value-row select, .comparison-add-form select").forEach(enhanceComparisonSelect);
 }
 
 async function writeClipboard(text, status) {
@@ -281,6 +366,42 @@ function initializeServiceCatalog() {
   }
   setServiceView(view, false);
   updateServiceCatalog();
+}
+
+const cardDialogTriggers = new WeakMap();
+
+function closeCardToolDialog(dialog) {
+  if (dialog?.open) dialog.close();
+}
+
+function initializeCardToolDialogs() {
+  document.querySelectorAll("[data-card-dialog-open]").forEach((trigger) => {
+    trigger.addEventListener("click", () => {
+      const dialog = document.getElementById(trigger.dataset.cardDialogOpen);
+      if (!dialog?.showModal) return;
+      document.querySelectorAll(".card-tool-dialog[open]").forEach(closeCardToolDialog);
+      closeCustomSelect();
+      cardDialogTriggers.set(dialog, trigger);
+      dialog.showModal();
+      document.body.classList.add("card-dialog-open");
+      window.requestAnimationFrame(() => {
+        dialog.querySelector('input:not([type="hidden"]), textarea, select, button')?.focus();
+      });
+    });
+  });
+
+  document.querySelectorAll(".card-tool-dialog").forEach((dialog) => {
+    dialog.addEventListener("click", (event) => {
+      if (event.target === dialog) closeCardToolDialog(dialog);
+    });
+    dialog.addEventListener("close", () => {
+      if (!document.querySelector(".card-tool-dialog[open]")) {
+        document.body.classList.remove("card-dialog-open");
+      }
+      cardDialogTriggers.get(dialog)?.focus();
+      cardDialogTriggers.delete(dialog);
+    });
+  });
 }
 
 function setComparisonExpanded(row, expanded) {
@@ -472,6 +593,11 @@ function initializeGlobalSearch() {
 }
 
 document.addEventListener("click", (event) => {
+  const cardToolClose = event.target.closest("[data-card-dialog-close]");
+  if (cardToolClose) {
+    closeCardToolDialog(cardToolClose.closest(".card-tool-dialog"));
+    return;
+  }
   if (openSelectMenu
       && !openSelectMenu.trigger.contains(event.target)
       && !openSelectMenu.menu.contains(event.target)) {
@@ -562,6 +688,22 @@ document.addEventListener("click", (event) => {
     if (status) status.textContent = `${visibleRows.length} visible row(s) set to ${visibility}.`;
     return;
   }
+  const addItem = event.target.closest("[data-request-add]");
+  if (addItem) {
+    const builder = addItem.closest("[data-request-builder]");
+    if (builder) addRequestItem(builder);
+    return;
+  }
+  const removeItem = event.target.closest("[data-request-remove]");
+  if (removeItem) {
+    const builder = removeItem.closest("[data-request-builder]");
+    const item = removeItem.closest("[data-request-item]");
+    if (builder && item && builder.querySelectorAll("[data-request-item]").length > 1) {
+      item.remove();
+      refreshRequestBuilder(builder);
+    }
+    return;
+  }
   const button = event.target.closest("[data-copy-all], [data-copy-selected]");
   if (!button) return;
   const selector = button.dataset.copyAll || button.dataset.copySelected;
@@ -572,10 +714,44 @@ document.addEventListener("click", (event) => {
   if (button.dataset.copySelected) {
     const selected = new Set(
       Array.from(document.querySelectorAll('input[name="export_line"]:checked'))
-        .map((input) => Number(input.value))
+        .map((input) => input.value)
     );
-    text = text.split("\n").filter((_line, index) => selected.has(index)).join("\n");
-    if (text) text += "\n";
+    const selectedLines = [];
+    let pendingComments = [];
+    let currentGroup;
+    let emittedGroup;
+    text.split("\n").forEach((line) => {
+      const trimmed = line.trim();
+      const group = trimmed.match(/^#\s*\[(.+)]$/);
+      if (group) {
+        currentGroup = line;
+        pendingComments = [];
+        return;
+      }
+      if (!trimmed) {
+        currentGroup = undefined;
+        pendingComments = [];
+        return;
+      }
+      if (trimmed.startsWith("#")) {
+        pendingComments.push(line);
+        return;
+      }
+      const separator = line.indexOf("=");
+      const key = separator < 0 ? "" : line.slice(0, separator).trim();
+      if (selected.has(key)) {
+        if (currentGroup && currentGroup !== emittedGroup) {
+          if (selectedLines.length) selectedLines.push("");
+          selectedLines.push(currentGroup);
+          emittedGroup = currentGroup;
+        } else if (!currentGroup) {
+          emittedGroup = undefined;
+        }
+        selectedLines.push(...pendingComments, line);
+      }
+      pendingComments = [];
+    });
+    text = selectedLines.length ? `${selectedLines.join("\n")}\n` : "";
   }
   void writeClipboard(text, status);
 });
@@ -641,11 +817,38 @@ document.addEventListener("change", (event) => {
     wrapper.hidden = false;
     return;
   }
-  const typeSelect = event.target.closest('select[name="value_type_0"], [data-value-type]');
+  const sharedVisibility = event.target.closest("[data-shared-visibility]");
+  if (sharedVisibility) {
+    syncSharedMetadata(sharedVisibility);
+    return;
+  }
+  const typeSelect = event.target.closest('select[name="value_type_0"], [data-value-type], [data-shared-value-type]');
   if (!typeSelect) return;
+  if (typeSelect.dataset.sharedValueType !== undefined) {
+    const formId = typeSelect.getAttribute("form");
+    const detail = formId
+      ? document.querySelector(`[data-shared-form="${CSS.escape(formId)}"]`)
+      : null;
+    syncSharedMetadata(typeSelect);
+    detail?.querySelectorAll(".comparison-value-row [data-value-input]").forEach((current) => {
+      const replacement = valueControl(typeSelect.value, current.value, current.name);
+      if (formId) replacement.setAttribute("form", formId);
+      replacement.disabled = current.disabled;
+      const customSelect = customSelectInstances.get(current);
+      if (customSelect) {
+        if (openSelectMenu?.trigger === customSelect.trigger) closeCustomSelect();
+        customSelect.trigger.remove();
+        customSelect.menu.remove();
+      }
+      current.replaceWith(replacement);
+    });
+    initializeCustomSelects(detail || document);
+    return;
+  }
   const form = typeSelect.closest("form");
+  const scope = typeSelect.closest("[data-request-item]") || form;
   const current = typeSelect.dataset.valueType !== undefined
-    ? form?.querySelector("[data-value-input]")
+    ? scope?.querySelector("[data-value-input]")
     : form?.querySelector('[name="value_0"]');
   if (!current) return;
   const replacement = valueControl(typeSelect.value, current.value, current.name);
@@ -690,8 +893,11 @@ document.addEventListener("DOMContentLoaded", () => {
   initializeApplicationShell();
   initializeGlobalSearch();
   initializeServiceCatalog();
+  initializeCardToolDialogs();
   initializeEnvironmentSelector();
   initializeValueSources();
+  initializeSharedMetadata();
+  initializeRequestBuilders();
   initializeCustomSelects();
   updateComparison();
 });

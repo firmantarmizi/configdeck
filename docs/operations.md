@@ -70,12 +70,14 @@ KEK rotation re-wraps environment DEKs and re-encrypts TOTP seeds; it does not r
 Before rotation, create and verify an off-host backup. Preserve the current key as the temporary previous key and generate a new primary key:
 
 ```bash
-umask 077
+install -d -m 700 secrets
 cp --preserve=mode,timestamps secrets/configdeck_master_key secrets/configdeck_master_key_previous
 openssl rand -base64 32 > secrets/configdeck_master_key.new
-chmod 600 secrets/configdeck_master_key.new secrets/configdeck_master_key_previous
+chmod 644 secrets/configdeck_master_key.new secrets/configdeck_master_key_previous
 mv secrets/configdeck_master_key.new secrets/configdeck_master_key
 ```
+
+The `secrets/` directory remains host-private at mode `0700`; mode `0644` on the files is required only so the fixed non-root container UID can read each read-only bind mount.
 
 Temporarily mount the previous key at:
 

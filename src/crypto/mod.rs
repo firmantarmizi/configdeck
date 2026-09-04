@@ -6,7 +6,7 @@ use chacha20poly1305::{
     aead::{Aead, Payload},
 };
 use hkdf::Hkdf;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit as HmacKeyInit, Mac};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
@@ -300,7 +300,7 @@ impl CryptoManager {
 
     pub fn csrf_token(&self, session_token: &str) -> Result<String, CryptoError> {
         let key = self.derive_key(b"csrf-token-key-v1")?;
-        let mut mac = <HmacSha256 as Mac>::new_from_slice(key.as_ref())
+        let mut mac = <HmacSha256 as HmacKeyInit>::new_from_slice(key.as_ref())
             .map_err(|_| CryptoError::KeyDerivation)?;
         mac.update(session_token.as_bytes());
         Ok(URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes()))
@@ -308,7 +308,7 @@ impl CryptoManager {
 
     pub fn blind_index(&self, purpose: &[u8], value: &[u8]) -> Result<Vec<u8>, CryptoError> {
         let key = self.derive_key(purpose)?;
-        let mut mac = <HmacSha256 as Mac>::new_from_slice(key.as_ref())
+        let mut mac = <HmacSha256 as HmacKeyInit>::new_from_slice(key.as_ref())
             .map_err(|_| CryptoError::KeyDerivation)?;
         mac.update(value);
         Ok(mac.finalize().into_bytes().to_vec())

@@ -44,6 +44,8 @@ SQLite migrations in `migrations/` are the schema source of truth. Foreign keys,
 
 All configuration values are encrypted at rest. `visibility` controls authorization to plaintext; it does not change storage encryption. There is no plaintext value column and no parallel `is_secret` flag.
 
+Variable grouping is presentation metadata, not an authorization boundary. Each variable version may carry an optional group name and stable display order. Import and export use portable `.env` comments (`# [Group]` plus optional key descriptions), while restricted-value access continues to depend only on `visibility` and backend authorization.
+
 ## Request path
 
 A typical authenticated request passes through:
@@ -64,7 +66,7 @@ Authorization, masking, decryption, and workflow-state validation are backend re
 
 ## Change workflow
 
-Contributors propose one or more additions, updates, or deletions. An Operator or Administrator can fulfill missing values, review the request, preview the resulting environment, apply the values through the organization's deployment system, and explicitly confirm the request as applied.
+Contributors add keys through a progressive request builder, update or delete existing keys from their configuration row, or paste up to 50 `.env` entries into one encrypted request preview. The comparison row edits a logical key, visibility, and type once across every active environment where that key exists; the expanded detail edits only each environment's value and value source. A missing cell offers an inline ADD request locked to that logical key and inherited metadata, while a cell with an active proposal links to the pending request instead of offering a duplicate ADD. Fulfilled public proposals are visible in context, restricted proposals are always masked, Operator-supplied values remain `Awaiting operator input`, and deletion requests are identified explicitly. If a logical key has restricted visibility in any active environment or proposal, the backend does not decrypt any current or proposed value for that key until its metadata is normalized. The server validates the complete target set and inserts the environment-scoped requests and audit records in one SQLite transaction, so a collision cannot leave a partial cross-environment request set. Bulk request paste detects additions versus updates and never changes current state directly. An Operator or Administrator can fulfill missing values, review the request, preview the resulting environment, apply the values through the organization's deployment system, and explicitly confirm the request as applied. A separate recent-authenticated workflow records configuration that is already deployed.
 
 ```text
 REQUESTED / NEEDS_INPUT

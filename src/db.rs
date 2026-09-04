@@ -197,6 +197,7 @@ mod tests {
             "ix_login_attempts_time",
             "ix_audit_action_time",
             "ix_audit_outcome_time",
+            "idx_variables_environment_group_order",
         ] {
             let exists: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'index' AND name = ?",

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -6,11 +6,18 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 pub const MAX_INPUT_BYTES: usize = 256 * 1024;
 pub const MAX_ENTRIES: usize = 500;
 pub const MAX_VALUE_BYTES: usize = 32 * 1024;
+const MAX_DESCRIPTION_CHARS: usize = 1_000;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, Zeroize, ZeroizeOnDrop)]
 pub struct Entry {
     pub key: String,
     pub value: String,
+    #[serde(default)]
+    pub group: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub position: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -26,28 +33,20 @@ pub struct ParseReport {
 }
 
 pub fn parse(input: &str) -> ParseReport {
-    if input.len() > MAX_INPUT_BYTES {
+    if let Some(issue) = validate_input(input) {
         return ParseReport {
-            issues: vec![ParseIssue {
-                line: 0,
-                message: "input exceeds the 256 KiB limit",
-            }],
-            ..ParseReport::default()
-        };
-    }
-    if input.contains('\0') {
-        return ParseReport {
-            issues: vec![ParseIssue {
-                line: 0,
-                message: "NUL bytes are not allowed",
-            }],
+            issues: vec![issue],
             ..ParseReport::default()
         };
     }
 
     let mut report = ParseReport::default();
+    let lines = input.lines().collect::<Vec<_>>();
     let mut keys = HashSet::new();
-    for (index, physical_line) in input.lines().enumerate() {
+    let mut current_group = None;
+    let mut pending_comments = Vec::new();
+    let mut section_boundary = true;
+    for (index, physical_line) in lines.iter().enumerate() {
         let line_number = index + 1;
         let line = if index == 0 {
             physical_line
@@ -57,7 +56,24 @@ pub fn parse(input: &str) -> ParseReport {
             physical_line
         };
         let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
+        if trimmed.is_empty() {
+            pending_comments.clear();
+            section_boundary = true;
+            continue;
+        }
+        if let Some(comment) = trimmed.strip_prefix('#') {
+            let comment = comment.trim();
+            if let Some(group) = parse_group_heading(comment).or_else(|| {
+                section_boundary
+                    .then(|| infer_plain_group(&lines, index, comment))
+                    .flatten()
+            }) {
+                current_group = Some(group);
+                pending_comments.clear();
+                section_boundary = false;
+            } else if !comment.is_empty() {
+                pending_comments.push(comment.to_owned());
+            }
             continue;
         }
         if report.entries.len() >= MAX_ENTRIES {
@@ -68,9 +84,27 @@ pub fn parse(input: &str) -> ParseReport {
             break;
         }
         match parse_assignment(trimmed) {
-            Ok(entry) => {
+            Ok(mut entry) => {
+                let description =
+                    (!pending_comments.is_empty()).then(|| pending_comments.join(" "));
+                if description
+                    .as_ref()
+                    .is_some_and(|value| value.chars().count() > MAX_DESCRIPTION_CHARS)
+                {
+                    report.issues.push(ParseIssue {
+                        line: line_number,
+                        message: "description exceeds the 1,000-character limit",
+                    });
+                    pending_comments.clear();
+                    continue;
+                }
                 if keys.insert(entry.key.clone()) {
+                    entry.group.clone_from(&current_group);
+                    entry.description = description;
+                    entry.position = i64::try_from(report.entries.len()).unwrap_or(i64::MAX);
                     report.entries.push(entry);
+                    pending_comments.clear();
+                    section_boundary = false;
                 } else {
                     report.issues.push(ParseIssue {
                         line: line_number,
@@ -93,6 +127,22 @@ pub fn parse(input: &str) -> ParseReport {
     report
 }
 
+fn validate_input(input: &str) -> Option<ParseIssue> {
+    if input.len() > MAX_INPUT_BYTES {
+        Some(ParseIssue {
+            line: 0,
+            message: "input exceeds the 256 KiB limit",
+        })
+    } else if input.contains('\0') {
+        Some(ParseIssue {
+            line: 0,
+            message: "NUL bytes are not allowed",
+        })
+    } else {
+        None
+    }
+}
+
 fn parse_assignment(line: &str) -> Result<Entry, &'static str> {
     let assignment = line.strip_prefix("export ").unwrap_or(line);
     let (key, raw_value) = assignment
@@ -109,7 +159,41 @@ fn parse_assignment(line: &str) -> Result<Entry, &'static str> {
     Ok(Entry {
         key: key.to_owned(),
         value,
+        group: None,
+        description: None,
+        position: 0,
     })
+}
+
+fn parse_group_heading(comment: &str) -> Option<String> {
+    let bracketed = comment.strip_prefix('[')?.strip_suffix(']')?;
+    normalize_group_name(bracketed)
+}
+
+fn infer_plain_group(lines: &[&str], index: usize, comment: &str) -> Option<String> {
+    let candidate = normalize_group_name(comment)?;
+    if candidate.ends_with(['.', ':', ';']) || candidate.contains('=') {
+        return None;
+    }
+    let mut following = lines[index + 1..]
+        .iter()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty());
+    let next = following.next()?;
+    let decorated = comment.starts_with(['=', '-', '*']) || comment.ends_with(['=', '-', '*']);
+    let followed_by_description = next.starts_with('#')
+        && following
+            .find(|line| !line.starts_with('#'))
+            .is_some_and(|line| parse_assignment(line).is_ok());
+    (decorated || followed_by_description).then_some(candidate)
+}
+
+fn normalize_group_name(value: &str) -> Option<String> {
+    let trimmed = value
+        .trim()
+        .trim_matches(|character| matches!(character, '=' | '-' | '*' | ' '))
+        .trim();
+    (!trimmed.is_empty() && trimmed.chars().count() <= 80).then(|| trimmed.to_owned())
 }
 
 fn parse_value(value: &str) -> Result<String, &'static str> {
@@ -161,8 +245,66 @@ fn parse_single_quoted(value: &str) -> Result<String, &'static str> {
 }
 
 pub fn render(entries: &[Entry]) -> String {
+    let group_order = entries
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .group
+                .as_ref()
+                .map(|group| (group.as_str(), entry.position))
+        })
+        .fold(
+            BTreeMap::<&str, i64>::new(),
+            |mut order, (group, position)| {
+                order
+                    .entry(group)
+                    .and_modify(|current| *current = (*current).min(position))
+                    .or_insert(position);
+                order
+            },
+        );
+    let mut ordered = entries.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| match (&left.group, &right.group) {
+        (None, None) => left
+            .position
+            .cmp(&right.position)
+            .then_with(|| left.key.cmp(&right.key)),
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (Some(left_group), Some(right_group)) => group_order
+            .get(left_group.as_str())
+            .cmp(&group_order.get(right_group.as_str()))
+            .then_with(|| left_group.cmp(right_group))
+            .then_with(|| left.position.cmp(&right.position))
+            .then_with(|| left.key.cmp(&right.key)),
+    });
+
     let mut output = String::new();
-    for entry in entries {
+    let mut previous_group: Option<&str> = None;
+    for entry in ordered {
+        let group = entry.group.as_deref();
+        if group != previous_group {
+            if !output.is_empty() {
+                output.push('\n');
+            }
+            if let Some(group) = group {
+                output.push_str("# [");
+                output.push_str(group);
+                output.push_str("]\n");
+            }
+            previous_group = group;
+        }
+        if let Some(description) = entry.description.as_deref() {
+            for line in description
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+            {
+                output.push_str("# ");
+                output.push_str(line);
+                output.push('\n');
+            }
+        }
         output.push_str(&entry.key);
         output.push('=');
         output.push_str(&render_value(&entry.value));
@@ -228,34 +370,58 @@ mod tests {
             Entry {
                 key: "SPACE".into(),
                 value: " two words ".into(),
+                group: None,
+                description: None,
+                position: 0,
             },
             Entry {
                 key: "QUOTE".into(),
                 value: "say \"hello\"".into(),
+                group: None,
+                description: None,
+                position: 1,
             },
             Entry {
                 key: "HASH".into(),
                 value: "a#b".into(),
+                group: None,
+                description: None,
+                position: 2,
             },
             Entry {
                 key: "NEWLINE".into(),
                 value: "first\nsecond".into(),
+                group: None,
+                description: None,
+                position: 3,
             },
             Entry {
                 key: "EQUALS".into(),
                 value: "a=b=c".into(),
+                group: None,
+                description: None,
+                position: 4,
             },
             Entry {
                 key: "UNICODE".into(),
                 value: "halo dunia 🌏".into(),
+                group: None,
+                description: None,
+                position: 5,
             },
             Entry {
                 key: "EMPTY".into(),
                 value: String::new(),
+                group: None,
+                description: None,
+                position: 6,
             },
             Entry {
                 key: "SLASH".into(),
                 value: r"C:\path\value".into(),
+                group: None,
+                description: None,
+                position: 7,
             },
         ];
         let rendered = render(&entries);
@@ -286,5 +452,52 @@ mod tests {
         let report = parse(&input);
         assert_eq!(report.entries.len(), MAX_ENTRIES);
         assert_eq!(report.issues.len(), 1);
+    }
+
+    #[test]
+    fn detects_groups_and_key_descriptions_without_exposing_values() {
+        let report = parse(
+            "# [Database]\n# Primary database host\nDB_HOST=db.internal\nDB_PORT=5432\n\n# Cache\n# Shared cache endpoint\nREDIS_URL=redis://cache\n",
+        );
+        assert!(report.issues.is_empty(), "{:?}", report.issues);
+        assert_eq!(report.entries[0].group.as_deref(), Some("Database"));
+        assert_eq!(
+            report.entries[0].description.as_deref(),
+            Some("Primary database host")
+        );
+        assert_eq!(report.entries[1].group.as_deref(), Some("Database"));
+        assert_eq!(report.entries[2].group.as_deref(), Some("Cache"));
+
+        let rendered = render(&report.entries);
+        assert!(rendered.contains("# [Database]"));
+        assert!(rendered.contains("# Primary database host"));
+        assert_eq!(parse(&rendered).entries, report.entries);
+    }
+
+    #[test]
+    fn canonical_render_places_ungrouped_entries_before_grouped_sections() {
+        let entries = vec![
+            Entry {
+                key: "DB_HOST".into(),
+                value: "database".into(),
+                group: Some("Database".into()),
+                description: None,
+                position: 0,
+            },
+            Entry {
+                key: "APP_NAME".into(),
+                value: "ConfigDeck".into(),
+                group: None,
+                description: Some("Application display name".into()),
+                position: 1,
+            },
+        ];
+
+        let rendered = render(&entries);
+        assert!(rendered.starts_with("# Application display name\nAPP_NAME=ConfigDeck\n"));
+        let reparsed = parse(&rendered);
+        assert!(reparsed.issues.is_empty(), "{:?}", reparsed.issues);
+        assert_eq!(reparsed.entries[0].group, None);
+        assert_eq!(reparsed.entries[1].group.as_deref(), Some("Database"));
     }
 }

@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::{IpAddr, SocketAddr},
     sync::atomic::Ordering,
     time::{Duration, Instant},
@@ -33,6 +33,7 @@ use crate::{
 };
 
 const STYLE: &str = include_str!("../../static/app.css");
+const REQUEST_IMPORT_MAX_ENTRIES: usize = 50;
 const SCRIPT: &str = include_str!("../../static/app.js");
 const THEME_SCRIPT: &str = include_str!("../../static/theme.js");
 const CONFIGDECK_LOGO: &str = include_str!("../../static/configdeck-logo.svg");
@@ -124,6 +125,7 @@ struct EnvironmentsTemplate<'a> {
     chrome: AppChrome<'a>,
     can_manage: bool,
     can_create_request: bool,
+    can_apply: bool,
     workspace: &'a environments::ComparisonWorkspace,
 }
 
@@ -153,6 +155,24 @@ struct ServiceAccessTemplate<'a> {
 struct ChangeRequestNewTemplate<'a> {
     chrome: AppChrome<'a>,
     environment: &'a variables::EnvironmentContext,
+}
+
+#[derive(Template)]
+#[template(path = "request_import.html")]
+struct RequestImportTemplate<'a> {
+    chrome: AppChrome<'a>,
+    environment: &'a variables::EnvironmentContext,
+    issues: &'a [crate::dotenv::ParseIssue],
+}
+
+#[derive(Template)]
+#[template(path = "request_import_preview.html")]
+struct RequestImportPreviewTemplate<'a> {
+    chrome: AppChrome<'a>,
+    environment: &'a variables::EnvironmentContext,
+    preview_token: &'a str,
+    entries: &'a [RequestImportPreviewEntry],
+    requires_reason: bool,
 }
 
 #[derive(Template)]
@@ -230,6 +250,9 @@ struct ImportPreviewTemplate<'a> {
 
 struct ImportPreviewEntry {
     key: String,
+    group_name: Option<String>,
+    description: Option<String>,
+    starts_group: bool,
     suggested_type: &'static str,
 }
 
@@ -338,6 +361,7 @@ struct AppliedVariableForm {
     visibility: String,
     value_type: String,
     description: Option<String>,
+    group_name: Option<String>,
     reason: String,
     csrf_token: String,
 }
@@ -429,8 +453,31 @@ struct ImportSourceForm {
 
 #[derive(Deserialize, Serialize)]
 struct ImportPreviewPayload {
+    purpose: String,
     expires_at: i64,
     entries: Vec<crate::dotenv::Entry>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct RequestImportPreviewPayload {
+    purpose: String,
+    expires_at: i64,
+    entries: Vec<RequestImportPayloadEntry>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct RequestImportPayloadEntry {
+    action: String,
+    entry: crate::dotenv::Entry,
+}
+
+struct RequestImportPreviewEntry {
+    action: String,
+    key: String,
+    group_name: Option<String>,
+    description: Option<String>,
+    starts_group: bool,
+    suggested_type: &'static str,
 }
 
 #[derive(Default, Deserialize)]
@@ -559,6 +606,10 @@ fn configuration_routes() -> Router<AppState> {
             "/services/{id}/environments",
             get(environment_list).post(environment_create),
         )
+        .route(
+            "/services/{id}/keys/request-edit",
+            post(shared_key_request_edit),
+        )
         .route("/environments/{id}/update", post(environment_update))
         .route("/environments/{id}/archive", post(environment_archive))
         .route("/environments/{id}/restore", post(environment_restore))
@@ -577,6 +628,18 @@ fn configuration_routes() -> Router<AppState> {
         .route(
             "/environments/{id}/change-requests/new",
             get(change_request_new),
+        )
+        .route(
+            "/environments/{id}/change-requests/import",
+            get(request_import_page),
+        )
+        .route(
+            "/environments/{id}/change-requests/import/preview",
+            post(request_import_preview),
+        )
+        .route(
+            "/environments/{id}/change-requests/import/commit",
+            post(request_import_commit),
         )
         .route(
             "/environments/{id}/change-requests",
@@ -1415,6 +1478,7 @@ async fn environment_list(
             .role
             .allows(crate::users::Capability::ManageMetadata),
         can_create_request: session.user.role.allows(Capability::CreateChangeRequest),
+        can_apply: session.user.role.allows(Capability::ApplyRequest),
         workspace: &workspace,
     }
     .render()?;
@@ -1447,6 +1511,77 @@ async fn variable_request_edit(
     )
     .await?;
     Ok(Redirect::to(&format!("/change-requests/{request_id}")).into_response())
+}
+
+async fn shared_key_request_edit(
+    State(state): State<AppState>,
+    Path(service_id): Path<String>,
+    headers: HeaderMap,
+    Form(mut fields): Form<HashMap<String, String>>,
+) -> Result<Response, AppError> {
+    let (_, session) = authenticated(&state, &headers).await?;
+    let csrf = fields
+        .remove("csrf_token")
+        .ok_or(AppError::InvalidRequest)?;
+    state.sessions.verify_csrf(&session, &csrf)?;
+    let current_key = fields
+        .remove("current_key")
+        .ok_or(AppError::InvalidRequest)?;
+    let new_key = fields.remove("new_key").ok_or(AppError::InvalidRequest)?;
+    let visibility = fields
+        .remove("visibility")
+        .ok_or(AppError::InvalidRequest)?;
+    let value_type = fields
+        .remove("value_type")
+        .ok_or(AppError::InvalidRequest)?;
+    let reason = fields.remove("reason").ok_or(AppError::InvalidRequest)?;
+    let item_count = fields
+        .remove("item_count")
+        .ok_or(AppError::InvalidRequest)?
+        .parse::<usize>()
+        .map_err(|_| AppError::InvalidRequest)?;
+    if item_count == 0 || item_count > REQUEST_IMPORT_MAX_ENTRIES {
+        return Err(AppError::InvalidRequest);
+    }
+    let mut values = Vec::with_capacity(item_count);
+    for index in 0..item_count {
+        let environment_id = fields
+            .remove(&format!("environment_id_{index}"))
+            .ok_or(AppError::InvalidRequest)?;
+        let variable_id = fields
+            .remove(&format!("variable_id_{index}"))
+            .unwrap_or_default();
+        if variable_id.is_empty() {
+            continue;
+        }
+        values.push(requests::SharedInlineValueInput {
+            environment_id,
+            variable_id,
+            value: fields.remove(&format!("value_{index}")).unwrap_or_default(),
+            value_source: fields
+                .remove(&format!("value_source_{index}"))
+                .ok_or(AppError::InvalidRequest)?,
+            description: fields
+                .remove(&format!("description_{index}"))
+                .filter(|value| !value.trim().is_empty()),
+        });
+    }
+    requests::create_shared_inline_edit(
+        &state.pool,
+        &state.crypto,
+        &session,
+        requests::SharedInlineEditInput {
+            service_id,
+            current_key,
+            new_key,
+            visibility,
+            value_type,
+            reason,
+            values,
+        },
+    )
+    .await?;
+    Ok(Redirect::to("/change-requests").into_response())
 }
 
 async fn environment_create(
@@ -1584,6 +1719,198 @@ async fn change_request_new(
     .into_response())
 }
 
+async fn request_import_page(
+    State(state): State<AppState>,
+    Path(environment_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    let (_, session, csrf) = authenticated_full_with_csrf(&state, &headers).await?;
+    if !session.user.role.allows(Capability::CreateChangeRequest) {
+        return Err(AppError::Forbidden);
+    }
+    let environment =
+        variables::environment_context(&state.pool, &session, &environment_id).await?;
+    variables::ensure_mutable(&environment)?;
+    Ok(Html(
+        RequestImportTemplate {
+            chrome: app_chrome(&state, &session, &csrf, "changes"),
+            environment: &environment,
+            issues: &[],
+        }
+        .render()?,
+    )
+    .into_response())
+}
+
+async fn request_import_preview(
+    State(state): State<AppState>,
+    Path(environment_id): Path<String>,
+    headers: HeaderMap,
+    Form(form): Form<ImportSourceForm>,
+) -> Result<Response, AppError> {
+    let (_, session, csrf) = authenticated_full_with_csrf(&state, &headers).await?;
+    state.sessions.verify_csrf(&session, &form.csrf_token)?;
+    if !session.user.role.allows(Capability::CreateChangeRequest) {
+        return Err(AppError::Forbidden);
+    }
+    let environment =
+        variables::environment_context(&state.pool, &session, &environment_id).await?;
+    variables::ensure_mutable(&environment)?;
+    let mut report = crate::dotenv::parse(&form.dotenv);
+    if report.entries.len() > REQUEST_IMPORT_MAX_ENTRIES {
+        report.issues.push(crate::dotenv::ParseIssue {
+            line: 0,
+            message: "a request can contain at most 50 variables",
+        });
+    }
+    if !report.issues.is_empty() {
+        let html = RequestImportTemplate {
+            chrome: app_chrome(&state, &session, &csrf, "changes"),
+            environment: &environment,
+            issues: &report.issues,
+        }
+        .render()?;
+        return Ok((StatusCode::UNPROCESSABLE_ENTITY, Html(html)).into_response());
+    }
+    let existing = active_environment_keys(&state.pool, &environment_id).await?;
+    let entries = report
+        .entries
+        .into_iter()
+        .map(|entry| RequestImportPayloadEntry {
+            action: if existing.contains(&entry.key) {
+                "UPDATE".to_owned()
+            } else {
+                "ADD".to_owned()
+            },
+            entry,
+        })
+        .collect::<Vec<_>>();
+    let payload = RequestImportPreviewPayload {
+        purpose: "CHANGE_REQUEST_IMPORT".to_owned(),
+        expires_at: time::OffsetDateTime::now_utc().unix_timestamp() + 30 * 60,
+        entries,
+    };
+    let serialized = Zeroizing::new(
+        serde_json::to_vec(&payload)
+            .map_err(|error| AppError::Internal(anyhow::Error::new(error)))?,
+    );
+    let preview_token = state
+        .crypto
+        .seal_import_preview(&session.user.id, &session.id, &environment_id, &serialized)
+        .map_err(|_| AppError::Crypto)?;
+    let mut previous_group = None;
+    let preview_entries = payload
+        .entries
+        .iter()
+        .map(|payload_entry| {
+            let entry = &payload_entry.entry;
+            let starts_group = entry.group.is_some() && entry.group != previous_group;
+            previous_group.clone_from(&entry.group);
+            RequestImportPreviewEntry {
+                action: payload_entry.action.clone(),
+                key: entry.key.clone(),
+                group_name: entry.group.clone(),
+                description: entry.description.clone(),
+                starts_group,
+                suggested_type: variables::suggest_value_type(&entry.value),
+            }
+        })
+        .collect::<Vec<_>>();
+    let requires_reason = payload.entries.iter().any(|entry| entry.action == "UPDATE");
+    Ok(Html(
+        RequestImportPreviewTemplate {
+            chrome: app_chrome(&state, &session, &csrf, "changes"),
+            environment: &environment,
+            preview_token: &preview_token,
+            entries: &preview_entries,
+            requires_reason,
+        }
+        .render()?,
+    )
+    .into_response())
+}
+
+async fn request_import_commit(
+    State(state): State<AppState>,
+    Path(environment_id): Path<String>,
+    headers: HeaderMap,
+    Form(mut fields): Form<HashMap<String, String>>,
+) -> Result<Response, AppError> {
+    let (_, session) = authenticated(&state, &headers).await?;
+    let csrf = fields
+        .remove("csrf_token")
+        .ok_or(AppError::InvalidRequest)?;
+    state.sessions.verify_csrf(&session, &csrf)?;
+    if !session.user.role.allows(Capability::CreateChangeRequest) {
+        return Err(AppError::Forbidden);
+    }
+    let token = fields
+        .remove("preview_token")
+        .ok_or(AppError::InvalidRequest)?;
+    let plaintext = state
+        .crypto
+        .open_import_preview(&session.user.id, &session.id, &environment_id, &token)
+        .map_err(|_| AppError::InvalidRequest)?;
+    let payload: RequestImportPreviewPayload =
+        serde_json::from_slice(&plaintext).map_err(|_| AppError::InvalidRequest)?;
+    if payload.purpose != "CHANGE_REQUEST_IMPORT"
+        || payload.expires_at < time::OffsetDateTime::now_utc().unix_timestamp()
+        || payload.entries.is_empty()
+        || payload.entries.len() > REQUEST_IMPORT_MAX_ENTRIES
+    {
+        return Err(AppError::InvalidRequest);
+    }
+    let title = fields.remove("title");
+    let reason = fields.remove("reason").unwrap_or_default();
+    let mut items = Vec::with_capacity(payload.entries.len());
+    for (index, mut payload_entry) in payload.entries.into_iter().enumerate() {
+        let visibility = fields
+            .remove(&format!("visibility_{index}"))
+            .ok_or(AppError::InvalidRequest)?;
+        let value_type = fields
+            .remove(&format!("value_type_{index}"))
+            .ok_or(AppError::InvalidRequest)?;
+        items.push(requests::ChangeRequestItemInput {
+            action: payload_entry.action,
+            key: std::mem::take(&mut payload_entry.entry.key),
+            value: Some(std::mem::take(&mut payload_entry.entry.value)),
+            value_source: Some("REQUESTER_PROVIDED".to_owned()),
+            visibility: Some(visibility),
+            value_type: Some(value_type),
+            description: fields.remove(&format!("description_{index}")),
+            group_name: fields.remove(&format!("group_name_{index}")),
+            display_order: Some(payload_entry.entry.position),
+        });
+    }
+    let id = requests::create(
+        &state.pool,
+        &state.crypto,
+        &session,
+        requests::ChangeRequestInput {
+            environment_id,
+            title,
+            reason,
+            items,
+        },
+    )
+    .await?;
+    Ok(Redirect::to(&format!("/change-requests/{id}")).into_response())
+}
+
+async fn active_environment_keys(
+    pool: &sqlx::SqlitePool,
+    environment_id: &str,
+) -> Result<HashSet<String>, AppError> {
+    Ok(sqlx::query_scalar::<_, String>(
+        "SELECT key FROM variables WHERE environment_id = ? AND lifecycle_status = 'ACTIVE'",
+    )
+    .bind(environment_id)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .collect())
+}
+
 async fn change_request_create(
     State(state): State<AppState>,
     Path(environment_id): Path<String>,
@@ -1593,7 +1920,7 @@ async fn change_request_create(
     let (_, session) = authenticated(&state, &headers).await?;
     let csrf = form.get("csrf_token").ok_or(AppError::Forbidden)?;
     state.sessions.verify_csrf(&session, csrf)?;
-    let input = request_input_from_form(&environment_id, &form)?;
+    let input = request_input_from_form(&environment_id, &form);
     let id = requests::create(&state.pool, &state.crypto, &session, input).await?;
     Ok(Redirect::to(&format!("/change-requests/{id}")).into_response())
 }
@@ -1793,9 +2120,9 @@ async fn api_change_request_create(
 fn request_input_from_form(
     environment_id: &str,
     form: &HashMap<String, String>,
-) -> Result<requests::ChangeRequestInput, AppError> {
+) -> requests::ChangeRequestInput {
     let mut items = Vec::new();
-    for index in 0..5 {
+    for index in 0..REQUEST_IMPORT_MAX_ENTRIES {
         let action = form
             .get(&format!("action_{index}"))
             .map_or("", String::as_str);
@@ -1811,17 +2138,18 @@ fn request_input_from_form(
             visibility: form.get(&format!("visibility_{index}")).cloned(),
             value_type: form.get(&format!("value_type_{index}")).cloned(),
             description: form.get(&format!("description_{index}")).cloned(),
+            group_name: form.get(&format!("group_name_{index}")).cloned(),
+            display_order: form
+                .get(&format!("display_order_{index}"))
+                .and_then(|value| value.parse().ok()),
         });
     }
-    Ok(requests::ChangeRequestInput {
+    requests::ChangeRequestInput {
         environment_id: environment_id.to_owned(),
         title: form.get("title").cloned(),
-        reason: form
-            .get("reason")
-            .cloned()
-            .ok_or(AppError::InvalidRequest)?,
+        reason: form.get("reason").cloned().unwrap_or_default(),
         items,
-    })
+    }
 }
 
 async fn variable_delete_applied(
@@ -1942,6 +2270,8 @@ async fn variable_record_applied(
             visibility: form.visibility,
             value_type: form.value_type,
             description: form.description,
+            group_name: form.group_name,
+            display_order: 0,
             reason: form.reason,
         },
     )
@@ -2003,6 +2333,7 @@ async fn import_preview(
         return Ok((StatusCode::UNPROCESSABLE_ENTITY, Html(html)).into_response());
     }
     let payload = ImportPreviewPayload {
+        purpose: "APPLIED_IMPORT".to_owned(),
         expires_at: time::OffsetDateTime::now_utc().unix_timestamp() + 30 * 60,
         entries: report.entries,
     };
@@ -2014,12 +2345,20 @@ async fn import_preview(
         .crypto
         .seal_import_preview(&session.user.id, &session.id, &environment_id, &serialized)
         .map_err(|_| AppError::Crypto)?;
+    let mut previous_group = None;
     let preview_entries = payload
         .entries
         .iter()
-        .map(|entry| ImportPreviewEntry {
-            key: entry.key.clone(),
-            suggested_type: variables::suggest_value_type(&entry.value),
+        .map(|entry| {
+            let starts_group = entry.group.is_some() && entry.group != previous_group;
+            previous_group.clone_from(&entry.group);
+            ImportPreviewEntry {
+                key: entry.key.clone(),
+                group_name: entry.group.clone(),
+                description: entry.description.clone(),
+                starts_group,
+                suggested_type: variables::suggest_value_type(&entry.value),
+            }
         })
         .collect::<Vec<_>>();
     let html = ImportPreviewTemplate {
@@ -2054,7 +2393,8 @@ async fn import_commit(
         .map_err(|_| AppError::InvalidRequest)?;
     let payload: ImportPreviewPayload =
         serde_json::from_slice(&plaintext).map_err(|_| AppError::InvalidRequest)?;
-    if payload.expires_at < time::OffsetDateTime::now_utc().unix_timestamp()
+    if payload.purpose != "APPLIED_IMPORT"
+        || payload.expires_at < time::OffsetDateTime::now_utc().unix_timestamp()
         || payload.entries.is_empty()
         || payload.entries.len() > crate::dotenv::MAX_ENTRIES
     {
@@ -2068,12 +2408,16 @@ async fn import_commit(
         let value_type = fields
             .remove(&format!("value_type_{index}"))
             .ok_or(AppError::InvalidRequest)?;
+        let group_name = fields.remove(&format!("group_name_{index}"));
+        let description = fields.remove(&format!("description_{index}"));
         inputs.push(variables::AppliedVariableInput {
             key: std::mem::take(&mut entry.key),
             value: std::mem::take(&mut entry.value),
             visibility,
             value_type,
-            description: None,
+            description,
+            group_name,
+            display_order: entry.position,
             reason: reason.clone(),
         });
     }
@@ -2116,6 +2460,7 @@ async fn environment_export(
     .await?;
     let keys = dotenv
         .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
         .filter_map(|line| line.split_once('=').map(|(key, _)| key.to_owned()))
         .collect::<Vec<_>>();
     let html = ExportTemplate {
@@ -2768,7 +3113,8 @@ mod tests {
     };
 
     use super::{
-        AppChrome, AppPermissions, ImportPreviewEntry, ImportPreviewTemplate, TotpSetupTemplate,
+        AppChrome, AppPermissions, ImportPreviewEntry, ImportPreviewTemplate,
+        RequestImportPreviewEntry, RequestImportPreviewTemplate, TotpSetupTemplate,
         resolve_client_ip, router, safe_return_to, totp_qr_code_data_uri,
     };
 
@@ -2830,6 +3176,9 @@ mod tests {
         };
         let entries = vec![ImportPreviewEntry {
             key: "DATABASE_URL".into(),
+            group_name: Some("Database".into()),
+            description: Some("Primary connection string".into()),
+            starts_group: true,
             suggested_type: "string",
         }];
         let html = ImportPreviewTemplate {
@@ -2853,10 +3202,58 @@ mod tests {
         .render()
         .unwrap();
         assert!(html.contains("DATABASE_URL"));
+        assert!(html.contains("Database"));
+        assert!(html.contains("Primary connection string"));
         assert!(html.contains("Values remain encrypted"));
         assert!(html.contains("authenticated-ciphertext-token"));
         assert!(html.contains("Suggested: string"));
         assert!(html.contains("value=\"string\" selected"));
+        assert!(!html.contains("postgres://"));
+    }
+
+    #[test]
+    fn request_import_preview_omits_values_and_labels_updates() {
+        let environment = variables::EnvironmentContext {
+            id: "env".into(),
+            name: "staging".into(),
+            service_id: "service".into(),
+            service_name: "Payments".into(),
+            archived_at: None,
+            service_archived_at: None,
+        };
+        let entries = vec![RequestImportPreviewEntry {
+            action: "UPDATE".into(),
+            key: "DATABASE_URL".into(),
+            group_name: Some("Database".into()),
+            description: Some("Primary connection string".into()),
+            starts_group: true,
+            suggested_type: "string",
+        }];
+        let html = RequestImportPreviewTemplate {
+            chrome: AppChrome {
+                csrf_token: "csrf",
+                active_nav: "changes",
+                section_label: "Changes",
+                user_email: "contributor@example.test",
+                user_role: "CONTRIBUTOR",
+                recent_active: false,
+                permissions: AppPermissions {
+                    can_manage_users: false,
+                    can_view_audit: false,
+                    can_manage_system: false,
+                },
+            },
+            environment: &environment,
+            preview_token: "authenticated-ciphertext-token",
+            entries: &entries,
+            requires_reason: true,
+        }
+        .render()
+        .unwrap();
+        assert!(html.contains("DATABASE_URL"));
+        assert!(html.contains("UPDATE"));
+        assert!(html.contains("Change reason"));
+        assert!(html.contains("authenticated-ciphertext-token"));
         assert!(!html.contains("postgres://"));
     }
 
@@ -3036,6 +3433,8 @@ mod tests {
                     visibility: visibility.into(),
                     value_type: if key == "API_URL" { "url" } else { "string" }.into(),
                     description: None,
+                    group_name: None,
+                    display_order: 0,
                     reason: "Confirmed applied".into(),
                 },
             )

@@ -1,0 +1,14 @@
+{% extends "app_base.html" %}
+{% block title %}Paste .env as request · ConfigDeck{% endblock %}
+{% block content %}
+<nav class="breadcrumbs" aria-label="Breadcrumb"><a href="/services">Configurations</a><span>/</span><a href="/services/{{ environment.service_id }}/environments">{{ environment.service_name }}</a><span>/</span><span>{{ environment.name }}</span><span>/</span><span>Paste .env</span></nav>
+<div class="hero-heading compact-heading"><div><p class="eyebrow">Bulk request</p><h1>Paste .env as a request</h1><p class="lead">Review additions and updates before sending one approval request.</p></div></div>
+<div class="notice"><strong>Proposal only</strong><span>This does not change the deployed configuration. Input is parsed as data, never executed, and values are encrypted before the review page is rendered.</span></div>
+{% if !issues.is_empty() %}<section class="error-panel"><h2>Fix these input issues</h2><ul>{% for issue in issues %}<li>{% if issue.line > 0 %}Line {{ issue.line }}: {% endif %}{{ issue.message }}</li>{% endfor %}</ul></section>{% endif %}
+<form method="post" action="/environments/{{ environment.id }}/change-requests/import/preview" class="panel stack">
+  <input type="hidden" name="csrf_token" value="{{ chrome.csrf_token }}">
+  <label>.env content<textarea name="dotenv" class="code-input" rows="18" maxlength="262144" spellcheck="false" required placeholder="# [Application]\n# Public application URL\nAPP_URL=https://example.test"></textarea></label>
+  <small>Up to 50 unique keys per request. Use <code># [Database]</code> headings to create groups.</small>
+  <div class="form-actions"><a class="button-link tertiary" href="/environments/{{ environment.id }}/change-requests/new">Add manually</a><button type="submit"><svg class="icon" aria-hidden="true"><use href="#icon-file"></use></svg>Review request</button></div>
+</form>
+{% endblock %}

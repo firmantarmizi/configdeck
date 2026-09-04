@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::{
     auth::AuthenticatedSession,
-    crypto::{CryptoManager, CurrentValueContext},
+    crypto::{CryptoManager, CurrentValueContext, ProposedValueContext},
     db::now_rfc3339,
     error::AppError,
     services::{map_write_error, validate_description, validate_name},
@@ -49,6 +49,7 @@ pub struct ComparisonWorkspace {
 pub struct ComparisonKey {
     pub key: String,
     pub cells: Vec<ComparisonCell>,
+    pub existing_count: usize,
     pub visibility_label: String,
     pub value_type_label: String,
     pub has_present: bool,
@@ -68,6 +69,11 @@ pub struct ComparisonCell {
     pub value_type: Option<String>,
     pub description: Option<String>,
     pub version: Option<i64>,
+    pub pending_request_id: Option<String>,
+    pub pending_action: Option<String>,
+    pub proposed_value: Option<String>,
+    pub proposed_visibility: Option<String>,
+    pub proposal_state: Option<String>,
 }
 
 #[derive(Clone, Debug, FromRow)]
@@ -99,9 +105,27 @@ struct VariableMetadata {
 }
 
 #[derive(Clone, Debug, FromRow)]
-struct PendingKey {
+struct PendingKeyRow {
+    request_id: String,
     environment_id: String,
+    item_id: String,
     key: String,
+    action: String,
+    encrypted_proposed_value: Option<Vec<u8>>,
+    proposed_value_nonce: Option<Vec<u8>>,
+    proposed_dek_version: Option<i64>,
+    proposed_visibility: String,
+    value_fulfilled_at: Option<String>,
+    item_revision: i64,
+}
+
+#[derive(Clone, Debug)]
+struct PendingMetadata {
+    request_id: String,
+    action: String,
+    proposed_value: Option<String>,
+    proposed_visibility: String,
+    proposal_state: String,
 }
 
 async fn load_comparison_variables(
@@ -120,10 +144,15 @@ async fn load_comparison_variables(
     .bind(service_id)
     .fetch_all(pool)
     .await?;
+    let restricted_keys: HashSet<_> = rows
+        .iter()
+        .filter(|row| row.visibility == "restricted")
+        .map(|row| row.key.clone())
+        .collect();
     let mut variables = Vec::with_capacity(rows.len());
     let mut deks = HashMap::new();
     for row in rows {
-        let value = if row.visibility == "public" {
+        let value = if row.visibility == "public" && !restricted_keys.contains(&row.key) {
             let dek_version = u64::try_from(row.dek_version).map_err(|_| AppError::Crypto)?;
             let cache_key = (row.environment_id.clone(), row.dek_version);
             if !deks.contains_key(&cache_key) {
@@ -164,19 +193,122 @@ async fn load_comparison_variables(
     Ok(variables)
 }
 
+async fn load_pending_metadata(
+    pool: &SqlitePool,
+    crypto: &CryptoManager,
+    service_id: &str,
+) -> Result<HashMap<String, HashMap<String, PendingMetadata>>, AppError> {
+    let rows = sqlx::query_as::<_, PendingKeyRow>(
+        "SELECT r.id AS request_id, r.environment_id, i.id AS item_id, i.key, i.action, \
+                i.encrypted_proposed_value, i.proposed_value_nonce, i.proposed_dek_version, \
+                i.proposed_visibility, i.value_fulfilled_at, i.item_revision \
+         FROM change_requests r \
+         JOIN change_request_items i ON i.change_request_id = r.id \
+         JOIN environments e ON e.id = r.environment_id \
+         WHERE r.service_id = ? AND e.archived_at IS NULL \
+           AND r.status IN ('REQUESTED', 'NEEDS_INPUT', 'READY_TO_APPLY') \
+         ORDER BY r.requested_at DESC, r.id DESC, i.key",
+    )
+    .bind(service_id)
+    .fetch_all(pool)
+    .await?;
+    let mut restricted_keys: HashSet<String> = rows
+        .iter()
+        .filter(|row| row.proposed_visibility == "restricted")
+        .map(|row| row.key.clone())
+        .collect();
+    restricted_keys.extend(
+        sqlx::query_scalar::<_, String>(
+            "SELECT DISTINCT v.key FROM variables v \
+             JOIN environments e ON e.id = v.environment_id \
+             WHERE e.service_id = ? AND e.archived_at IS NULL \
+               AND v.lifecycle_status = 'ACTIVE' AND v.visibility = 'restricted'",
+        )
+        .bind(service_id)
+        .fetch_all(pool)
+        .await?,
+    );
+    let mut pending: HashMap<String, HashMap<String, PendingMetadata>> = HashMap::new();
+    let mut deks = HashMap::new();
+    for row in rows {
+        if pending
+            .get(&row.environment_id)
+            .is_some_and(|keys| keys.contains_key(&row.key))
+        {
+            continue;
+        }
+        let fulfilled = row.value_fulfilled_at.is_some();
+        let proposal_state = if row.action == "DELETE" {
+            "delete".to_owned()
+        } else if !fulfilled {
+            "awaiting".to_owned()
+        } else if restricted_keys.contains(&row.key) {
+            "masked".to_owned()
+        } else {
+            "value".to_owned()
+        };
+        let proposed_value = if proposal_state == "value" {
+            let (Some(ciphertext), Some(nonce), Some(dek_version)) = (
+                row.encrypted_proposed_value.as_deref(),
+                row.proposed_value_nonce.as_deref(),
+                row.proposed_dek_version,
+            ) else {
+                return Err(AppError::Crypto);
+            };
+            let dek_version_u64 = u64::try_from(dek_version).map_err(|_| AppError::Crypto)?;
+            let cache_key = (row.environment_id.clone(), dek_version);
+            if !deks.contains_key(&cache_key) {
+                let dek =
+                    dek_by_version(pool, crypto, &row.environment_id, dek_version_u64).await?;
+                deks.insert(cache_key.clone(), dek);
+            }
+            let dek = deks.get(&cache_key).ok_or(AppError::Crypto)?;
+            let plaintext = crypto
+                .decrypt_proposed_value(
+                    dek,
+                    &ProposedValueContext {
+                        service_id,
+                        environment_id: &row.environment_id,
+                        change_request_id: &row.request_id,
+                        item_id: &row.item_id,
+                        item_revision: u64::try_from(row.item_revision)
+                            .map_err(|_| AppError::Crypto)?,
+                        dek_version: dek_version_u64,
+                    },
+                    ciphertext,
+                    nonce,
+                )
+                .map_err(|_| AppError::Crypto)?;
+            Some(String::from_utf8(plaintext.to_vec()).map_err(|_| AppError::Crypto)?)
+        } else {
+            None
+        };
+        pending.entry(row.environment_id).or_default().insert(
+            row.key,
+            PendingMetadata {
+                request_id: row.request_id,
+                action: row.action,
+                proposed_value,
+                proposed_visibility: row.proposed_visibility,
+                proposal_state,
+            },
+        );
+    }
+    Ok(pending)
+}
+
 fn comparison_key(
     key: String,
     metadata: &HashMap<String, VariableMetadata>,
     environments: &[EnvironmentRecord],
-    pending: &HashMap<String, HashSet<String>>,
+    pending: &HashMap<String, HashMap<String, PendingMetadata>>,
 ) -> ComparisonKey {
-    let cells: Vec<_> = environments
+    let mut cells: Vec<_> = environments
         .iter()
         .map(|environment| {
             let variable = metadata.get(&environment.id);
-            let has_pending = pending
-                .get(&environment.id)
-                .is_some_and(|keys| keys.contains(&key));
+            let proposal = pending.get(&environment.id).and_then(|keys| keys.get(&key));
+            let has_pending = proposal.is_some();
             let (status_label, status_class) = match (variable, has_pending) {
                 (Some(_), true) => ("Pending change", "pending"),
                 (Some(variable), false) if variable.deployment_status == "NOT_APPLIED" => {
@@ -197,6 +329,11 @@ fn comparison_key(
                 value_type: variable.map(|value| value.value_type.clone()),
                 description: variable.and_then(|value| value.description.clone()),
                 version: variable.map(|value| value.version),
+                pending_request_id: proposal.map(|value| value.request_id.clone()),
+                pending_action: proposal.map(|value| value.action.clone()),
+                proposed_value: proposal.and_then(|value| value.proposed_value.clone()),
+                proposed_visibility: proposal.map(|value| value.proposed_visibility.clone()),
+                proposal_state: proposal.map(|value| value.proposal_state.clone()),
             }
         })
         .collect();
@@ -211,15 +348,24 @@ fn comparison_key(
     let visibility_label = match visibilities.len() {
         0 => "Missing".to_owned(),
         1 => (*visibilities.iter().next().expect("one visibility")).to_owned(),
-        _ => "Mixed visibility".to_owned(),
+        _ => "Inconsistent".to_owned(),
     };
     let value_type_label = match value_types.len() {
         0 => "No type".to_owned(),
         1 => (*value_types.iter().next().expect("one value type")).to_owned(),
-        _ => "Mixed type".to_owned(),
+        _ => "Inconsistent type".to_owned(),
     };
+    if visibilities.len() > 1 {
+        for cell in &mut cells {
+            cell.value = None;
+        }
+    }
     ComparisonKey {
         key,
+        existing_count: cells
+            .iter()
+            .filter(|cell| cell.variable_id.is_some())
+            .count(),
         visibility_label,
         value_type_label,
         has_present: cells.iter().any(|cell| cell.status_class == "present"),
@@ -277,18 +423,7 @@ pub async fn comparison_for_service(
         .partition(|environment| environment.archived_at.is_none());
 
     let variables = load_comparison_variables(pool, crypto, &service.id).await?;
-    let pending = sqlx::query_as::<_, PendingKey>(
-        "SELECT DISTINCT r.environment_id, i.key \
-         FROM change_requests r \
-         JOIN change_request_items i ON i.change_request_id = r.id \
-         JOIN environments e ON e.id = r.environment_id \
-         WHERE r.service_id = ? AND e.archived_at IS NULL \
-           AND r.status IN ('REQUESTED', 'NEEDS_INPUT', 'READY_TO_APPLY') \
-         ORDER BY i.key",
-    )
-    .bind(service_id)
-    .fetch_all(pool)
-    .await?;
+    let pending_by_environment = load_pending_metadata(pool, crypto, &service.id).await?;
 
     let mut by_key: BTreeMap<String, HashMap<String, VariableMetadata>> = BTreeMap::new();
     for variable in variables {
@@ -297,13 +432,10 @@ pub async fn comparison_for_service(
             .or_default()
             .insert(variable.environment_id.clone(), variable);
     }
-    let mut pending_by_environment: HashMap<String, HashSet<String>> = HashMap::new();
-    for item in pending {
-        by_key.entry(item.key.clone()).or_default();
-        pending_by_environment
-            .entry(item.environment_id)
-            .or_default()
-            .insert(item.key);
+    for keys in pending_by_environment.values() {
+        for key in keys.keys() {
+            by_key.entry(key.clone()).or_default();
+        }
     }
 
     let keys = by_key
@@ -666,6 +798,7 @@ mod tests {
         crypto::CryptoManager,
         db::{initialize_and_validate_key_registry, test_pool},
         error::AppError,
+        requests::{self, ChangeRequestInput, ChangeRequestItemInput},
         services::{self, ServiceInput},
         users::Role,
         variables::{self, AppliedVariableInput},
@@ -948,6 +1081,8 @@ mod tests {
                 visibility: "public".into(),
                 value_type: "string".into(),
                 description: Some("Public endpoint".into()),
+                group_name: Some("Application".into()),
+                display_order: 0,
                 reason: "seed comparison".into(),
             },
         )
@@ -966,6 +1101,183 @@ mod tests {
             workspace.keys[0].cells[0].description.as_deref(),
             Some("Public endpoint")
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn comparison_exposes_public_proposal_but_never_restricted_proposal() {
+        let pool = test_pool().await;
+        seed_identity(&pool).await;
+        let crypto = CryptoManager::new(Zeroizing::new([22; 32]));
+        initialize_and_validate_key_registry(&pool, &crypto)
+            .await
+            .unwrap();
+        let admin = session("admin", Role::Administrator);
+        let service_id = services::create(
+            &pool,
+            &admin,
+            ServiceInput {
+                name: "Proposal comparison".into(),
+                description: None,
+            },
+        )
+        .await
+        .unwrap();
+        let environment_id = create(
+            &pool,
+            &crypto,
+            &admin,
+            &service_id,
+            EnvironmentInput {
+                name: "Development".into(),
+                description: None,
+            },
+        )
+        .await
+        .unwrap();
+        let restricted_environment_id = create(
+            &pool,
+            &crypto,
+            &admin,
+            &service_id,
+            EnvironmentInput {
+                name: "Production".into(),
+                description: None,
+            },
+        )
+        .await
+        .unwrap();
+        for (key, value, visibility) in [
+            ("PUBLIC_HOST", "current.example", "public"),
+            ("API_TOKEN", "current-secret", "restricted"),
+            ("MIXED_KEY", "current-public", "public"),
+        ] {
+            variables::record_applied(
+                &pool,
+                &crypto,
+                &admin,
+                &environment_id,
+                AppliedVariableInput {
+                    key: key.into(),
+                    value: value.into(),
+                    visibility: visibility.into(),
+                    value_type: "string".into(),
+                    description: None,
+                    group_name: None,
+                    display_order: 0,
+                    reason: "seed proposal comparison".into(),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        variables::record_applied(
+            &pool,
+            &crypto,
+            &admin,
+            &restricted_environment_id,
+            AppliedVariableInput {
+                key: "MIXED_KEY".into(),
+                value: "current-restricted".into(),
+                visibility: "restricted".into(),
+                value_type: "string".into(),
+                description: None,
+                group_name: None,
+                display_order: 0,
+                reason: "seed inconsistent visibility".into(),
+            },
+        )
+        .await
+        .unwrap();
+        requests::create(
+            &pool,
+            &crypto,
+            &admin,
+            ChangeRequestInput {
+                environment_id: environment_id.clone(),
+                title: Some("Update comparison values".into()),
+                reason: "Verify proposal presentation".into(),
+                items: vec![
+                    ChangeRequestItemInput {
+                        action: "UPDATE".into(),
+                        key: "PUBLIC_HOST".into(),
+                        value: Some("preview.example".into()),
+                        value_source: Some("REQUESTER_PROVIDED".into()),
+                        visibility: Some("public".into()),
+                        value_type: Some("string".into()),
+                        description: None,
+                        group_name: None,
+                        display_order: None,
+                    },
+                    ChangeRequestItemInput {
+                        action: "UPDATE".into(),
+                        key: "API_TOKEN".into(),
+                        value: Some("proposed-secret".into()),
+                        value_source: Some("REQUESTER_PROVIDED".into()),
+                        visibility: Some("restricted".into()),
+                        value_type: Some("string".into()),
+                        description: None,
+                        group_name: None,
+                        display_order: None,
+                    },
+                    ChangeRequestItemInput {
+                        action: "UPDATE".into(),
+                        key: "MIXED_KEY".into(),
+                        value: Some("mixed-public-proposal".into()),
+                        value_source: Some("REQUESTER_PROVIDED".into()),
+                        visibility: Some("public".into()),
+                        value_type: Some("string".into()),
+                        description: None,
+                        group_name: None,
+                        display_order: None,
+                    },
+                ],
+            },
+        )
+        .await
+        .unwrap();
+
+        let workspace = comparison_for_service(&pool, &crypto, &admin, &service_id)
+            .await
+            .unwrap();
+        let public = workspace
+            .keys
+            .iter()
+            .find(|row| row.key == "PUBLIC_HOST")
+            .unwrap();
+        assert_eq!(public.cells[0].proposal_state.as_deref(), Some("value"));
+        assert_eq!(
+            public.cells[0].proposed_value.as_deref(),
+            Some("preview.example")
+        );
+        let restricted = workspace
+            .keys
+            .iter()
+            .find(|row| row.key == "API_TOKEN")
+            .unwrap();
+        assert_eq!(
+            restricted.cells[0].proposal_state.as_deref(),
+            Some("masked")
+        );
+        assert!(restricted.cells[0].proposed_value.is_none());
+        assert!(!format!("{workspace:?}").contains("proposed-secret"));
+        let mixed = workspace
+            .keys
+            .iter()
+            .find(|row| row.key == "MIXED_KEY")
+            .unwrap();
+        assert_eq!(mixed.visibility_label, "Inconsistent");
+        assert!(mixed.cells.iter().all(|cell| cell.value.is_none()));
+        let mixed_proposal = mixed
+            .cells
+            .iter()
+            .find(|cell| cell.environment_id == environment_id)
+            .unwrap();
+        assert_eq!(mixed_proposal.proposal_state.as_deref(), Some("masked"));
+        assert!(mixed_proposal.proposed_value.is_none());
+        let debug = format!("{workspace:?}");
+        assert!(!debug.contains("current-public"));
+        assert!(!debug.contains("mixed-public-proposal"));
     }
 
     async fn seed_identity(pool: &sqlx::SqlitePool) {

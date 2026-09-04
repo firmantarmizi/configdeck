@@ -31,7 +31,7 @@ Administrators create additional accounts from `Users & Access`. There are no de
 ## Docker Compose
 
 1. Copy `.env.example` to `.env` and provide a strong bootstrap password.
-2. Create `secrets/configdeck_master_key` containing standard-base64 encoding of exactly 32 random bytes.
+2. Create a host-private `secrets/` directory and `secrets/configdeck_master_key` containing standard-base64 encoding of exactly 32 random bytes. The file must be readable by the non-root container process.
 3. Start the service:
 
 ```bash
@@ -57,13 +57,14 @@ From a Linux or WSL terminal, enter the cloned repository:
 ```bash
 cd configdeck
 cp .env.example .env
-mkdir -p secrets
-umask 077
+install -d -m 700 secrets
 openssl rand -base64 32 > secrets/configdeck_master_key
+chmod 644 secrets/configdeck_master_key
 nano .env
 ```
 
 Generate the master-key file only for a brand-new database. If the ConfigDeck data volume already exists, keep the existing `secrets/configdeck_master_key`; replacing it will make the application fail closed because the stored KEK fingerprint will no longer match.
+The source file is readable inside the container but remains protected on the host by the mode-`0700` parent directory and is mounted read-only. On platforms with managed file secrets, prefer their equivalent read-only file mount.
 
 Set `CONFIGDECK_ADMIN_PASSWORD` in `.env` to a unique password of at least 12 bytes. For HTTP localhost, include `docker-compose.local.yml` so ConfigDeck uses a non-Secure development session cookie:
 
@@ -87,9 +88,9 @@ Administrators use **Maintenance → Backup & recovery** to create verified SQLi
 
 **Maintenance → Key rotation** supports atomic KEK re-wrap/TOTP re-encryption and synchronous resumable per-environment DEK rotation. Both require high-impact identity confirmation. Follow [`docs/operations.md`](docs/operations.md); never replace the active master-key file without first preserving it as the temporary previous-key secret.
 
-For initial migration, refresh privileged authentication and select **Import .env**. The preview never repeats plaintext values and defaults every row to `restricted`; search/filter keys, apply bulk visibility only to the currently visible rows, and review the suggested type before confirming. **Preview .env** decrypts the complete current environment only after recent authentication and supports Copy `.env`, Copy Selected, and download. Close the preview after use because it contains plaintext restricted values.
+For initial migration, refresh privileged authentication and select **Record deployed configuration**. This Operator-only workflow is explicitly for values already active on the deployment platform. Its preview never repeats plaintext values and defaults every row to `restricted`; search/filter keys, review detected groups and descriptions, apply bulk visibility only to the currently visible rows, and review the suggested type before recording the state. Use `# [Database]` as a portable group heading and an ordinary comment immediately above a key as its description. **Preview .env** preserves those sections and comments, decrypts the complete current environment only after recent authentication, and supports Copy `.env`, Copy Selected, and download. Close the preview after use because it contains plaintext restricted values.
 
-An Administrator opens **Manage Contributor access** on an App. Grant/revoke immediately invalidates the affected Contributor's sessions. An assigned Contributor can submit one or more ADD/UPDATE/DELETE items. “I provide it” encrypts the submitted value immediately; a restricted value is write-only afterward. “Operator provides it” remains `NEEDS_INPUT` until fulfilled. Operator/Administrator approval, resulting `.env` preview, external deployment, and explicit Mark Applied preserve the difference between proposed and deployed state.
+An Administrator opens **Manage Contributor access** on an App. Grant/revoke immediately invalidates the affected Contributor's sessions. An assigned Contributor adds one or more keys through the progressive builder, updates or deletes an existing key from its row, or pastes up to 50 `.env` entries as one request. Bulk paste detects ADD versus UPDATE, keeps values out of preview HTML, defaults visibility to `restricted`, and does not mutate current state. “I provide it” encrypts the submitted value immediately; a restricted value is write-only afterward. “Operator provides it” remains `NEEDS_INPUT` until fulfilled. Operator/Administrator approval, resulting `.env` preview, external deployment, and explicit Mark Applied preserve the difference between proposed and deployed state.
 
 If the production Compose file was already started directly for local testing, no data reset is necessary. Recreate only the container while retaining the named volumes:
 

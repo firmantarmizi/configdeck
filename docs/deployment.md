@@ -12,6 +12,69 @@ ghcr.io/<repository-owner>/<repository-name>:<version>
 
 The release includes an SBOM, provenance, and GitHub attestation. Production deployments should pin the immutable image digest rather than a mutable tag. Environment-specific credentials, hosts, and webhooks belong in protected deployment configuration, not this repository.
 
+## Dokploy with a published image
+
+For a small production host, publish the image in GitHub Actions and let Dokploy pull it instead of compiling Rust on the deployment server. Create a Docker Compose service in Dokploy and use the following baseline, replacing `<version>` with a published release such as `0.1.0`:
+
+```yaml
+services:
+  configdeck:
+    image: ghcr.io/firmantarmizi/configdeck:<version>
+    restart: unless-stopped
+    environment:
+      CONFIGDECK_ENV: production
+      CONFIGDECK_BIND: 0.0.0.0:3000
+      CONFIGDECK_DATABASE_URL: sqlite:///data/configdeck.db
+      CONFIGDECK_ADMIN_EMAIL: ${CONFIGDECK_ADMIN_EMAIL:-}
+      CONFIGDECK_ADMIN_PASSWORD: ${CONFIGDECK_ADMIN_PASSWORD:-}
+      CONFIGDECK_DB_MAX_CONNECTIONS: ${CONFIGDECK_DB_MAX_CONNECTIONS:-5}
+      CONFIGDECK_TRUSTED_PROXIES: ${CONFIGDECK_TRUSTED_PROXIES:-}
+      RUST_LOG: ${RUST_LOG:-configdeck=info,tower_http=info}
+    expose:
+      - "3000"
+    volumes:
+      - configdeck_data:/data
+      - configdeck_backup:/backup
+      - ../files/configdeck_master_key:/run/secrets/configdeck_master_key:ro
+    read_only: true
+    pids_limit: 128
+    mem_limit: 256m
+    cpus: 0.50
+    stop_grace_period: 20s
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/configdeck", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  configdeck_data:
+  configdeck_backup:
+```
+
+In Dokploy:
+
+1. Create `../files/configdeck_master_key` through the Compose service file-mount facility. Its content must be one standard-base64 value that decodes to exactly 32 bytes. Never store it in Git or the Compose environment editor.
+2. Add the bootstrap Administrator email and a unique temporary password in the Dokploy Environment tab. The Compose file references only the required variables; Dokploy environment values are not automatically injected unless referenced.
+3. Deploy exactly one replica. SQLite must not be shared by multiple running ConfigDeck instances.
+4. In the Domains tab, route the `configdeck` service to container port `3000`, enable HTTPS, and redeploy after domain changes. A host port does not need to be published.
+5. Complete TOTP enrollment, change the bootstrap password, create a second Administrator, then remove both bootstrap variables and redeploy without deleting either named volume.
+6. Verify `/health`, `/ready`, login, backup creation, and an off-host backup before storing real configuration.
+
+Public GHCR container packages can be pulled anonymously. If the package remains private, configure a GHCR registry in Dokploy using a classic token limited to `read:packages`. Pin the resolved image digest after the first successful deployment, and create a verified backup before changing versions.
+
 ## Prerequisites
 
 - Docker Engine 24+ with Compose v2, or an equivalent container platform.
@@ -28,10 +91,9 @@ Copy the environment template and generate the master key once:
 
 ```bash
 cp .env.example .env
-mkdir -p secrets
-umask 077
+install -d -m 700 secrets
 openssl rand -base64 32 > secrets/configdeck_master_key
-chmod 600 secrets/configdeck_master_key
+chmod 644 secrets/configdeck_master_key
 ```
 
 Set a unique bootstrap Administrator email and password in `.env`, then start:
@@ -46,6 +108,7 @@ curl -fsS http://127.0.0.1:3000/ready
 ```
 
 The master-key file must decode from standard base64 to exactly 32 bytes. Preserve it for the lifetime of the database and back it up separately. Replacing it on an existing database causes ConfigDeck to fail closed.
+Mode `0644` allows the fixed non-root container UID to read the bind-mounted file; the mode-`0700` parent directory prevents other host users from reaching it, and the container mount is read-only. A managed secret-file mount with equivalent access is preferred when the platform provides one.
 
 Complete TOTP enrollment, replace the initial password, finish organization setup, and create a second Administrator. Remove `CONFIGDECK_ADMIN_EMAIL` and `CONFIGDECK_ADMIN_PASSWORD` from the deployment after bootstrap, then recreate only the container. Never remove the data volume during a normal redeploy.
 

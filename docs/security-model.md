@@ -45,6 +45,7 @@ Inactive users are always denied. Contributor access is App-scoped. The backend 
 - Sensitive pages use `Cache-Control: no-store` and `Pragma: no-cache`.
 - Plaintext values are never placed in URLs, browser storage, global JavaScript state, logs, or audit metadata.
 - Reveal and export are explicit actions. Restricted values remain masked on ordinary pages.
+- The comparison workspace only decrypts a logical key when its visibility is consistently public. Any restricted current value or proposal makes the complete key fail closed and masked across environments until the metadata is normalized.
 - Forwarded client headers are ignored unless the immediate proxy is in `CONFIGDECK_TRUSTED_PROXIES`.
 
 ## Primary threats and controls
@@ -55,7 +56,7 @@ Inactive users are always denied. Contributor access is App-scoped. The backend 
 | Unauthorized restricted-value access | Backend role/scope checks, no decrypt before authorization, recent auth | Review grants and privileged audit events |
 | Session theft | Hashed session tokens, secure cookies, expiry, rotation, revocation | Protect endpoints, browsers, and TLS termination |
 | CSRF/XSS/cache leakage | Session-bound CSRF, output escaping, CSP, no-store, no plaintext URLs/storage | Patch promptly and restrict network access |
-| Malicious `.env` import | Data-only parser, size/count limits, duplicate rejection, no shell expansion | Review visibility and type before commit |
+| Malicious `.env` input | Data-only parser, size/count/metadata limits, duplicate rejection, no shell expansion, and purpose-bound encrypted preview tokens | Review detected action, group, description, visibility, and type; contributor paste creates a proposal, while recording deployed state remains recent-authenticated and Operator-only |
 | Log leakage | Request-body exclusion and metadata allowlists | Restrict log access and define retention |
 | Storage exhaustion | Bounded logs/auth state, pagination, free-space monitoring | Define audit/archive/backup lifecycle and alerts |
 | Host compromise | Non-root container, read-only filesystem, dropped capabilities | Isolate and rebuild the host; rotate real credentials afterward |

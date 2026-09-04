@@ -152,6 +152,8 @@ mod tests {
                     visibility: "restricted".into(),
                     value_type: "string".into(),
                     description: None,
+                    group_name: None,
+                    display_order: i64::try_from(index).unwrap(),
                     reason: "Test dashboard scope".into(),
                 },
             )

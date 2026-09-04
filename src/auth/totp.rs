@@ -1,5 +1,5 @@
 use data_encoding::BASE32_NOPAD;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use sha1::Sha1;
 use subtle::ConstantTimeEq;
@@ -84,7 +84,7 @@ pub(crate) fn code_at(secret: &[u8], unix_seconds: i64) -> String {
 }
 
 fn hotp(secret: &[u8], counter: u64) -> u32 {
-    let mut mac = <HmacSha1 as Mac>::new_from_slice(secret).expect("HMAC accepts any key size");
+    let mut mac = <HmacSha1 as KeyInit>::new_from_slice(secret).expect("HMAC accepts any key size");
     mac.update(&counter.to_be_bytes());
     let digest = mac.finalize().into_bytes();
     let offset = usize::from(digest[19] & 0x0f);

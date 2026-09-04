@@ -35,6 +35,9 @@ pub struct VariableView {
     pub visibility: String,
     pub value_type: String,
     pub description: Option<String>,
+    pub group_name: Option<String>,
+    pub display_order: i64,
+    pub starts_group: bool,
     pub version: i64,
     pub deployment_status: String,
     pub updated_at: String,
@@ -54,6 +57,8 @@ struct VariableRow {
     visibility: String,
     value_type: String,
     description: Option<String>,
+    group_name: Option<String>,
+    display_order: i64,
     version: i64,
     deployment_status: String,
     updated_at: String,
@@ -68,6 +73,8 @@ pub struct AppliedVariableInput {
     pub visibility: String,
     pub value_type: String,
     pub description: Option<String>,
+    pub group_name: Option<String>,
+    pub display_order: i64,
     pub reason: String,
 }
 
@@ -86,6 +93,7 @@ pub struct HistoryView {
     pub visibility: String,
     pub value_type: String,
     pub description: Option<String>,
+    pub group_name: Option<String>,
     pub lifecycle_status: String,
     pub changed_at: String,
     pub changed_by: String,
@@ -105,6 +113,7 @@ struct HistoryRow {
     visibility: String,
     value_type: String,
     description: Option<String>,
+    group_name: Option<String>,
     lifecycle_status: String,
     changed_at: String,
     changed_by: String,
@@ -145,12 +154,17 @@ pub async fn list_for_environment_filtered(
     }
     let rows = sqlx::query_as::<_, VariableRow>(
         "SELECT v.id, v.key, v.encrypted_value, v.value_nonce, v.dek_version, v.visibility, \
-                v.value_type, v.description, v.version, v.deployment_status, v.updated_at, \
+                v.value_type, v.description, v.group_name, v.display_order, v.version, v.deployment_status, v.updated_at, \
                 updater.email AS updated_by, v.last_applied_at \
          FROM variables v JOIN users updater ON updater.id = v.updated_by \
          WHERE v.environment_id = ? AND v.lifecycle_status = 'ACTIVE' \
            AND (? = '' OR instr(lower(v.key), lower(?)) > 0) \
-           AND (? = '' OR v.visibility = ?) ORDER BY v.key",
+           AND (? = '' OR v.visibility = ?) \
+         ORDER BY CASE WHEN v.group_name IS NULL THEN 1 ELSE 0 END, \
+                  COALESCE((SELECT MIN(vg.display_order) FROM variables vg \
+                            WHERE vg.environment_id = v.environment_id \
+                              AND vg.lifecycle_status = 'ACTIVE' AND vg.group_name = v.group_name), v.display_order), \
+                  v.display_order, v.key",
     )
     .bind(environment_id)
     .bind(query)
@@ -161,6 +175,7 @@ pub async fn list_for_environment_filtered(
     .await?;
 
     let mut result = Vec::with_capacity(rows.len());
+    let mut previous_group: Option<String> = None;
     for row in rows {
         let value = if row.visibility == "public" {
             Some(decrypt_row_value(pool, crypto, &environment, &row).await?)
@@ -168,6 +183,8 @@ pub async fn list_for_environment_filtered(
             None
         };
         let updated_display = display_timestamp(&row.updated_at);
+        let starts_group = row.group_name.is_some() && row.group_name != previous_group;
+        previous_group.clone_from(&row.group_name);
         result.push(VariableView {
             id: row.id,
             key: row.key,
@@ -175,6 +192,9 @@ pub async fn list_for_environment_filtered(
             visibility: row.visibility,
             value_type: row.value_type,
             description: row.description,
+            group_name: row.group_name,
+            display_order: row.display_order,
+            starts_group,
             version: row.version,
             deployment_status: row.deployment_status,
             updated_at: row.updated_at,
@@ -229,6 +249,8 @@ async fn prepare_applied(
     let value_type = validate_value_type(&input.value_type)?;
     validate_value(&input.value, value_type)?;
     let description = validate_description(input.description)?;
+    let group_name = validate_group_name(input.group_name)?;
+    let display_order = validate_display_order(input.display_order)?;
     let reason = validate_reason(&input.reason)?;
 
     let existing = sqlx::query_as::<_, ExistingVariable>(
@@ -310,6 +332,8 @@ async fn prepare_applied(
         visibility: visibility.to_owned(),
         value_type: value_type.to_owned(),
         description,
+        group_name,
+        display_order,
         reason,
         dek_version: i64::try_from(dek_version).map_err(|_| AppError::Crypto)?,
         encrypted,
@@ -364,7 +388,7 @@ pub async fn delete_applied(
     let reason = validate_reason(reason)?;
     let row = sqlx::query_as::<_, DeleteVariableRow>(
         "SELECT v.id, v.environment_id, v.key, v.encrypted_value, v.value_nonce, v.dek_version, \
-                v.visibility, v.value_type, v.description, v.version \
+                v.visibility, v.value_type, v.description, v.group_name, v.display_order, v.version \
          FROM variables v WHERE v.id = ? AND v.lifecycle_status = 'ACTIVE'",
     )
     .bind(variable_id)
@@ -422,6 +446,8 @@ pub async fn delete_applied(
         visibility: row.visibility,
         value_type: row.value_type,
         description: row.description,
+        group_name: row.group_name,
+        display_order: row.display_order,
         reason,
         dek_version: i64::try_from(dek_version).map_err(|_| AppError::Crypto)?,
         encrypted,
@@ -453,6 +479,8 @@ struct AppliedWrite {
     visibility: String,
     value_type: String,
     description: Option<String>,
+    group_name: Option<String>,
+    display_order: i64,
     reason: String,
     dek_version: i64,
     encrypted: EncryptedBlob,
@@ -511,8 +539,9 @@ async fn insert_direct_change(
         sqlx::query(
             "INSERT INTO change_request_items(\
                 id, change_request_id, variable_id, action, key, base_variable_version, \
-                proposed_visibility, proposed_value_type, proposed_description, created_at\
-             ) VALUES(?, ?, ?, 'DELETE', ?, ?, ?, ?, ?, ?)",
+                proposed_visibility, proposed_value_type, proposed_description, proposed_group_name, \
+                proposed_display_order, created_at\
+             ) VALUES(?, ?, ?, 'DELETE', ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&write.item_id)
         .bind(&write.request_id)
@@ -522,6 +551,8 @@ async fn insert_direct_change(
         .bind(&write.visibility)
         .bind(&write.value_type)
         .bind(&write.description)
+        .bind(&write.group_name)
+        .bind(write.display_order)
         .bind(now)
         .execute(&mut **transaction)
         .await?;
@@ -531,9 +562,10 @@ async fn insert_direct_change(
             "INSERT INTO change_request_items(\
                 id, change_request_id, variable_id, action, key, base_variable_version, \
                 encrypted_proposed_value, proposed_value_nonce, proposed_crypto_version, proposed_dek_version, \
-                proposed_visibility, proposed_value_type, proposed_description, value_source, \
+                proposed_visibility, proposed_value_type, proposed_description, proposed_group_name, \
+                proposed_display_order, value_source, \
                 value_fulfilled_by, value_fulfilled_at, created_at\
-             ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, 'OPERATOR_PROVIDED', ?, ?, ?)",
+             ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, 'OPERATOR_PROVIDED', ?, ?, ?)",
         )
         .bind(&write.item_id)
         .bind(&write.request_id)
@@ -547,6 +579,8 @@ async fn insert_direct_change(
         .bind(&write.visibility)
         .bind(&write.value_type)
         .bind(&write.description)
+        .bind(&write.group_name)
+        .bind(write.display_order)
         .bind(&session.user.id)
         .bind(now)
         .bind(now)
@@ -566,9 +600,9 @@ async fn mutate_current(
         sqlx::query(
             "INSERT INTO variables(\
                 id, environment_id, key, encrypted_value, value_nonce, crypto_version, dek_version, \
-                visibility, value_type, description, version, lifecycle_status, deployment_status, \
+                visibility, value_type, description, group_name, display_order, version, lifecycle_status, deployment_status, \
                 created_at, created_by, updated_at, updated_by, last_applied_at, last_applied_by\
-             ) VALUES(?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, 'ACTIVE', 'APPLIED', ?, ?, ?, ?, ?, ?)",
+             ) VALUES(?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', 'APPLIED', ?, ?, ?, ?, ?, ?)",
         )
         .bind(&write.variable_id)
         .bind(&write.environment.id)
@@ -579,6 +613,8 @@ async fn mutate_current(
         .bind(&write.visibility)
         .bind(&write.value_type)
         .bind(&write.description)
+        .bind(&write.group_name)
+        .bind(write.display_order)
         .bind(write.version)
         .bind(now)
         .bind(&session.user.id)
@@ -598,7 +634,7 @@ async fn mutate_current(
     };
     let result = sqlx::query(
         "UPDATE variables SET encrypted_value = ?, value_nonce = ?, crypto_version = 1, \
-                dek_version = ?, visibility = ?, value_type = ?, description = ?, version = ?, \
+                dek_version = ?, visibility = ?, value_type = ?, description = ?, group_name = ?, display_order = ?, version = ?, \
                 lifecycle_status = ?, deleted_at = ?, deployment_status = 'APPLIED', \
                 updated_at = ?, updated_by = ?, last_applied_at = ?, last_applied_by = ? \
          WHERE id = ? AND environment_id = ? AND version = ? AND lifecycle_status = ?",
@@ -609,6 +645,8 @@ async fn mutate_current(
     .bind(&write.visibility)
     .bind(&write.value_type)
     .bind(&write.description)
+    .bind(&write.group_name)
+    .bind(write.display_order)
     .bind(write.version)
     .bind(lifecycle_status)
     .bind(deleted_at)
@@ -638,9 +676,9 @@ async fn insert_version_and_audit(
     sqlx::query(
         "INSERT INTO variable_versions(\
             id, variable_id, environment_id, version, operation, encrypted_value, value_nonce, \
-            crypto_version, dek_version, visibility, value_type, description, lifecycle_status, \
+            crypto_version, dek_version, visibility, value_type, description, group_name, display_order, lifecycle_status, \
             changed_by, changed_at, change_request_id, change_request_item_id\
-         ) VALUES(?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         ) VALUES(?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(Uuid::new_v4().to_string())
     .bind(&write.variable_id)
@@ -653,6 +691,8 @@ async fn insert_version_and_audit(
     .bind(&write.visibility)
     .bind(&write.value_type)
     .bind(&write.description)
+    .bind(&write.group_name)
+    .bind(write.display_order)
     .bind(if write.action == "DELETE" {
         "DELETED"
     } else {
@@ -777,7 +817,7 @@ pub async fn history(
     let rows = sqlx::query_as::<_, HistoryRow>(
         "SELECT vv.id, vv.variable_id, vv.environment_id, e.service_id, vv.version, vv.operation, \
                 vv.encrypted_value, vv.value_nonce, vv.dek_version, vv.visibility, vv.value_type, \
-                vv.description, vv.lifecycle_status, vv.changed_at, u.email AS changed_by \
+                vv.description, vv.group_name, vv.lifecycle_status, vv.changed_at, u.email AS changed_by \
          FROM variable_versions vv JOIN environments e ON e.id = vv.environment_id \
          JOIN users u ON u.id = vv.changed_by WHERE vv.variable_id = ? ORDER BY vv.version DESC",
     )
@@ -799,6 +839,7 @@ pub async fn history(
             visibility: row.visibility,
             value_type: row.value_type,
             description: row.description,
+            group_name: row.group_name,
             lifecycle_status: row.lifecycle_status,
             changed_at: row.changed_at,
             changed_by: row.changed_by,
@@ -852,6 +893,7 @@ pub async fn reveal_version(
         visibility: row.visibility.clone(),
         value_type: String::new(),
         description: None,
+        group_name: None,
         lifecycle_status: String::new(),
         changed_at: String::new(),
         changed_by: String::new(),
@@ -892,10 +934,15 @@ pub async fn export_environment(
     let environment = environment_context(pool, session, environment_id).await?;
     let rows = sqlx::query_as::<_, VariableRow>(
         "SELECT v.id, v.key, v.encrypted_value, v.value_nonce, v.dek_version, v.visibility, \
-                v.value_type, v.description, v.version, v.deployment_status, v.updated_at, \
+                v.value_type, v.description, v.group_name, v.display_order, v.version, v.deployment_status, v.updated_at, \
                 updater.email AS updated_by, v.last_applied_at \
          FROM variables v JOIN users updater ON updater.id = v.updated_by \
-         WHERE v.environment_id = ? AND v.lifecycle_status = 'ACTIVE' ORDER BY v.key",
+         WHERE v.environment_id = ? AND v.lifecycle_status = 'ACTIVE' \
+         ORDER BY CASE WHEN v.group_name IS NULL THEN 1 ELSE 0 END, \
+                  COALESCE((SELECT MIN(vg.display_order) FROM variables vg \
+                            WHERE vg.environment_id = v.environment_id \
+                              AND vg.lifecycle_status = 'ACTIVE' AND vg.group_name = v.group_name), v.display_order), \
+                  v.display_order, v.key",
     )
     .bind(environment_id)
     .fetch_all(pool)
@@ -905,6 +952,9 @@ pub async fn export_environment(
         entries.push(crate::dotenv::Entry {
             key: row.key.clone(),
             value: decrypt_row_value(pool, crypto, &environment, &row).await?,
+            group: row.group_name,
+            description: row.description,
+            position: row.display_order,
         });
     }
     let rendered = Zeroizing::new(crate::dotenv::render(&entries));
@@ -933,6 +983,9 @@ pub async fn copy_current(
     let rendered = crate::dotenv::render(&[crate::dotenv::Entry {
         key,
         value: value.to_string(),
+        group: None,
+        description: None,
+        position: 0,
     }]);
     let row = sqlx::query_as::<_, CopyAuditRow>(
         "SELECT v.key, v.visibility, e.id AS environment_id, e.service_id \
@@ -979,6 +1032,8 @@ struct DeleteVariableRow {
     visibility: String,
     value_type: String,
     description: Option<String>,
+    group_name: Option<String>,
+    display_order: i64,
     version: i64,
 }
 
@@ -1160,6 +1215,29 @@ pub(crate) fn validate_value_type(value: &str) -> Result<&str, AppError> {
     match value {
         "string" | "boolean" | "integer" | "url" | "multiline" => Ok(value),
         _ => Err(AppError::InvalidRequest),
+    }
+}
+
+pub(crate) fn validate_group_name(value: Option<String>) -> Result<Option<String>, AppError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.chars().count() > 80 || value.chars().any(char::is_control) {
+        return Err(AppError::InvalidRequest);
+    }
+    Ok(Some(value.to_owned()))
+}
+
+pub(crate) fn validate_display_order(value: i64) -> Result<i64, AppError> {
+    let max_entries = i64::try_from(crate::dotenv::MAX_ENTRIES).unwrap_or(i64::MAX);
+    if (0..max_entries).contains(&value) {
+        Ok(value)
+    } else {
+        Err(AppError::InvalidRequest)
     }
 }
 
@@ -1628,20 +1706,25 @@ mod tests {
             .unwrap();
         assert_eq!(count, 0);
 
+        let mut api_url = input("API_URL", "https://example.test/a=b", "public", "url");
+        api_url.group_name = Some("Application".into());
+        api_url.description = Some("Public application URL".into());
+        api_url.display_order = 1;
+        let mut database_url = input(
+            "DATABASE_URL",
+            "postgres://user:secret@example.test/db",
+            "restricted",
+            "string",
+        );
+        database_url.group_name = Some("Database".into());
+        database_url.description = Some("Primary database connection".into());
+        database_url.display_order = 2;
         let imported = import_applied(
             &pool,
             &crypto,
             &operator,
             &environment_id,
-            vec![
-                input("API_URL", "https://example.test/a=b", "public", "url"),
-                input(
-                    "DATABASE_URL",
-                    "postgres://user:secret@example.test/db",
-                    "restricted",
-                    "string",
-                ),
-            ],
+            vec![api_url, database_url],
         )
         .await
         .unwrap();
@@ -1671,6 +1754,8 @@ mod tests {
                 .unwrap();
         assert!(exported.contains("API_URL=\"https://example.test/a=b\""));
         assert!(exported.contains("DATABASE_URL=postgres://user:secret@example.test/db"));
+        assert!(exported.contains("# [Application]\n# Public application URL\nAPI_URL="));
+        assert!(exported.contains("# [Database]\n# Primary database connection\nDATABASE_URL="));
     }
 
     fn input(key: &str, value: &str, visibility: &str, value_type: &str) -> AppliedVariableInput {
@@ -1680,6 +1765,8 @@ mod tests {
             visibility: visibility.into(),
             value_type: value_type.into(),
             description: None,
+            group_name: None,
+            display_order: 0,
             reason: "Confirmed as applied in deployment platform".into(),
         }
     }

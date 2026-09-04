@@ -16,8 +16,9 @@ use crate::{
     services::validate_description,
     users::{Capability, can_access_service},
     variables::{
-        EnvironmentContext, ensure_mutable, environment_context, validate_key, validate_reason,
-        validate_value, validate_value_type, validate_visibility,
+        EnvironmentContext, ensure_mutable, environment_context, validate_display_order,
+        validate_group_name, validate_key, validate_reason, validate_value, validate_value_type,
+        validate_visibility,
     },
 };
 
@@ -42,6 +43,8 @@ pub struct ChangeRequestItemInput {
     pub visibility: Option<String>,
     pub value_type: Option<String>,
     pub description: Option<String>,
+    pub group_name: Option<String>,
+    pub display_order: Option<i64>,
 }
 
 #[derive(Clone)]
@@ -54,6 +57,26 @@ pub struct InlineEditInput {
     pub value_type: String,
     pub description: Option<String>,
     pub reason: String,
+}
+
+#[derive(Clone)]
+pub struct SharedInlineValueInput {
+    pub environment_id: String,
+    pub variable_id: String,
+    pub value: String,
+    pub value_source: String,
+    pub description: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct SharedInlineEditInput {
+    pub service_id: String,
+    pub current_key: String,
+    pub new_key: String,
+    pub visibility: String,
+    pub value_type: String,
+    pub reason: String,
+    pub values: Vec<SharedInlineValueInput>,
 }
 
 #[derive(Clone, Debug, FromRow, Serialize)]
@@ -114,6 +137,8 @@ struct ItemRow {
     proposed_visibility: String,
     proposed_value_type: String,
     proposed_description: Option<String>,
+    proposed_group_name: Option<String>,
+    proposed_display_order: i64,
     value_source: Option<String>,
     value_fulfilled_at: Option<String>,
     item_revision: i64,
@@ -141,6 +166,8 @@ struct CurrentRow {
     visibility: String,
     value_type: String,
     description: Option<String>,
+    group_name: Option<String>,
+    display_order: i64,
     version: i64,
     lifecycle_status: String,
 }
@@ -166,6 +193,8 @@ struct PreparedApply {
     visibility: String,
     value_type: String,
     description: Option<String>,
+    group_name: Option<String>,
+    display_order: i64,
     encrypted: EncryptedBlob,
     dek_version: i64,
 }
@@ -180,6 +209,7 @@ pub struct ChangeRequestItemView {
     pub visibility: String,
     pub value_type: String,
     pub description: Option<String>,
+    pub group_name: Option<String>,
     pub value_source: Option<String>,
     pub fulfilled: bool,
 }
@@ -192,6 +222,8 @@ struct ExistingVariable {
     visibility: String,
     value_type: String,
     description: Option<String>,
+    group_name: Option<String>,
+    display_order: i64,
 }
 
 #[derive(FromRow)]
@@ -218,8 +250,30 @@ struct PreparedItem {
     visibility: String,
     value_type: String,
     description: Option<String>,
+    group_name: Option<String>,
+    display_order: i64,
     value_source: Option<String>,
     fulfilled: bool,
+}
+
+struct PreparedSharedRequest {
+    id: String,
+    environment_id: String,
+    service_id: String,
+    title: String,
+    reason: String,
+    status: &'static str,
+    items: Vec<PreparedItem>,
+}
+
+struct ValidatedSharedInlineEdit {
+    service_id: String,
+    current_key: String,
+    new_key: String,
+    visibility: String,
+    value_type: String,
+    reason: String,
+    values: HashMap<String, SharedInlineValueInput>,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -238,8 +292,8 @@ pub async fn create(
     if input.items.is_empty() || input.items.len() > MAX_ITEMS {
         return Err(AppError::InvalidRequest);
     }
-    let title = validate_title(input.title)?;
-    let reason = validate_reason(&input.reason)?;
+    let mut title = validate_title(input.title)?;
+    let reason = validate_request_reason(&input.items, &input.reason)?;
     let request_id = Uuid::new_v4().to_string();
     let (active_dek_version, dek) =
         environments::active_dek(pool, crypto, &input.environment_id).await?;
@@ -252,7 +306,7 @@ pub async fn create(
             return Err(AppError::InvalidRequest);
         }
         let existing = sqlx::query_as::<_, ExistingVariable>(
-            "SELECT id, version, lifecycle_status, visibility, value_type, description FROM variables WHERE environment_id = ? AND key = ?",
+            "SELECT id, version, lifecycle_status, visibility, value_type, description, group_name, display_order FROM variables WHERE environment_id = ? AND key = ?",
         )
         .bind(&input.environment_id)
         .bind(&key)
@@ -272,6 +326,9 @@ pub async fn create(
             &dek,
         )?;
         prepared.push(item);
+    }
+    if title.is_none() {
+        title = Some(default_request_title(&prepared));
     }
     let status = if prepared
         .iter()
@@ -298,8 +355,8 @@ pub async fn create(
     .await?;
     for item in &prepared {
         sqlx::query(
-            "INSERT INTO change_request_items(id, change_request_id, variable_id, action, key, base_variable_version, encrypted_proposed_value, proposed_value_nonce, proposed_crypto_version, proposed_dek_version, proposed_visibility, proposed_value_type, proposed_description, value_source, value_fulfilled_by, value_fulfilled_at, item_revision, created_at) \
-             VALUES(?, ?, ?, ?, ?, ?, ?, ?, CASE WHEN ? IS NULL THEN NULL ELSE 1 END, ?, ?, ?, ?, ?, ?, ?, 1, ?)",
+            "INSERT INTO change_request_items(id, change_request_id, variable_id, action, key, base_variable_version, encrypted_proposed_value, proposed_value_nonce, proposed_crypto_version, proposed_dek_version, proposed_visibility, proposed_value_type, proposed_description, proposed_group_name, proposed_display_order, value_source, value_fulfilled_by, value_fulfilled_at, item_revision, created_at) \
+             VALUES(?, ?, ?, ?, ?, ?, ?, ?, CASE WHEN ? IS NULL THEN NULL ELSE 1 END, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)",
         )
         .bind(&item.id)
         .bind(&request_id)
@@ -314,6 +371,8 @@ pub async fn create(
         .bind(&item.visibility)
         .bind(&item.value_type)
         .bind(&item.description)
+        .bind(&item.group_name)
+        .bind(item.display_order)
         .bind(&item.value_source)
         .bind(item.fulfilled.then_some(session.user.id.as_str()))
         .bind(item.fulfilled.then_some(now.as_str()))
@@ -376,6 +435,8 @@ pub async fn create_inline_edit(
         visibility: Some(input.visibility),
         value_type: Some(input.value_type),
         description: input.description,
+        group_name: None,
+        display_order: None,
     };
     let (title, items) = if new_key == current_key {
         (format!("Update {current_key}"), vec![proposed])
@@ -391,6 +452,8 @@ pub async fn create_inline_edit(
                     visibility: None,
                     value_type: None,
                     description: None,
+                    group_name: None,
+                    display_order: None,
                 },
                 proposed,
             ],
@@ -410,6 +473,271 @@ pub async fn create_inline_edit(
     .await
 }
 
+/// Creates one environment-scoped request for every active environment where the logical key
+/// exists. All request headers/items/audit records are inserted in one `SQLite` transaction, so a
+/// conflict in any target prevents the entire coordinated edit from being recorded.
+pub async fn create_shared_inline_edit(
+    pool: &SqlitePool,
+    crypto: &CryptoManager,
+    session: &AuthenticatedSession,
+    input: SharedInlineEditInput,
+) -> Result<usize, AppError> {
+    session.require_full()?;
+    if !session.user.role.allows(Capability::CreateChangeRequest)
+        || !can_access_service(pool, &session.user.id, session.user.role, &input.service_id).await?
+    {
+        return Err(AppError::Forbidden);
+    }
+
+    let input = validate_shared_inline_edit(input)?;
+    let expected = shared_edit_targets(pool, session, &input).await?;
+    if expected.len() != input.values.len() {
+        return Err(AppError::Conflict);
+    }
+
+    let mut prepared_requests = Vec::with_capacity(expected.len());
+    for (environment_id, expected_variable_id) in expected {
+        prepared_requests.push(
+            prepare_shared_request(
+                pool,
+                crypto,
+                session,
+                &input,
+                &environment_id,
+                &expected_variable_id,
+            )
+            .await?,
+        );
+    }
+    persist_shared_requests(pool, session, &prepared_requests).await?;
+    Ok(prepared_requests.len())
+}
+
+fn validate_shared_inline_edit(
+    input: SharedInlineEditInput,
+) -> Result<ValidatedSharedInlineEdit, AppError> {
+    if input.values.is_empty() || input.values.len() > MAX_ITEMS {
+        return Err(AppError::InvalidRequest);
+    }
+    let value_count = input.values.len();
+    let values: HashMap<_, _> = input
+        .values
+        .into_iter()
+        .map(|value| (value.environment_id.clone(), value))
+        .collect();
+    if values.len() != value_count {
+        return Err(AppError::InvalidRequest);
+    }
+    Ok(ValidatedSharedInlineEdit {
+        service_id: input.service_id,
+        current_key: validate_key(&input.current_key)?,
+        new_key: validate_key(&input.new_key)?,
+        visibility: validate_visibility(&input.visibility)?.to_owned(),
+        value_type: validate_value_type(&input.value_type)?.to_owned(),
+        reason: validate_reason(&input.reason)?,
+        values,
+    })
+}
+
+async fn shared_edit_targets(
+    pool: &SqlitePool,
+    session: &AuthenticatedSession,
+    input: &ValidatedSharedInlineEdit,
+) -> Result<Vec<(String, String)>, AppError> {
+    Ok(sqlx::query_as(
+        "SELECT v.environment_id, v.id FROM variables v \
+         JOIN environments e ON e.id = v.environment_id \
+         JOIN services s ON s.id = e.service_id \
+         WHERE e.service_id = ? AND s.organization_id = ? AND e.archived_at IS NULL \
+           AND v.key = ? AND v.lifecycle_status = 'ACTIVE' \
+         ORDER BY e.name_normalized, e.id",
+    )
+    .bind(&input.service_id)
+    .bind(&session.user.organization_id)
+    .bind(&input.current_key)
+    .fetch_all(pool)
+    .await?)
+}
+
+async fn prepare_shared_request(
+    pool: &SqlitePool,
+    crypto: &CryptoManager,
+    session: &AuthenticatedSession,
+    input: &ValidatedSharedInlineEdit,
+    environment_id: &str,
+    expected_variable_id: &str,
+) -> Result<PreparedSharedRequest, AppError> {
+    let submitted = input
+        .values
+        .get(environment_id)
+        .filter(|value| value.variable_id == expected_variable_id)
+        .ok_or(AppError::Conflict)?;
+    let environment = environment_context(pool, session, environment_id).await?;
+    ensure_mutable(&environment)?;
+    let request_id = Uuid::new_v4().to_string();
+    let (dek_version, dek) = environments::active_dek(pool, crypto, environment_id).await?;
+    let dek_version_i64 = i64::try_from(dek_version).map_err(|_| AppError::Crypto)?;
+    let proposed = ChangeRequestItemInput {
+        action: if input.new_key == input.current_key {
+            "UPDATE".to_owned()
+        } else {
+            "ADD".to_owned()
+        },
+        key: input.new_key.clone(),
+        value: (submitted.value_source != "OPERATOR_PROVIDED").then(|| submitted.value.clone()),
+        value_source: Some(submitted.value_source.clone()),
+        visibility: Some(input.visibility.clone()),
+        value_type: Some(input.value_type.clone()),
+        description: submitted.description.clone(),
+        group_name: None,
+        display_order: None,
+    };
+    let item_inputs = shared_item_inputs(input, proposed);
+    let mut items = Vec::with_capacity(item_inputs.len());
+    for item_input in item_inputs {
+        let key = validate_key(&item_input.key)?;
+        let existing = sqlx::query_as::<_, ExistingVariable>(
+            "SELECT id, version, lifecycle_status, visibility, value_type, description, group_name, display_order FROM variables WHERE environment_id = ? AND key = ?",
+        )
+        .bind(environment_id)
+        .bind(&key)
+        .fetch_optional(pool)
+        .await?;
+        items.push(prepare_item(
+            crypto,
+            &environment,
+            &request_id,
+            &Uuid::new_v4().to_string(),
+            dek_version,
+            dek_version_i64,
+            item_input,
+            key,
+            existing,
+            &dek,
+        )?);
+    }
+    let status = request_status(&items);
+    Ok(PreparedSharedRequest {
+        id: request_id,
+        environment_id: environment_id.to_owned(),
+        service_id: environment.service_id,
+        title: if input.new_key == input.current_key {
+            format!("Update {}", input.current_key)
+        } else {
+            format!("Rename {} to {}", input.current_key, input.new_key)
+        },
+        reason: input.reason.clone(),
+        status,
+        items,
+    })
+}
+
+fn shared_item_inputs(
+    input: &ValidatedSharedInlineEdit,
+    proposed: ChangeRequestItemInput,
+) -> Vec<ChangeRequestItemInput> {
+    if input.new_key == input.current_key {
+        return vec![proposed];
+    }
+    vec![
+        ChangeRequestItemInput {
+            action: "DELETE".to_owned(),
+            key: input.current_key.clone(),
+            value: None,
+            value_source: None,
+            visibility: None,
+            value_type: None,
+            description: None,
+            group_name: None,
+            display_order: None,
+        },
+        proposed,
+    ]
+}
+
+fn request_status(items: &[PreparedItem]) -> &'static str {
+    if items
+        .iter()
+        .any(|item| matches!(item.action.as_str(), "ADD" | "UPDATE") && !item.fulfilled)
+    {
+        "NEEDS_INPUT"
+    } else {
+        "REQUESTED"
+    }
+}
+
+async fn persist_shared_requests(
+    pool: &SqlitePool,
+    session: &AuthenticatedSession,
+    prepared_requests: &[PreparedSharedRequest],
+) -> Result<(), AppError> {
+    let now = now_rfc3339()?;
+    let coordinated_environment_count = prepared_requests.len();
+    let mut transaction = pool.begin().await?;
+    for request in prepared_requests {
+        sqlx::query(
+            "INSERT INTO change_requests(id, service_id, environment_id, title, reason, status, requested_by, requested_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&request.id)
+        .bind(&request.service_id)
+        .bind(&request.environment_id)
+        .bind(&request.title)
+        .bind(&request.reason)
+        .bind(request.status)
+        .bind(&session.user.id)
+        .bind(&now)
+        .execute(&mut *transaction)
+        .await?;
+        for item in &request.items {
+            sqlx::query(
+                "INSERT INTO change_request_items(id, change_request_id, variable_id, action, key, base_variable_version, encrypted_proposed_value, proposed_value_nonce, proposed_crypto_version, proposed_dek_version, proposed_visibility, proposed_value_type, proposed_description, proposed_group_name, proposed_display_order, value_source, value_fulfilled_by, value_fulfilled_at, item_revision, created_at) \
+                 VALUES(?, ?, ?, ?, ?, ?, ?, ?, CASE WHEN ? IS NULL THEN NULL ELSE 1 END, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)",
+            )
+            .bind(&item.id)
+            .bind(&request.id)
+            .bind(&item.variable_id)
+            .bind(&item.action)
+            .bind(&item.key)
+            .bind(item.base_version)
+            .bind(&item.encrypted_value)
+            .bind(&item.nonce)
+            .bind(&item.encrypted_value)
+            .bind(item.dek_version)
+            .bind(&item.visibility)
+            .bind(&item.value_type)
+            .bind(&item.description)
+            .bind(&item.group_name)
+            .bind(item.display_order)
+            .bind(&item.value_source)
+            .bind(item.fulfilled.then_some(session.user.id.as_str()))
+            .bind(item.fulfilled.then_some(now.as_str()))
+            .bind(&now)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        sqlx::query(
+            "INSERT INTO audit_logs(occurred_at, actor_user_id, action, service_id, environment_id, change_request_id, metadata_json) VALUES(?, ?, 'CREATE_REQUEST', ?, ?, ?, ?)",
+        )
+        .bind(&now)
+        .bind(&session.user.id)
+        .bind(&request.service_id)
+        .bind(&request.environment_id)
+        .bind(&request.id)
+        .bind(
+            serde_json::json!({
+                "item_count": request.items.len(),
+                "status": request.status,
+                "coordinated_environment_count": coordinated_environment_count
+            })
+            .to_string(),
+        )
+        .execute(&mut *transaction)
+        .await?;
+    }
+    transaction.commit().await?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prepare_item(
     crypto: &CryptoManager,
@@ -425,24 +753,7 @@ fn prepare_item(
 ) -> Result<PreparedItem, AppError> {
     let action = input.action.trim().to_ascii_uppercase();
     if action == "DELETE" {
-        let existing = existing
-            .filter(|row| row.lifecycle_status == "ACTIVE")
-            .ok_or(AppError::Conflict)?;
-        return Ok(PreparedItem {
-            id: item_id.to_owned(),
-            action,
-            key,
-            variable_id: Some(existing.id),
-            base_version: Some(existing.version),
-            encrypted_value: None,
-            nonce: None,
-            dek_version: None,
-            visibility: existing.visibility,
-            value_type: existing.value_type,
-            description: existing.description,
-            value_source: None,
-            fulfilled: false,
-        });
+        return prepare_delete_item(item_id, action, key, existing);
     }
     let (variable_id, base_version) = match action.as_str() {
         "ADD"
@@ -454,15 +765,25 @@ fn prepare_item(
         }
         "UPDATE" => {
             let existing = existing
+                .as_ref()
                 .filter(|row| row.lifecycle_status == "ACTIVE")
                 .ok_or(AppError::Conflict)?;
-            (Some(existing.id), Some(existing.version))
+            (Some(existing.id.clone()), Some(existing.version))
         }
         _ => return Err(AppError::Conflict),
     };
     let visibility = validate_visibility(input.visibility.as_deref().unwrap_or("restricted"))?;
     let value_type = validate_value_type(input.value_type.as_deref().unwrap_or("string"))?;
     let description = validate_description(input.description)?;
+    let group_name = validate_group_name(input.group_name)?.or_else(|| {
+        existing
+            .as_ref()
+            .and_then(|current| current.group_name.clone())
+    });
+    let display_order = match input.display_order {
+        Some(order) => validate_display_order(order)?,
+        None => existing.as_ref().map_or(0, |current| current.display_order),
+    };
     let value_source = input
         .value_source
         .as_deref()
@@ -509,9 +830,70 @@ fn prepare_item(
         visibility: visibility.to_owned(),
         value_type: value_type.to_owned(),
         description,
+        group_name,
+        display_order,
         value_source: Some(value_source.to_owned()),
         fulfilled,
     })
+}
+
+fn prepare_delete_item(
+    item_id: &str,
+    action: String,
+    key: String,
+    existing: Option<ExistingVariable>,
+) -> Result<PreparedItem, AppError> {
+    let existing = existing
+        .filter(|row| row.lifecycle_status == "ACTIVE")
+        .ok_or(AppError::Conflict)?;
+    Ok(PreparedItem {
+        id: item_id.to_owned(),
+        action,
+        key,
+        variable_id: Some(existing.id),
+        base_version: Some(existing.version),
+        encrypted_value: None,
+        nonce: None,
+        dek_version: None,
+        visibility: existing.visibility,
+        value_type: existing.value_type,
+        description: existing.description,
+        group_name: existing.group_name,
+        display_order: existing.display_order,
+        value_source: None,
+        fulfilled: false,
+    })
+}
+
+fn default_request_title(items: &[PreparedItem]) -> String {
+    if items.len() == 1 {
+        let verb = match items[0].action.as_str() {
+            "ADD" => "Add",
+            "UPDATE" => "Update",
+            "DELETE" => "Delete",
+            _ => "Change",
+        };
+        return format!("{verb} {}", items[0].key);
+    }
+    if items.iter().all(|item| item.action == "ADD") {
+        format!("Add {} configuration keys", items.len())
+    } else {
+        format!("Update {} configuration keys", items.len())
+    }
+}
+
+fn validate_request_reason(
+    items: &[ChangeRequestItemInput],
+    value: &str,
+) -> Result<String, AppError> {
+    let additions_only = items
+        .iter()
+        .all(|item| item.action.trim().eq_ignore_ascii_case("ADD"));
+    if additions_only && value.trim().is_empty() {
+        Ok(String::new())
+    } else {
+        validate_reason(value)
+    }
 }
 
 pub async fn list_visible_page(
@@ -693,7 +1075,7 @@ pub async fn detail(
         return Err(AppError::NotFound);
     }
     let rows = sqlx::query_as::<_, ItemRow>(
-        "SELECT id, change_request_id, variable_id, action, key, base_variable_version, encrypted_proposed_value, proposed_value_nonce, proposed_dek_version, proposed_visibility, proposed_value_type, proposed_description, value_source, value_fulfilled_at, item_revision \
+        "SELECT id, change_request_id, variable_id, action, key, base_variable_version, encrypted_proposed_value, proposed_value_nonce, proposed_dek_version, proposed_visibility, proposed_value_type, proposed_description, proposed_group_name, proposed_display_order, value_source, value_fulfilled_at, item_revision \
          FROM change_request_items WHERE change_request_id = ? ORDER BY created_at, id",
     )
     .bind(request_id)
@@ -715,6 +1097,7 @@ pub async fn detail(
             visibility: row.proposed_visibility,
             value_type: row.proposed_value_type,
             description: row.proposed_description,
+            group_name: row.proposed_group_name,
             value_source: row.value_source,
             fulfilled: row.value_fulfilled_at.is_some(),
         });
@@ -1079,7 +1462,7 @@ async fn load_workflow_items(
     for id in request_ids {
         items.extend(
             sqlx::query_as::<_, ItemRow>(
-                "SELECT id, change_request_id, variable_id, action, key, base_variable_version, encrypted_proposed_value, proposed_value_nonce, proposed_dek_version, proposed_visibility, proposed_value_type, proposed_description, value_source, value_fulfilled_at, item_revision FROM change_request_items WHERE change_request_id = ? ORDER BY key, id",
+                "SELECT id, change_request_id, variable_id, action, key, base_variable_version, encrypted_proposed_value, proposed_value_nonce, proposed_dek_version, proposed_visibility, proposed_value_type, proposed_description, proposed_group_name, proposed_display_order, value_source, value_fulfilled_at, item_revision FROM change_request_items WHERE change_request_id = ? ORDER BY key, id",
             )
             .bind(id)
             .fetch_all(pool)
@@ -1097,7 +1480,7 @@ async fn load_workflow_items_in_transaction(
     for id in request_ids {
         items.extend(
             sqlx::query_as::<_, ItemRow>(
-                "SELECT id, change_request_id, variable_id, action, key, base_variable_version, encrypted_proposed_value, proposed_value_nonce, proposed_dek_version, proposed_visibility, proposed_value_type, proposed_description, value_source, value_fulfilled_at, item_revision FROM change_request_items WHERE change_request_id = ? ORDER BY key, id",
+                "SELECT id, change_request_id, variable_id, action, key, base_variable_version, encrypted_proposed_value, proposed_value_nonce, proposed_dek_version, proposed_visibility, proposed_value_type, proposed_description, proposed_group_name, proposed_display_order, value_source, value_fulfilled_at, item_revision FROM change_request_items WHERE change_request_id = ? ORDER BY key, id",
             )
             .bind(id)
             .fetch_all(&mut **transaction)
@@ -1112,7 +1495,7 @@ async fn load_current_rows(
     environment_id: &str,
 ) -> Result<Vec<CurrentRow>, AppError> {
     Ok(sqlx::query_as::<_, CurrentRow>(
-        "SELECT id, key, encrypted_value, value_nonce, dek_version, visibility, value_type, description, version, lifecycle_status FROM variables WHERE environment_id = ? ORDER BY key, id",
+        "SELECT id, key, encrypted_value, value_nonce, dek_version, visibility, value_type, description, group_name, display_order, version, lifecycle_status FROM variables WHERE environment_id = ? ORDER BY key, id",
     )
     .bind(environment_id)
     .fetch_all(pool)
@@ -1124,7 +1507,7 @@ async fn load_current_rows_in_transaction(
     environment_id: &str,
 ) -> Result<Vec<CurrentRow>, AppError> {
     Ok(sqlx::query_as::<_, CurrentRow>(
-        "SELECT id, key, encrypted_value, value_nonce, dek_version, visibility, value_type, description, version, lifecycle_status FROM variables WHERE environment_id = ? ORDER BY key, id",
+        "SELECT id, key, encrypted_value, value_nonce, dek_version, visibility, value_type, description, group_name, display_order, version, lifecycle_status FROM variables WHERE environment_id = ? ORDER BY key, id",
     )
     .bind(environment_id)
     .fetch_all(&mut **transaction)
@@ -1224,12 +1607,14 @@ fn selection_fingerprint(
                 .as_deref()
                 .unwrap_or("")
                 .as_bytes(),
+            item.proposed_group_name.as_deref().unwrap_or("").as_bytes(),
             item.value_source.as_deref().unwrap_or("").as_bytes(),
             item.encrypted_proposed_value.as_deref().unwrap_or_default(),
             item.proposed_value_nonce.as_deref().unwrap_or_default(),
         ] {
             digest_field(&mut digest, value);
         }
+        digest.update(item.proposed_display_order.to_be_bytes());
     }
     for variable in current {
         digest_field(&mut digest, variable.id.as_bytes());
@@ -1241,6 +1626,11 @@ fn selection_fingerprint(
             &mut digest,
             variable.description.as_deref().unwrap_or("").as_bytes(),
         );
+        digest_field(
+            &mut digest,
+            variable.group_name.as_deref().unwrap_or("").as_bytes(),
+        );
+        digest.update(variable.display_order.to_be_bytes());
         digest.update(variable.version.to_be_bytes());
     }
     digest.finalize().to_vec()
@@ -1258,14 +1648,19 @@ async fn resolve_dotenv(
     items: &[ItemRow],
     current: &[CurrentRow],
 ) -> Result<Zeroizing<String>, AppError> {
-    let mut values = BTreeMap::<String, String>::new();
+    let mut values = BTreeMap::<String, (String, Option<String>, Option<String>, i64)>::new();
     for row in current
         .iter()
         .filter(|row| row.lifecycle_status == "ACTIVE")
     {
         values.insert(
             row.key.clone(),
-            decrypt_current_row(pool, crypto, environment, row).await?,
+            (
+                decrypt_current_row(pool, crypto, environment, row).await?,
+                row.group_name.clone(),
+                row.description.clone(),
+                row.display_order,
+            ),
         );
     }
     for item in items {
@@ -1293,7 +1688,12 @@ async fn resolve_dotenv(
                 }
                 values.insert(
                     item.key.clone(),
-                    decrypt_proposed_row(pool, crypto, environment, item).await?,
+                    (
+                        decrypt_proposed_row(pool, crypto, environment, item).await?,
+                        item.proposed_group_name.clone(),
+                        item.proposed_description.clone(),
+                        item.proposed_display_order,
+                    ),
                 );
             }
             "UPDATE" => {
@@ -1310,7 +1710,12 @@ async fn resolve_dotenv(
                 }
                 values.insert(
                     item.key.clone(),
-                    decrypt_proposed_row(pool, crypto, environment, item).await?,
+                    (
+                        decrypt_proposed_row(pool, crypto, environment, item).await?,
+                        item.proposed_group_name.clone(),
+                        item.proposed_description.clone(),
+                        item.proposed_display_order,
+                    ),
                 );
             }
             _ => return Err(AppError::Conflict),
@@ -1318,7 +1723,15 @@ async fn resolve_dotenv(
     }
     let entries = values
         .into_iter()
-        .map(|(key, value)| crate::dotenv::Entry { key, value })
+        .map(
+            |(key, (value, group, description, display_order))| crate::dotenv::Entry {
+                key,
+                value,
+                group,
+                description,
+                position: display_order,
+            },
+        )
         .collect::<Vec<_>>();
     Ok(Zeroizing::new(crate::dotenv::render(&entries)))
 }
@@ -1484,6 +1897,8 @@ async fn prepare_apply_items(
             visibility: item.proposed_visibility.clone(),
             value_type: item.proposed_value_type.clone(),
             description: item.proposed_description.clone(),
+            group_name: item.proposed_group_name.clone(),
+            display_order: item.proposed_display_order,
             encrypted,
             dek_version: active_dek_version_i64,
         });
@@ -1505,7 +1920,7 @@ async fn persist_apply_item(
     };
     if write.expected_version.is_none() {
         sqlx::query(
-            "INSERT INTO variables(id, environment_id, key, encrypted_value, value_nonce, crypto_version, dek_version, visibility, value_type, description, version, lifecycle_status, deployment_status, created_at, created_by, updated_at, updated_by, last_applied_at, last_applied_by) VALUES(?, ?, ?, ?, ?, 1, ?, ?, ?, ?, 1, 'ACTIVE', 'APPLIED', ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO variables(id, environment_id, key, encrypted_value, value_nonce, crypto_version, dek_version, visibility, value_type, description, group_name, display_order, version, lifecycle_status, deployment_status, created_at, created_by, updated_at, updated_by, last_applied_at, last_applied_by) VALUES(?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, 1, 'ACTIVE', 'APPLIED', ?, ?, ?, ?, ?, ?)",
         )
         .bind(&write.variable_id)
         .bind(&environment.id)
@@ -1516,6 +1931,8 @@ async fn persist_apply_item(
         .bind(&write.visibility)
         .bind(&write.value_type)
         .bind(&write.description)
+        .bind(&write.group_name)
+        .bind(write.display_order)
         .bind(now)
         .bind(&session.user.id)
         .bind(now)
@@ -1526,7 +1943,7 @@ async fn persist_apply_item(
         .await?;
     } else {
         let changed = sqlx::query(
-            "UPDATE variables SET encrypted_value = ?, value_nonce = ?, crypto_version = 1, dek_version = ?, visibility = ?, value_type = ?, description = ?, version = ?, lifecycle_status = ?, deleted_at = ?, deployment_status = 'APPLIED', updated_at = ?, updated_by = ?, last_applied_at = ?, last_applied_by = ? WHERE id = ? AND environment_id = ? AND version = ? AND lifecycle_status = ?",
+            "UPDATE variables SET encrypted_value = ?, value_nonce = ?, crypto_version = 1, dek_version = ?, visibility = ?, value_type = ?, description = ?, group_name = ?, display_order = ?, version = ?, lifecycle_status = ?, deleted_at = ?, deployment_status = 'APPLIED', updated_at = ?, updated_by = ?, last_applied_at = ?, last_applied_by = ? WHERE id = ? AND environment_id = ? AND version = ? AND lifecycle_status = ?",
         )
         .bind(&write.encrypted.ciphertext)
         .bind(write.encrypted.nonce.as_slice())
@@ -1534,6 +1951,8 @@ async fn persist_apply_item(
         .bind(&write.visibility)
         .bind(&write.value_type)
         .bind(&write.description)
+        .bind(&write.group_name)
+        .bind(write.display_order)
         .bind(write.version)
         .bind(lifecycle)
         .bind((write.action == "DELETE").then_some(now))
@@ -1553,7 +1972,7 @@ async fn persist_apply_item(
         }
     }
     sqlx::query(
-        "INSERT INTO variable_versions(id, variable_id, environment_id, version, operation, encrypted_value, value_nonce, crypto_version, dek_version, visibility, value_type, description, lifecycle_status, changed_by, changed_at, change_request_id, change_request_item_id) VALUES(?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO variable_versions(id, variable_id, environment_id, version, operation, encrypted_value, value_nonce, crypto_version, dek_version, visibility, value_type, description, group_name, display_order, lifecycle_status, changed_by, changed_at, change_request_id, change_request_item_id) VALUES(?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(Uuid::new_v4().to_string())
     .bind(&write.variable_id)
@@ -1566,6 +1985,8 @@ async fn persist_apply_item(
     .bind(&write.visibility)
     .bind(&write.value_type)
     .bind(&write.description)
+    .bind(&write.group_name)
+    .bind(write.display_order)
     .bind(lifecycle)
     .bind(&session.user.id)
     .bind(now)
@@ -1630,7 +2051,7 @@ mod tests {
     use super::{
         ChangeRequestInput, ChangeRequestItemInput, InlineEditInput, approve, create,
         create_inline_edit, detail, fulfill_value, list_visible_page, mark_applied,
-        preview_resulting,
+        preview_resulting, validate_request_reason,
     };
 
     #[tokio::test]
@@ -1776,6 +2197,8 @@ mod tests {
             visibility: Some("restricted".into()),
             value_type: Some("string".into()),
             description: None,
+            group_name: None,
+            display_order: None,
         };
         let result = create(
             &pool,
@@ -1839,6 +2262,8 @@ mod tests {
                 visibility: "public".into(),
                 value_type: "string".into(),
                 description: Some("Original".into()),
+                group_name: None,
+                display_order: 0,
                 reason: "seed current configuration".into(),
             },
         )
@@ -1921,6 +2346,8 @@ mod tests {
                 visibility: "restricted".into(),
                 value_type: "string".into(),
                 description: None,
+                group_name: None,
+                display_order: 0,
                 reason: "seed restricted value".into(),
             },
         )
@@ -2116,6 +2543,9 @@ mod tests {
         )
         .await
         .unwrap();
+        let mut grouped_add = proposed_item("ADD", "ADD_ME", Some("added"));
+        grouped_add.group_name = Some("Application".into());
+        grouped_add.display_order = Some(7);
         let request_id = create(
             &pool,
             &crypto,
@@ -2125,7 +2555,7 @@ mod tests {
                 title: Some("Atomic workflow".into()),
                 reason: "exercise all actions".into(),
                 items: vec![
-                    proposed_item("ADD", "ADD_ME", Some("added")),
+                    grouped_add,
                     proposed_item("UPDATE", "UPDATE_ME", Some("updated")),
                     proposed_item("DELETE", "DELETE_ME", None),
                 ],
@@ -2154,6 +2584,7 @@ mod tests {
         .await
         .unwrap();
         assert!(preview.dotenv.contains("ADD_ME=added\n"));
+        assert!(preview.dotenv.contains("# [Application]\n"));
         assert!(preview.dotenv.contains("UPDATE_ME=updated\n"));
         assert!(!preview.dotenv.contains("DELETE_ME"));
         mark_applied(
@@ -2180,6 +2611,14 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(linked_versions, 3);
+        let grouped: (Option<String>, i64) = sqlx::query_as(
+            "SELECT group_name, display_order FROM variables WHERE environment_id = ? AND key = 'ADD_ME'",
+        )
+        .bind(&environment_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(grouped, (Some("Application".into()), 7));
         let deleted: String = sqlx::query_scalar(
             "SELECT lifecycle_status FROM variables WHERE environment_id = ? AND key = 'DELETE_ME'",
         )
@@ -2337,6 +2776,8 @@ mod tests {
             visibility: "public".into(),
             value_type: "string".into(),
             description: None,
+            group_name: None,
+            display_order: 0,
             reason: "test setup".into(),
         }
     }
@@ -2350,7 +2791,21 @@ mod tests {
             visibility: Some("public".into()),
             value_type: Some("string".into()),
             description: None,
+            group_name: None,
+            display_order: None,
         }
+    }
+
+    #[test]
+    fn addition_notes_are_optional_but_update_reason_is_required() {
+        let addition = vec![proposed_item("ADD", "NEW_KEY", Some("value"))];
+        assert_eq!(validate_request_reason(&addition, "   ").unwrap(), "");
+
+        let update = vec![proposed_item("UPDATE", "EXISTING_KEY", Some("value"))];
+        assert!(matches!(
+            validate_request_reason(&update, ""),
+            Err(AppError::InvalidRequest)
+        ));
     }
 
     fn single_add_request(environment_id: &str, key: &str, value: &str) -> ChangeRequestInput {
@@ -2396,6 +2851,8 @@ mod tests {
                     visibility: Some("restricted".into()),
                     value_type: Some("string".into()),
                     description: None,
+                    group_name: None,
+                    display_order: None,
                 },
                 ChangeRequestItemInput {
                     action: "ADD".into(),
@@ -2405,6 +2862,8 @@ mod tests {
                     visibility: Some("restricted".into()),
                     value_type: Some("string".into()),
                     description: None,
+                    group_name: None,
+                    display_order: None,
                 },
             ],
         }
