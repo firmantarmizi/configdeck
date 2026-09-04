@@ -12,7 +12,7 @@ Created and maintained by **Firman Tarmizi**.
 
 ## Development
 
-Requirements: Rust 1.94 or newer and a 32-byte master key encoded with standard base64. The container build pins the Rust 1.97.1 stable toolchain on Debian Bookworm.
+Requirements: Rust 1.94 or newer and a 32-byte master key encoded with standard base64. The container build pins the Rust 1.98.0 stable toolchain on Debian Bookworm.
 
 ```bash
 export CONFIGDECK_ENV=development

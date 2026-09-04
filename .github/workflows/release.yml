@@ -25,25 +25,25 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install pinned Rust toolchain
-        run: rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
+        run: rustup toolchain install 1.98.0 --profile minimal --component clippy,rustfmt
 
       - name: Match tag to package version
         shell: bash
         run: |
-          package_version="$(cargo +1.97.1 metadata --locked --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          package_version="$(cargo +1.98.0 metadata --locked --no-deps --format-version 1 | jq -r '.packages[0].version')"
           test "$GITHUB_REF_NAME" = "v${package_version}"
 
       - name: Run release quality gate
         run: |
-          cargo +1.97.1 fmt --check
-          cargo +1.97.1 clippy --locked --all-targets --all-features -- -D warnings
-          cargo +1.97.1 test --locked
+          cargo +1.98.0 fmt --check
+          cargo +1.98.0 clippy --locked --all-targets --all-features -- -D warnings
+          cargo +1.98.0 test --locked
 
       - name: Install cargo-audit
-        run: cargo +1.97.1 install cargo-audit --locked --version 0.22.2
+        run: cargo +1.98.0 install cargo-audit --locked --version 0.22.2
 
       - name: Audit dependencies
-        run: cargo +1.97.1 audit
+        run: cargo +1.98.0 audit
 
   publish:
     name: Publish GHCR image
