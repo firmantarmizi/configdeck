@@ -3199,7 +3199,7 @@ mod tests {
         assert!(html.contains("Database"));
         assert!(html.contains("Values remain encrypted"));
         assert!(html.contains("authenticated-ciphertext-token"));
-        assert!(html.contains("Suggested: string"));
+        assert!(!html.contains("Suggested: string"));
         assert!(html.contains("value=\"string\" selected"));
         assert!(!html.contains("postgres://"));
     }
