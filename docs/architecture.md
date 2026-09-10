@@ -40,11 +40,11 @@ Organization
         └── Change requests and items
 ```
 
-SQLite migrations in `migrations/` are the schema source of truth. Foreign keys, strict tables, checks, unique constraints, and append-only triggers enforce invariants alongside backend validation.
+The single SQLite `migrations/0001_initial.sql` migration is the v0.1.0 schema source of truth for fresh installations. Foreign keys, strict tables, checks, unique constraints, and append-only triggers enforce invariants alongside backend validation. After public adoption, this baseline is immutable and later schema changes use new numbered migrations.
 
 All configuration values are encrypted at rest. `visibility` controls authorization to plaintext; it does not change storage encryption. There is no plaintext value column and no parallel `is_secret` flag.
 
-Variable grouping is presentation metadata, not an authorization boundary. Each variable version may carry an optional group name and stable display order. Import and export use portable `.env` comments (`# [Group]` plus optional key descriptions), while restricted-value access continues to depend only on `visibility` and backend authorization.
+Variable grouping is presentation metadata, not an authorization boundary. Each variable version may carry an optional group name and stable display order. Import and export use explicit portable `.env` headings such as `# [Database]`; ordinary comments are ignored rather than converted into key descriptions. Keys are case-sensitive, may contain dots (for example `app.baseURL`), and are preserved verbatim. Restricted-value access continues to depend only on `visibility` and backend authorization.
 
 ## Request path
 

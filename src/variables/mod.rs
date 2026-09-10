@@ -8,7 +8,7 @@ use crate::{
     auth::{AuthenticatedSession, PrivilegedAuthLevel},
     crypto::{CryptoManager, CurrentValueContext, EncryptedBlob, ProposedValueContext},
     db::now_rfc3339,
-    environments,
+    dotenv, environments,
     error::AppError,
     services::validate_description,
     users::{Capability, can_access_service},
@@ -953,7 +953,6 @@ pub async fn export_environment(
             key: row.key.clone(),
             value: decrypt_row_value(pool, crypto, &environment, &row).await?,
             group: row.group_name,
-            description: row.description,
             position: row.display_order,
         });
     }
@@ -984,7 +983,6 @@ pub async fn copy_current(
         key,
         value: value.to_string(),
         group: None,
-        description: None,
         position: 0,
     }]);
     let row = sqlx::query_as::<_, CopyAuditRow>(
@@ -1191,13 +1189,7 @@ pub(crate) fn ensure_mutable(environment: &EnvironmentContext) -> Result<(), App
 
 pub(crate) fn validate_key(value: &str) -> Result<String, AppError> {
     let key = value.trim();
-    let valid = !key.is_empty()
-        && key.len() <= 255
-        && key.bytes().enumerate().all(|(index, byte)| {
-            byte == b'_'
-                || byte.is_ascii_alphanumeric() && (index > 0 || byte.is_ascii_alphabetic())
-        });
-    if valid {
+    if dotenv::valid_key(key) {
         Ok(key.to_owned())
     } else {
         Err(AppError::InvalidRequest)
@@ -1310,7 +1302,18 @@ mod tests {
     use super::{
         AppliedVariableInput, delete_applied, export_environment, history, import_applied,
         list_for_environment, record_applied, reveal_current, reveal_version, suggest_value_type,
+        validate_key,
     };
+
+    #[test]
+    fn accepts_dotted_keys_without_normalizing_them() {
+        assert_eq!(
+            validate_key(" app.baseURL ").unwrap(),
+            "app.baseURL".to_owned()
+        );
+        assert!(validate_key(".app").is_err());
+        assert!(validate_key("app-baseURL").is_err());
+    }
 
     #[test]
     fn suggests_conservative_types_for_import_preview() {
@@ -1372,7 +1375,12 @@ mod tests {
             &crypto,
             &operator,
             &environment_id,
-            input("API_URL", "https://staging.example.test", "public", "url"),
+            input(
+                "app.baseURL",
+                "https://staging.example.test",
+                "public",
+                "url",
+            ),
         )
         .await
         .unwrap();
@@ -1399,7 +1407,7 @@ mod tests {
         assert_eq!(
             contributor_view
                 .iter()
-                .find(|row| row.key == "API_URL")
+                .find(|row| row.key == "app.baseURL")
                 .unwrap()
                 .value
                 .as_deref(),
@@ -1754,8 +1762,10 @@ mod tests {
                 .unwrap();
         assert!(exported.contains("API_URL=\"https://example.test/a=b\""));
         assert!(exported.contains("DATABASE_URL=postgres://user:secret@example.test/db"));
-        assert!(exported.contains("# [Application]\n# Public application URL\nAPI_URL="));
-        assert!(exported.contains("# [Database]\n# Primary database connection\nDATABASE_URL="));
+        assert!(exported.contains("# [Application]\nAPI_URL="));
+        assert!(exported.contains("# [Database]\nDATABASE_URL="));
+        assert!(!exported.contains("Public application URL"));
+        assert!(!exported.contains("Primary database connection"));
     }
 
     fn input(key: &str, value: &str, visibility: &str, value_type: &str) -> AppliedVariableInput {

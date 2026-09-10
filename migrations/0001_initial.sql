@@ -1,17 +1,36 @@
--- ConfigDeck migration 0001: baseline schema
+-- ConfigDeck v0.1.0 baseline schema.
 -- Target: SQLite >= 3.37 (STRICT tables), foreign_keys=ON.
 -- IDs are canonical lowercase UUID strings; timestamps are RFC 3339 UTC strings.
--- This document is the reviewed baseline. Implementation migrations may split it
--- into numbered files but must preserve these invariants.
+-- This migration is the complete schema for a fresh public installation.
 
 CREATE TABLE organizations (
     id                  TEXT PRIMARY KEY,
     singleton           INTEGER NOT NULL DEFAULT 1 UNIQUE CHECK (singleton = 1),
     name                TEXT NOT NULL,
     require_totp_all    INTEGER NOT NULL DEFAULT 0 CHECK (require_totp_all IN (0, 1)),
+    onboarding_completed_at TEXT,
+    logo_mime_type      TEXT CHECK (logo_mime_type IS NULL OR logo_mime_type IN ('image/png', 'image/webp')),
+    logo_data           BLOB CHECK (logo_data IS NULL OR (length(logo_data) > 0 AND length(logo_data) <= 262144)),
+    logo_updated_at     TEXT,
     created_at          TEXT NOT NULL,
     updated_at          TEXT NOT NULL
 ) STRICT;
+
+CREATE TRIGGER organizations_validate_logo_insert
+BEFORE INSERT ON organizations
+WHEN (NEW.logo_data IS NULL) <> (NEW.logo_mime_type IS NULL)
+  OR (NEW.logo_data IS NULL) <> (NEW.logo_updated_at IS NULL)
+BEGIN
+    SELECT RAISE(ABORT, 'organization logo metadata must be complete');
+END;
+
+CREATE TRIGGER organizations_validate_logo_update
+BEFORE UPDATE OF logo_data, logo_mime_type, logo_updated_at ON organizations
+WHEN (NEW.logo_data IS NULL) <> (NEW.logo_mime_type IS NULL)
+  OR (NEW.logo_data IS NULL) <> (NEW.logo_updated_at IS NULL)
+BEGIN
+    SELECT RAISE(ABORT, 'organization logo metadata must be complete');
+END;
 
 CREATE TABLE users (
     id                          TEXT PRIMARY KEY,
@@ -29,6 +48,7 @@ CREATE TABLE users (
     totp_enabled_at             TEXT,
     totp_last_used_step         INTEGER,
     password_changed_at         TEXT NOT NULL,
+    must_change_password        INTEGER NOT NULL DEFAULT 0 CHECK (must_change_password IN (0, 1)),
     last_login_at               TEXT,
     created_at                  TEXT NOT NULL,
     updated_at                  TEXT NOT NULL,
@@ -132,6 +152,8 @@ CREATE TABLE variables (
     visibility          TEXT NOT NULL CHECK (visibility IN ('public', 'restricted')),
     value_type          TEXT NOT NULL CHECK (value_type IN ('string', 'boolean', 'integer', 'url', 'multiline')),
     description         TEXT,
+    group_name          TEXT CHECK (group_name IS NULL OR (length(trim(group_name)) BETWEEN 1 AND 80)),
+    display_order       INTEGER NOT NULL DEFAULT 0 CHECK (display_order >= 0),
     version             INTEGER NOT NULL CHECK (version >= 1),
     lifecycle_status    TEXT NOT NULL DEFAULT 'ACTIVE' CHECK (lifecycle_status IN ('ACTIVE', 'DELETED')),
     deployment_status   TEXT NOT NULL DEFAULT 'APPLIED' CHECK (deployment_status IN ('NOT_APPLIED', 'APPLIED')),
@@ -147,7 +169,7 @@ CREATE TABLE variables (
         REFERENCES environment_keys(environment_id, dek_version) ON DELETE RESTRICT,
     CHECK (length(key) BETWEEN 1 AND 255),
     CHECK (substr(key, 1, 1) GLOB '[A-Za-z_]'),
-    CHECK (key NOT GLOB '*[^A-Za-z0-9_]*'),
+    CHECK (key NOT GLOB '*[^A-Za-z0-9_.]*'),
     CHECK (
         (lifecycle_status = 'ACTIVE' AND deleted_at IS NULL)
         OR (lifecycle_status = 'DELETED' AND deleted_at IS NOT NULL)
@@ -205,6 +227,8 @@ CREATE TABLE change_request_items (
     proposed_visibility         TEXT NOT NULL CHECK (proposed_visibility IN ('public', 'restricted')),
     proposed_value_type         TEXT NOT NULL CHECK (proposed_value_type IN ('string', 'boolean', 'integer', 'url', 'multiline')),
     proposed_description        TEXT,
+    proposed_group_name         TEXT CHECK (proposed_group_name IS NULL OR (length(trim(proposed_group_name)) BETWEEN 1 AND 80)),
+    proposed_display_order      INTEGER NOT NULL DEFAULT 0 CHECK (proposed_display_order >= 0),
     value_source                TEXT CHECK (value_source IN ('REQUESTER_PROVIDED', 'OPERATOR_PROVIDED')),
     value_fulfilled_by          TEXT REFERENCES users(id) ON DELETE RESTRICT,
     value_fulfilled_at          TEXT,
@@ -213,7 +237,7 @@ CREATE TABLE change_request_items (
     UNIQUE (change_request_id, key),
     CHECK (length(key) BETWEEN 1 AND 255),
     CHECK (substr(key, 1, 1) GLOB '[A-Za-z_]'),
-    CHECK (key NOT GLOB '*[^A-Za-z0-9_]*'),
+    CHECK (key NOT GLOB '*[^A-Za-z0-9_.]*'),
     CHECK ((value_fulfilled_by IS NULL) = (value_fulfilled_at IS NULL)),
     CHECK (
         (encrypted_proposed_value IS NULL AND proposed_value_nonce IS NULL AND proposed_crypto_version IS NULL AND proposed_dek_version IS NULL)
@@ -251,6 +275,8 @@ CREATE TABLE variable_versions (
     visibility          TEXT NOT NULL CHECK (visibility IN ('public', 'restricted')),
     value_type          TEXT NOT NULL CHECK (value_type IN ('string', 'boolean', 'integer', 'url', 'multiline')),
     description         TEXT,
+    group_name          TEXT CHECK (group_name IS NULL OR (length(trim(group_name)) BETWEEN 1 AND 80)),
+    display_order       INTEGER NOT NULL DEFAULT 0 CHECK (display_order >= 0),
     lifecycle_status    TEXT NOT NULL CHECK (lifecycle_status IN ('ACTIVE', 'DELETED')),
     changed_by          TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
     changed_at          TEXT NOT NULL,
@@ -419,38 +445,11 @@ CREATE UNIQUE INDEX ux_one_active_kek_rotation
     ON key_rotation_operations ((1))
     WHERE rotation_type = 'KEK' AND status NOT IN ('COMPLETED', 'FAILED');
 
-CREATE TABLE backups (
-    id                  TEXT PRIMARY KEY,
-    backup_identifier   TEXT NOT NULL UNIQUE,
-    size_bytes          INTEGER CHECK (size_bytes IS NULL OR size_bytes >= 0),
-    checksum_sha256     BLOB,
-    status              TEXT NOT NULL CHECK (status IN ('CREATING', 'AVAILABLE', 'FAILED')),
-    created_by          TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
-    created_at          TEXT NOT NULL,
-    completed_at        TEXT,
-    failure_code        TEXT,
-    CHECK (backup_identifier NOT LIKE '%/%' AND backup_identifier NOT LIKE '%\%'),
-    CHECK (
-        (status = 'AVAILABLE' AND completed_at IS NOT NULL AND checksum_sha256 IS NOT NULL AND size_bytes IS NOT NULL)
-        OR status IN ('CREATING', 'FAILED')
-    )
-) STRICT;
-
-CREATE TABLE restore_intents (
-    id                  TEXT PRIMARY KEY,
-    backup_identifier   TEXT NOT NULL,
-    reason              TEXT NOT NULL,
-    requested_by        TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
-    requested_at        TEXT NOT NULL,
-    marker_written_at   TEXT NOT NULL,
-    cancelled_at        TEXT,
-    FOREIGN KEY (backup_identifier) REFERENCES backups(backup_identifier) ON DELETE RESTRICT,
-    CHECK (backup_identifier NOT LIKE '%/%' AND backup_identifier NOT LIKE '%\%')
-) STRICT;
-
 CREATE INDEX ix_environments_service ON environments (service_id, archived_at);
 CREATE INDEX ix_access_service ON user_service_access (service_id, user_id);
 CREATE INDEX ix_variables_environment_active ON variables (environment_id, key) WHERE lifecycle_status = 'ACTIVE';
+CREATE INDEX idx_variables_environment_group_order
+    ON variables(environment_id, lifecycle_status, group_name, display_order, key);
 CREATE INDEX ix_variable_versions_variable ON variable_versions (variable_id, version DESC);
 CREATE INDEX ix_change_requests_environment_status ON change_requests (environment_id, status, requested_at);
 CREATE INDEX ix_change_requests_requester ON change_requests (requested_by, requested_at DESC);
@@ -459,7 +458,9 @@ CREATE INDEX ix_sessions_user ON sessions (user_id, revoked_at, absolute_expires
 CREATE INDEX ix_sessions_expiry ON sessions (absolute_expires_at, idle_expires_at);
 CREATE INDEX ix_login_attempts_account_time ON login_attempts (account_key_hash, attempted_at);
 CREATE INDEX ix_login_attempts_client_time ON login_attempts (client_identity_hash, attempted_at);
+CREATE INDEX ix_login_attempts_time ON login_attempts (attempted_at);
 CREATE INDEX ix_audit_time ON audit_logs (occurred_at DESC);
 CREATE INDEX ix_audit_actor_time ON audit_logs (actor_user_id, occurred_at DESC);
 CREATE INDEX ix_audit_environment_time ON audit_logs (environment_id, occurred_at DESC);
-
+CREATE INDEX ix_audit_action_time ON audit_logs (action, occurred_at DESC);
+CREATE INDEX ix_audit_outcome_time ON audit_logs (outcome, occurred_at DESC);

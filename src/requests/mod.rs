@@ -1648,7 +1648,7 @@ async fn resolve_dotenv(
     items: &[ItemRow],
     current: &[CurrentRow],
 ) -> Result<Zeroizing<String>, AppError> {
-    let mut values = BTreeMap::<String, (String, Option<String>, Option<String>, i64)>::new();
+    let mut values = BTreeMap::<String, (String, Option<String>, i64)>::new();
     for row in current
         .iter()
         .filter(|row| row.lifecycle_status == "ACTIVE")
@@ -1658,7 +1658,6 @@ async fn resolve_dotenv(
             (
                 decrypt_current_row(pool, crypto, environment, row).await?,
                 row.group_name.clone(),
-                row.description.clone(),
                 row.display_order,
             ),
         );
@@ -1691,7 +1690,6 @@ async fn resolve_dotenv(
                     (
                         decrypt_proposed_row(pool, crypto, environment, item).await?,
                         item.proposed_group_name.clone(),
-                        item.proposed_description.clone(),
                         item.proposed_display_order,
                     ),
                 );
@@ -1713,7 +1711,6 @@ async fn resolve_dotenv(
                     (
                         decrypt_proposed_row(pool, crypto, environment, item).await?,
                         item.proposed_group_name.clone(),
-                        item.proposed_description.clone(),
                         item.proposed_display_order,
                     ),
                 );
@@ -1724,11 +1721,10 @@ async fn resolve_dotenv(
     let entries = values
         .into_iter()
         .map(
-            |(key, (value, group, description, display_order))| crate::dotenv::Entry {
+            |(key, (value, group, display_order))| crate::dotenv::Entry {
                 key,
                 value,
                 group,
-                description,
                 position: display_order,
             },
         )

@@ -56,7 +56,7 @@ Inactive users are always denied. Contributor access is App-scoped. The backend 
 | Unauthorized restricted-value access | Backend role/scope checks, no decrypt before authorization, recent auth | Review grants and privileged audit events |
 | Session theft | Hashed session tokens, secure cookies, expiry, rotation, revocation | Protect endpoints, browsers, and TLS termination |
 | CSRF/XSS/cache leakage | Session-bound CSRF, output escaping, CSP, no-store, no plaintext URLs/storage | Patch promptly and restrict network access |
-| Malicious `.env` input | Data-only parser, size/count/metadata limits, duplicate rejection, no shell expansion, and purpose-bound encrypted preview tokens | Review detected action, group, description, visibility, and type; contributor paste creates a proposal, while recording deployed state remains recent-authenticated and Operator-only |
+| Malicious `.env` input | Data-only parser, size/count/metadata limits, duplicate rejection, explicit dotted-key validation, no shell expansion, and purpose-bound encrypted preview tokens | Review detected action, group, visibility, and type; ordinary comments are ignored, contributor paste creates a proposal, and recording deployed state remains recent-authenticated and Operator-only |
 | Log leakage | Request-body exclusion and metadata allowlists | Restrict log access and define retention |
 | Storage exhaustion | Bounded logs/auth state, pagination, free-space monitoring | Define audit/archive/backup lifecycle and alerts |
 | Host compromise | Non-root container, read-only filesystem, dropped capabilities | Isolate and rebuild the host; rotate real credentials afterward |

@@ -6,7 +6,6 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 pub const MAX_INPUT_BYTES: usize = 256 * 1024;
 pub const MAX_ENTRIES: usize = 500;
 pub const MAX_VALUE_BYTES: usize = 32 * 1024;
-const MAX_DESCRIPTION_CHARS: usize = 1_000;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, Zeroize, ZeroizeOnDrop)]
 pub struct Entry {
@@ -14,8 +13,6 @@ pub struct Entry {
     pub value: String,
     #[serde(default)]
     pub group: Option<String>,
-    #[serde(default)]
-    pub description: Option<String>,
     #[serde(default)]
     pub position: i64,
 }
@@ -44,7 +41,6 @@ pub fn parse(input: &str) -> ParseReport {
     let lines = input.lines().collect::<Vec<_>>();
     let mut keys = HashSet::new();
     let mut current_group = None;
-    let mut pending_comments = Vec::new();
     let mut section_boundary = true;
     for (index, physical_line) in lines.iter().enumerate() {
         let line_number = index + 1;
@@ -57,7 +53,6 @@ pub fn parse(input: &str) -> ParseReport {
         };
         let trimmed = line.trim();
         if trimmed.is_empty() {
-            pending_comments.clear();
             section_boundary = true;
             continue;
         }
@@ -69,10 +64,7 @@ pub fn parse(input: &str) -> ParseReport {
                     .flatten()
             }) {
                 current_group = Some(group);
-                pending_comments.clear();
                 section_boundary = false;
-            } else if !comment.is_empty() {
-                pending_comments.push(comment.to_owned());
             }
             continue;
         }
@@ -85,25 +77,10 @@ pub fn parse(input: &str) -> ParseReport {
         }
         match parse_assignment(trimmed) {
             Ok(mut entry) => {
-                let description =
-                    (!pending_comments.is_empty()).then(|| pending_comments.join(" "));
-                if description
-                    .as_ref()
-                    .is_some_and(|value| value.chars().count() > MAX_DESCRIPTION_CHARS)
-                {
-                    report.issues.push(ParseIssue {
-                        line: line_number,
-                        message: "description exceeds the 1,000-character limit",
-                    });
-                    pending_comments.clear();
-                    continue;
-                }
                 if keys.insert(entry.key.clone()) {
                     entry.group.clone_from(&current_group);
-                    entry.description = description;
                     entry.position = i64::try_from(report.entries.len()).unwrap_or(i64::MAX);
                     report.entries.push(entry);
-                    pending_comments.clear();
                     section_boundary = false;
                 } else {
                     report.issues.push(ParseIssue {
@@ -149,9 +126,7 @@ fn parse_assignment(line: &str) -> Result<Entry, &'static str> {
         .split_once('=')
         .ok_or("expected KEY=VALUE assignment")?;
     let key = key.trim();
-    if !valid_key(key) {
-        return Err("invalid variable key");
-    }
+    validate_key_syntax(key)?;
     let value = parse_value(raw_value.trim())?;
     if value.len() > MAX_VALUE_BYTES {
         return Err("value exceeds the 32 KiB limit");
@@ -160,7 +135,6 @@ fn parse_assignment(line: &str) -> Result<Entry, &'static str> {
         key: key.to_owned(),
         value,
         group: None,
-        description: None,
         position: 0,
     })
 }
@@ -294,17 +268,6 @@ pub fn render(entries: &[Entry]) -> String {
             }
             previous_group = group;
         }
-        if let Some(description) = entry.description.as_deref() {
-            for line in description
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-            {
-                output.push_str("# ");
-                output.push_str(line);
-                output.push('\n');
-            }
-        }
         output.push_str(&entry.key);
         output.push('=');
         output.push_str(&render_value(&entry.value));
@@ -340,18 +303,33 @@ fn render_value(value: &str) -> String {
     result
 }
 
-fn valid_key(key: &str) -> bool {
-    !key.is_empty()
-        && key.len() <= 255
-        && key.bytes().enumerate().all(|(index, byte)| {
-            byte == b'_'
-                || byte.is_ascii_alphanumeric() && (index > 0 || byte.is_ascii_alphabetic())
-        })
+fn validate_key_syntax(key: &str) -> Result<(), &'static str> {
+    if key.is_empty() {
+        return Err("variable key is empty; expected KEY=VALUE");
+    }
+    if key.len() > 255 {
+        return Err("variable key exceeds the 255-byte limit");
+    }
+    let mut bytes = key.bytes();
+    if !bytes
+        .next()
+        .is_some_and(|byte| byte == b'_' || byte.is_ascii_alphabetic())
+    {
+        return Err("variable key must start with an ASCII letter or underscore");
+    }
+    if bytes.any(|byte| !(byte == b'_' || byte == b'.' || byte.is_ascii_alphanumeric())) {
+        return Err("variable key may contain only ASCII letters, numbers, underscores, or dots");
+    }
+    Ok(())
+}
+
+pub(crate) fn valid_key(key: &str) -> bool {
+    validate_key_syntax(key).is_ok()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Entry, MAX_ENTRIES, parse, render};
+    use super::{Entry, MAX_ENTRIES, parse, render, valid_key};
 
     #[test]
     fn parses_data_without_shell_interpolation() {
@@ -371,56 +349,48 @@ mod tests {
                 key: "SPACE".into(),
                 value: " two words ".into(),
                 group: None,
-                description: None,
                 position: 0,
             },
             Entry {
                 key: "QUOTE".into(),
                 value: "say \"hello\"".into(),
                 group: None,
-                description: None,
                 position: 1,
             },
             Entry {
                 key: "HASH".into(),
                 value: "a#b".into(),
                 group: None,
-                description: None,
                 position: 2,
             },
             Entry {
                 key: "NEWLINE".into(),
                 value: "first\nsecond".into(),
                 group: None,
-                description: None,
                 position: 3,
             },
             Entry {
                 key: "EQUALS".into(),
                 value: "a=b=c".into(),
                 group: None,
-                description: None,
                 position: 4,
             },
             Entry {
                 key: "UNICODE".into(),
                 value: "halo dunia 🌏".into(),
                 group: None,
-                description: None,
                 position: 5,
             },
             Entry {
                 key: "EMPTY".into(),
                 value: String::new(),
                 group: None,
-                description: None,
                 position: 6,
             },
             Entry {
                 key: "SLASH".into(),
                 value: r"C:\path\value".into(),
                 group: None,
-                description: None,
                 position: 7,
             },
         ];
@@ -444,6 +414,29 @@ mod tests {
     }
 
     #[test]
+    fn accepts_dotted_keys_and_explains_invalid_key_syntax() {
+        let report =
+            parse("app.baseURL=https://example.test\nlogging.level.org.springframework=info\n");
+        assert!(report.issues.is_empty(), "{:?}", report.issues);
+        assert_eq!(report.entries[0].key, "app.baseURL");
+        assert_eq!(report.entries[1].key, "logging.level.org.springframework");
+        assert!(render(&report.entries).starts_with("app.baseURL=https://example.test\n"));
+        assert!(valid_key("APP_URL"));
+        assert!(valid_key("_internal.setting"));
+
+        let report = parse(".leading=value\nBAD-KEY=value\n");
+        assert_eq!(report.issues.len(), 2);
+        assert_eq!(
+            report.issues[0].message,
+            "variable key must start with an ASCII letter or underscore"
+        );
+        assert_eq!(
+            report.issues[1].message,
+            "variable key may contain only ASCII letters, numbers, underscores, or dots"
+        );
+    }
+
+    #[test]
     fn enforces_entry_limit() {
         let input = (0..=MAX_ENTRIES)
             .map(|index| format!("K{index}=value"))
@@ -455,22 +448,18 @@ mod tests {
     }
 
     #[test]
-    fn detects_groups_and_key_descriptions_without_exposing_values() {
+    fn detects_groups_and_ignores_ordinary_comments() {
         let report = parse(
             "# [Database]\n# Primary database host\nDB_HOST=db.internal\nDB_PORT=5432\n\n# Cache\n# Shared cache endpoint\nREDIS_URL=redis://cache\n",
         );
         assert!(report.issues.is_empty(), "{:?}", report.issues);
         assert_eq!(report.entries[0].group.as_deref(), Some("Database"));
-        assert_eq!(
-            report.entries[0].description.as_deref(),
-            Some("Primary database host")
-        );
         assert_eq!(report.entries[1].group.as_deref(), Some("Database"));
         assert_eq!(report.entries[2].group.as_deref(), Some("Cache"));
 
         let rendered = render(&report.entries);
         assert!(rendered.contains("# [Database]"));
-        assert!(rendered.contains("# Primary database host"));
+        assert!(!rendered.contains("# Primary database host"));
         assert_eq!(parse(&rendered).entries, report.entries);
     }
 
@@ -481,20 +470,18 @@ mod tests {
                 key: "DB_HOST".into(),
                 value: "database".into(),
                 group: Some("Database".into()),
-                description: None,
                 position: 0,
             },
             Entry {
                 key: "APP_NAME".into(),
                 value: "ConfigDeck".into(),
                 group: None,
-                description: Some("Application display name".into()),
                 position: 1,
             },
         ];
 
         let rendered = render(&entries);
-        assert!(rendered.starts_with("# Application display name\nAPP_NAME=ConfigDeck\n"));
+        assert!(rendered.starts_with("APP_NAME=ConfigDeck\n"));
         let reparsed = parse(&rendered);
         assert!(reparsed.issues.is_empty(), "{:?}", reparsed.issues);
         assert_eq!(reparsed.entries[0].group, None);

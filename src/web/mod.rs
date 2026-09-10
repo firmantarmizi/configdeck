@@ -251,7 +251,6 @@ struct ImportPreviewTemplate<'a> {
 struct ImportPreviewEntry {
     key: String,
     group_name: Option<String>,
-    description: Option<String>,
     starts_group: bool,
     suggested_type: &'static str,
 }
@@ -475,7 +474,6 @@ struct RequestImportPreviewEntry {
     action: String,
     key: String,
     group_name: Option<String>,
-    description: Option<String>,
     starts_group: bool,
     suggested_type: &'static str,
 }
@@ -1810,7 +1808,6 @@ async fn request_import_preview(
                 action: payload_entry.action.clone(),
                 key: entry.key.clone(),
                 group_name: entry.group.clone(),
-                description: entry.description.clone(),
                 starts_group,
                 suggested_type: variables::suggest_value_type(&entry.value),
             }
@@ -1877,7 +1874,7 @@ async fn request_import_commit(
             value_source: Some("REQUESTER_PROVIDED".to_owned()),
             visibility: Some(visibility),
             value_type: Some(value_type),
-            description: fields.remove(&format!("description_{index}")),
+            description: None,
             group_name: fields.remove(&format!("group_name_{index}")),
             display_order: Some(payload_entry.entry.position),
         });
@@ -2355,7 +2352,6 @@ async fn import_preview(
             ImportPreviewEntry {
                 key: entry.key.clone(),
                 group_name: entry.group.clone(),
-                description: entry.description.clone(),
                 starts_group,
                 suggested_type: variables::suggest_value_type(&entry.value),
             }
@@ -2409,13 +2405,12 @@ async fn import_commit(
             .remove(&format!("value_type_{index}"))
             .ok_or(AppError::InvalidRequest)?;
         let group_name = fields.remove(&format!("group_name_{index}"));
-        let description = fields.remove(&format!("description_{index}"));
         inputs.push(variables::AppliedVariableInput {
             key: std::mem::take(&mut entry.key),
             value: std::mem::take(&mut entry.value),
             visibility,
             value_type,
-            description,
+            description: None,
             group_name,
             display_order: entry.position,
             reason: reason.clone(),
@@ -3177,7 +3172,6 @@ mod tests {
         let entries = vec![ImportPreviewEntry {
             key: "DATABASE_URL".into(),
             group_name: Some("Database".into()),
-            description: Some("Primary connection string".into()),
             starts_group: true,
             suggested_type: "string",
         }];
@@ -3203,7 +3197,6 @@ mod tests {
         .unwrap();
         assert!(html.contains("DATABASE_URL"));
         assert!(html.contains("Database"));
-        assert!(html.contains("Primary connection string"));
         assert!(html.contains("Values remain encrypted"));
         assert!(html.contains("authenticated-ciphertext-token"));
         assert!(html.contains("Suggested: string"));
@@ -3225,7 +3218,6 @@ mod tests {
             action: "UPDATE".into(),
             key: "DATABASE_URL".into(),
             group_name: Some("Database".into()),
-            description: Some("Primary connection string".into()),
             starts_group: true,
             suggested_type: "string",
         }];
