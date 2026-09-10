@@ -490,7 +490,8 @@ button.link-button { min-height: 0; padding: 0; background: transparent; color: 
 .request-builder-heading { align-items: end; }
 .request-overview { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; }
 .request-item-list { display: grid; gap: 1rem; }
-.request-item { position: relative; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; padding-top: 1.2rem; }
+.request-item { position: relative; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; gap: 1rem; padding-top: 1.2rem; }
+.request-item > label { min-width: 0; }
 .request-item legend { padding: 0 .5rem; font-weight: 800; }
 .request-item-remove { position: absolute; top: .7rem; right: .8rem; }
 .request-add-item { justify-self: start; }
@@ -610,13 +611,16 @@ td small { display: block; margin-top: .3rem; }
 .variable-group-row:first-child th { padding-top: .75rem; border-top: 0; }
 
 .import-review-toolbar { display: grid; grid-template-columns: minmax(16rem, 1.5fr) minmax(12rem, .7fr) auto minmax(10rem, auto); align-items: end; gap: .8rem; }
-.import-review-toolbar .copy-status { align-self: center; text-align: right; }
+.import-review-toolbar .copy-status { display: flex; align-items: center; justify-content: flex-end; align-self: end; min-height: 2.55rem; text-align: right; }
 .import-review-table { max-height: min(58vh, 700px); overflow: auto; }
-.import-review-table thead { position: sticky; z-index: 2; top: 0; background: var(--surface); }
+.import-review-table thead { position: static; }
+.import-review-table thead th { position: sticky; z-index: 2; top: 0; background: var(--surface); box-shadow: inset 0 -1px 0 var(--border); }
 .import-review-table tr[hidden] { display: none; }
-.import-review-table td { min-width: 10rem; }
+.import-review-table td { min-width: 10rem; vertical-align: top; }
 .import-review-table td:first-child { min-width: 18rem; }
-.import-review-table td input { width: 100%; margin-top: .5rem; }
+.import-review-table td input { width: 100%; margin-top: 0; }
+.import-review-table td input, .import-review-table td select { min-height: 2.85rem; }
+.import-key-cell { display: flex; align-items: center; min-height: 2.85rem; gap: .55rem; }
 .import-review-table tr.import-group-start td { border-top: 2px solid color-mix(in srgb, var(--accent) 55%, var(--border)); }
 .compact-reason { padding: 1rem 1.25rem; }
 
