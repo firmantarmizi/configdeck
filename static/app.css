@@ -492,6 +492,7 @@ button.link-button { min-height: 0; padding: 0; background: transparent; color: 
 .request-item-list { display: grid; gap: 1rem; }
 .request-item { position: relative; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; gap: 1rem; padding-top: 1.2rem; }
 .request-item > label { min-width: 0; }
+.request-item input:not([type=hidden]), .request-item select { height: 2.75rem; }
 .request-item legend { padding: 0 .5rem; font-weight: 800; }
 .request-item-remove { position: absolute; top: .7rem; right: .8rem; }
 .request-add-item { justify-self: start; }
@@ -520,8 +521,10 @@ td small { display: block; margin-top: .3rem; }
 .status-success { color: var(--success); }
 .role-form { align-items: center; gap: .4rem; }
 .role-form select { min-width: 9.5rem; }
-.user-actions { position: relative; display: flex; flex-wrap: wrap; gap: .4rem; min-width: 8rem; }
-.user-action-menu { position: relative; }
+.user-actions { position: relative; display: flex; align-items: center; flex-wrap: wrap; gap: .4rem; min-width: 8rem; }
+.user-actions .icon-button { min-height: 2.25rem; }
+.user-actions .icon-button:hover, .user-actions .icon-button:focus-visible { border-color: var(--accent); background: var(--surface-raised); color: var(--accent-hover); }
+.user-action-menu { position: relative; margin: 0; }
 .user-action-menu > summary { list-style: none; }
 .user-action-menu > summary::-webkit-details-marker { display: none; }
 .user-action-menu[open]::before { position: fixed; z-index: 40; inset: 0; background: rgba(0,0,0,.48); content: ""; }

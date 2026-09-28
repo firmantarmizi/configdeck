@@ -68,3 +68,7 @@ Audit events contain allowlisted metadata, never configuration plaintext or auth
 ## Reporting vulnerabilities
 
 Follow the private reporting process in [`SECURITY.md`](../SECURITY.md). Never include real configuration values, credentials, session material, databases, backups, or production host details in a report.
+
+### Redacted environment preview
+
+The read-only `/environments/{id}/preview` page uses the same backend-authorized projection as the normal variable list. It decrypts public values only; restricted values are fixed masks, including for their original requester. Every request checks the session and service scope. It needs no recent authentication because it reveals no additional information, uses no-store/no-cache headers, and grants no full-export, download, or request-apply capability.

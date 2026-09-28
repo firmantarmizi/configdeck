@@ -256,6 +256,14 @@ struct ImportPreviewEntry {
 }
 
 #[derive(Template)]
+#[template(path = "environment_preview.html")]
+struct EnvironmentPreviewTemplate<'a> {
+    chrome: AppChrome<'a>,
+    environment: &'a variables::EnvironmentContext,
+    dotenv: &'a str,
+}
+
+#[derive(Template)]
 #[template(path = "export.html")]
 struct ExportTemplate<'a> {
     chrome: AppChrome<'a>,
@@ -278,6 +286,7 @@ struct TotpSetupTemplate<'a> {
 struct RecentAuthTemplate<'a> {
     csrf_token: &'a str,
     return_to: &'a str,
+    cancel_to: &'a str,
     high_impact: bool,
 }
 
@@ -622,6 +631,7 @@ fn configuration_routes() -> Router<AppState> {
         .route("/environments/{id}/import", get(import_page))
         .route("/environments/{id}/import/preview", post(import_preview))
         .route("/environments/{id}/import/commit", post(import_commit))
+        .route("/environments/{id}/preview", get(environment_preview))
         .route("/environments/{id}/export", get(environment_export))
         .route(
             "/environments/{id}/change-requests/new",
@@ -2233,7 +2243,7 @@ async fn api_environment_export(
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
     let (_, session) = authenticated(&state, &headers).await?;
-    let (_, dotenv) = variables::export_environment(
+    let variables::EnvironmentExport { dotenv, .. } = variables::export_environment(
         &state.pool,
         &state.crypto,
         &state.sessions,
@@ -2427,6 +2437,28 @@ async fn import_commit(
     Ok(Redirect::to(&format!("/environments/{environment_id}/variables")).into_response())
 }
 
+async fn environment_preview(
+    State(state): State<AppState>,
+    Path(environment_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    let (_, session, csrf) = authenticated_full_with_csrf(&state, &headers).await?;
+    let (environment, dotenv) = variables::preview_redacted_environment(
+        &state.pool,
+        &state.crypto,
+        &session,
+        &environment_id,
+    )
+    .await?;
+    let html = EnvironmentPreviewTemplate {
+        chrome: app_chrome(&state, &session, &csrf, "configurations"),
+        environment: &environment,
+        dotenv: &dotenv,
+    }
+    .render()?;
+    Ok(Html(html).into_response())
+}
+
 async fn environment_export(
     State(state): State<AppState>,
     Path(environment_id): Path<String>,
@@ -2445,7 +2477,11 @@ async fn environment_export(
         ))
         .into_response());
     }
-    let (environment, dotenv) = variables::export_environment(
+    let variables::EnvironmentExport {
+        environment,
+        dotenv,
+        keys,
+    } = variables::export_environment(
         &state.pool,
         &state.crypto,
         &state.sessions,
@@ -2453,11 +2489,7 @@ async fn environment_export(
         &environment_id,
     )
     .await?;
-    let keys = dotenv
-        .lines()
-        .filter(|line| !line.trim_start().starts_with('#'))
-        .filter_map(|line| line.split_once('=').map(|(key, _)| key.to_owned()))
-        .collect::<Vec<_>>();
+
     let html = ExportTemplate {
         chrome: app_chrome(&state, &session, &csrf, "configurations"),
         environment: &environment,
@@ -2476,7 +2508,7 @@ async fn environment_export_download(
 ) -> Result<Response, AppError> {
     let (_, session) = authenticated(&state, &headers).await?;
     state.sessions.verify_csrf(&session, &form.csrf_token)?;
-    let (_, dotenv) = variables::export_environment(
+    let variables::EnvironmentExport { dotenv, .. } = variables::export_environment(
         &state.pool,
         &state.crypto,
         &state.sessions,
@@ -2692,10 +2724,12 @@ async fn recent_auth_page(
         .map_err(|_| AppError::Crypto)?;
     state.sessions.verify_csrf(&session, &csrf)?;
     let return_to = safe_return_to(&query.return_to);
+    let cancel_to = recent_auth_cancel_target(&return_to);
     Ok(Html(
         RecentAuthTemplate {
             csrf_token: &csrf,
             return_to: &return_to,
+            cancel_to: &cancel_to,
             high_impact: query.level == "high",
         }
         .render()?,
@@ -2731,6 +2765,32 @@ async fn recent_auth(
         session_cookie(&state, &tokens.session_token)?,
     );
     Ok(response)
+}
+
+fn recent_auth_cancel_target(return_to: &str) -> String {
+    let target = safe_return_to(return_to);
+    let path = target.split(['?', '#']).next().unwrap_or("/dashboard");
+    let segments: Vec<_> = path.split('/').collect();
+    match segments.as_slice() {
+        [
+            "",
+            "dashboard" | "users" | "maintenance" | "change-requests",
+        ] => path.to_owned(),
+        [
+            "",
+            "environments",
+            id,
+            "import" | "export" | "variables" | "preview",
+        ] if Uuid::parse_str(id).is_ok() => {
+            format!("/environments/{id}/variables")
+        }
+        ["", "variables", id, "history"] | ["", "change-requests", id]
+            if Uuid::parse_str(id).is_ok() =>
+        {
+            path.to_owned()
+        }
+        _ => "/dashboard".to_owned(),
+    }
 }
 
 fn safe_return_to(value: &str) -> String {
@@ -3110,7 +3170,8 @@ mod tests {
     use super::{
         AppChrome, AppPermissions, ImportPreviewEntry, ImportPreviewTemplate,
         RequestImportPreviewEntry, RequestImportPreviewTemplate, TotpSetupTemplate,
-        resolve_client_ip, router, safe_return_to, totp_qr_code_data_uri,
+        recent_auth_cancel_target, resolve_client_ip, router, safe_return_to,
+        totp_qr_code_data_uri,
     };
 
     #[test]
@@ -3128,6 +3189,44 @@ mod tests {
         ] {
             assert_eq!(safe_return_to(unsafe_target), "/dashboard");
         }
+    }
+
+    #[test]
+    fn recent_auth_cancel_targets_only_known_unprivileged_pages() {
+        let id = "22222222-2222-4222-8222-222222222222";
+        for action in ["export", "import", "variables", "preview"] {
+            assert_eq!(
+                recent_auth_cancel_target(&format!("/environments/{id}/{action}?selected=ignored")),
+                format!("/environments/{id}/variables")
+            );
+        }
+        for path in [
+            "/dashboard".to_owned(),
+            "/users".to_owned(),
+            "/maintenance".to_owned(),
+            "/change-requests".to_owned(),
+            format!("/change-requests/{id}"),
+            format!("/variables/{id}/history"),
+        ] {
+            assert_eq!(recent_auth_cancel_target(&path), path);
+        }
+        for target in [
+            "https://evil.example",
+            "//evil.example",
+            "/\\evil.example",
+            "/auth/recent?return_to=/users",
+            "/logout",
+            "/unknown",
+            "/environments/../export",
+            "/environments/%2f%2fevil.example/export",
+            "/users\r\nlocation:https://evil.example",
+        ] {
+            assert_eq!(recent_auth_cancel_target(target), "/dashboard");
+        }
+        assert_eq!(
+            recent_auth_cancel_target("/users?next=//evil.example#ignored"),
+            "/users"
+        );
     }
 
     #[test]
@@ -3662,6 +3761,363 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert!(response.headers().get("location").is_none());
+    }
+
+    struct PreviewFixture {
+        state: AppState,
+        service_id: String,
+        environment_id: String,
+        tokens: crate::auth::SessionTokens,
+    }
+
+    async fn preview_fixture() -> PreviewFixture {
+        let state = response_state().await;
+        seed_registry_identities(&state.pool).await;
+        let admin = test_session("admin", Role::Administrator);
+        let service_id = services::create(
+            &state.pool,
+            &admin,
+            ServiceInput {
+                name: "Preview app".into(),
+                description: None,
+            },
+        )
+        .await
+        .unwrap();
+        let environment_id = environments::create(
+            &state.pool,
+            &state.crypto,
+            &admin,
+            &service_id,
+            EnvironmentInput {
+                name: "staging".into(),
+                description: None,
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO user_service_access(user_id, service_id, granted_at, granted_by) VALUES('contributor', ?, '2026-09-26T00:00:00Z', 'admin')")
+            .bind(&service_id).execute(&state.pool).await.unwrap();
+        for (position, (key, value, visibility)) in [
+            ("API_URL", "https://example.test", "public"),
+            (
+                "PRIVATE_KEY",
+                "synthetic-private-value\nnever-display-this",
+                "restricted",
+            ),
+            (
+                "MESSAGE",
+                "first\n</textarea><script>synthetic</script>",
+                "public",
+            ),
+            ("REMOVED", "removed-value", "public"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let variable_id = variables::record_applied(
+                &state.pool,
+                &state.crypto,
+                &admin,
+                &environment_id,
+                AppliedVariableInput {
+                    key: key.into(),
+                    value: value.into(),
+                    visibility: visibility.into(),
+                    value_type: "multiline".into(),
+                    description: None,
+                    group_name: Some("Application".into()),
+                    display_order: i64::try_from(position).unwrap(),
+                    reason: "Synthetic test fixture".into(),
+                },
+            )
+            .await
+            .unwrap();
+            if key == "REMOVED" {
+                variables::delete_applied(
+                    &state.pool,
+                    &state.crypto,
+                    &admin,
+                    &variable_id,
+                    "Removed in fixture",
+                )
+                .await
+                .unwrap();
+            }
+        }
+        let tokens = state
+            .sessions
+            .create(
+                &test_session("contributor", Role::Contributor).user,
+                AuthenticationState::Full,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        PreviewFixture {
+            state,
+            service_id,
+            environment_id,
+            tokens,
+        }
+    }
+
+    async fn preview_get(fixture: &PreviewFixture, path: &str) -> axum::response::Response {
+        router(fixture.state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .header(
+                        "cookie",
+                        format!("__Host-configdeck_session={}", fixture.tokens.session_token),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn cancel_recent_auth_leaves_export_and_import_without_elevating_session() {
+        let mut fixture = preview_fixture().await;
+        fixture.tokens = fixture
+            .state
+            .sessions
+            .create(
+                &test_session("admin", Role::Administrator).user,
+                AuthenticationState::Full,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let cancel_path = format!("/environments/{}/variables", fixture.environment_id);
+        for action in ["export", "import"] {
+            let protected_path = format!("/environments/{}/{action}", fixture.environment_id);
+            let response = preview_get(&fixture, &protected_path).await;
+            assert_eq!(response.status(), StatusCode::SEE_OTHER);
+            let auth_path = response.headers()["location"].to_str().unwrap().to_owned();
+            let response = preview_get(&fixture, &auth_path).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(response.headers().get("set-cookie").is_none());
+            let bytes = axum::body::to_bytes(response.into_body(), 128 * 1024)
+                .await
+                .unwrap();
+            let html = String::from_utf8(bytes.to_vec()).unwrap();
+            assert!(html.contains(&format!("name=\"return_to\" value=\"{protected_path}\"")));
+            let cancel_href = html
+                .split("class=\"auth-cancel\" href=\"")
+                .nth(1)
+                .unwrap()
+                .split('"')
+                .next()
+                .unwrap();
+            assert_eq!(cancel_href, cancel_path);
+            let response = preview_get(&fixture, cancel_href).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(response.headers().get("location").is_none());
+            let bytes = axum::body::to_bytes(response.into_body(), 128 * 1024)
+                .await
+                .unwrap();
+            let html = String::from_utf8(bytes.to_vec()).unwrap();
+            assert!(!html.contains("synthetic-private-value"));
+            assert!(!html.contains("never-display-this"));
+            let response = preview_get(&fixture, &protected_path).await;
+            assert_eq!(response.status(), StatusCode::SEE_OTHER);
+            assert_eq!(response.headers()["location"], auth_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn redacted_preview_preserves_public_data_and_never_decrypts_restricted_values() {
+        let fixture = preview_fixture().await;
+        let path = format!("/environments/{}/preview", fixture.environment_id);
+        for corrupt_restricted_value in [false, true] {
+            if corrupt_restricted_value {
+                sqlx::query("UPDATE variables SET encrypted_value = zeroblob(16) WHERE visibility = 'restricted'")
+                    .execute(&fixture.state.pool).await.unwrap();
+            }
+            let response = preview_get(&fixture, &path).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()["cache-control"], "no-store");
+            assert_eq!(response.headers()["pragma"], "no-cache");
+            let bytes = axum::body::to_bytes(response.into_body(), 128 * 1024)
+                .await
+                .unwrap();
+            let html = String::from_utf8(bytes.to_vec()).unwrap();
+            assert!(html.contains("API_URL=https://example.test"));
+            assert!(html.contains("PRIVATE_KEY="));
+            assert!(html.contains("********"));
+            assert!(html.contains("# [Application]"));
+            assert!(html.contains("first\n"));
+            assert!(!html.contains("synthetic-private-value"));
+            assert!(!html.contains("never-display-this"));
+            assert!(!html.contains("REMOVED="));
+            assert!(!html.contains("removed-value"));
+            assert!(!html.contains("</textarea><script>"));
+            assert!(!html.contains("/export/download"));
+            assert!(!html.contains("data-copy-all"));
+            assert!(!html.contains("encrypted_value"));
+            assert!(!html.contains("value_nonce"));
+        }
+        let response = preview_get(
+            &fixture,
+            &format!("/environments/{}/variables", fixture.environment_id),
+        )
+        .await;
+        let bytes = axum::body::to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap();
+        assert!(String::from_utf8(bytes.to_vec()).unwrap().contains(&path));
+    }
+
+    #[tokio::test]
+    async fn redacted_preview_rejects_anonymous_incomplete_and_unassigned_access() {
+        let fixture = preview_fixture().await;
+        let path = format!("/environments/{}/preview", fixture.environment_id);
+        let anonymous = router(fixture.state.clone())
+            .oneshot(Request::builder().uri(&path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+        let incomplete = fixture
+            .state
+            .sessions
+            .create(
+                &test_session("contributor", Role::Contributor).user,
+                AuthenticationState::PasswordOnly,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let response = router(fixture.state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(&path)
+                    .header(
+                        "cookie",
+                        format!("__Host-configdeck_session={}", incomplete.session_token),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        sqlx::query(
+            "DELETE FROM user_service_access WHERE user_id = 'contributor' AND service_id = ?",
+        )
+        .bind(&fixture.service_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        let response = preview_get(&fixture, &path).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let bytes = axum::body::to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap();
+        let html = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(!html.contains("API_URL"));
+        assert!(!html.contains("PRIVATE_KEY"));
+        assert!(!html.contains("https://example.test"));
+    }
+
+    #[tokio::test]
+    async fn redacted_preview_does_not_grant_full_export_or_download() {
+        let fixture = preview_fixture().await;
+        for path in [
+            format!("/environments/{}/export", fixture.environment_id),
+            format!("/api/environments/{}/export", fixture.environment_id),
+        ] {
+            assert_eq!(
+                preview_get(&fixture, &path).await.status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+        let download = router(fixture.state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/environments/{}/export/download",
+                        fixture.environment_id
+                    ))
+                    .header(
+                        "cookie",
+                        format!("__Host-configdeck_session={}", fixture.tokens.session_token),
+                    )
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(format!(
+                        "csrf_token={}",
+                        fixture.tokens.csrf_token
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(download.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn contributor_multiline_import_preview_is_encrypted_and_atomic_on_errors() {
+        let fixture = preview_fixture().await;
+        for (source, expected) in [
+            (
+                "KEY_PRIVATE=\"-----BEGIN PRIVATE KEY-----\nsynthetic-test-only\n-----END PRIVATE KEY-----\"\nAFTER=ok",
+                StatusCode::OK,
+            ),
+            (
+                "AFTER=ok\nKEY_PRIVATE=\"synthetic-test-only\nunclosed",
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+        ] {
+            let encoded =
+                percent_encoding::utf8_percent_encode(source, percent_encoding::NON_ALPHANUMERIC);
+            let response = router(fixture.state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!(
+                            "/environments/{}/change-requests/import/preview",
+                            fixture.environment_id
+                        ))
+                        .header(
+                            "cookie",
+                            format!("__Host-configdeck_session={}", fixture.tokens.session_token),
+                        )
+                        .header("content-type", "application/x-www-form-urlencoded")
+                        .body(Body::from(format!(
+                            "csrf_token={}&dotenv={encoded}",
+                            fixture.tokens.csrf_token
+                        )))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+            let bytes = axum::body::to_bytes(response.into_body(), 128 * 1024)
+                .await
+                .unwrap();
+            let html = String::from_utf8(bytes.to_vec()).unwrap();
+            assert!(!html.contains("synthetic-test-only"));
+            if expected == StatusCode::OK {
+                assert!(html.contains("value=\"multiline\" selected"));
+                assert!(html.contains("preview_token"));
+            } else {
+                assert!(html.contains("Line 2:"));
+                assert!(!html.contains("name=\"preview_token\""));
+            }
+        }
+        let request_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM change_requests WHERE requested_by = 'contributor'",
+        )
+        .fetch_one(&fixture.state.pool)
+        .await
+        .unwrap();
+        assert_eq!(request_count, 0);
     }
 
     async fn response_state() -> AppState {

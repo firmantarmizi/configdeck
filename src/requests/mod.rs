@@ -2539,7 +2539,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let mut grouped_add = proposed_item("ADD", "ADD_ME", Some("added"));
+        let mut grouped_add = proposed_item("ADD", "ADD_ME", Some("first line\nsecond line"));
         grouped_add.group_name = Some("Application".into());
         grouped_add.display_order = Some(7);
         let request_id = create(
@@ -2579,7 +2579,11 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(preview.dotenv.contains("ADD_ME=added\n"));
+        assert!(
+            preview
+                .dotenv
+                .contains("ADD_ME=\"first line\nsecond line\"\n")
+        );
         assert!(preview.dotenv.contains("# [Application]\n"));
         assert!(preview.dotenv.contains("UPDATE_ME=updated\n"));
         assert!(!preview.dotenv.contains("DELETE_ME"));

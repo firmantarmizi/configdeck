@@ -20,6 +20,7 @@
 
 {% if can_apply && workspace.service.archived_at.is_none() %}<details class="panel create-panel secondary-create deployed-import"><summary>Record deployed configuration</summary><p class="muted">Operator action: import configuration that is already active on the deployment platform.</p><div class="environment-request-links">{% for environment in workspace.environments %}<a class="button-link secondary compact-button" href="/environments/{{ environment.id }}/import"><svg class="icon" aria-hidden="true"><use href="#icon-upload"></use></svg>{{ environment.name }}</a>{% endfor %}</div></details>{% endif %}
 
+<details class="panel create-panel secondary-create"><summary>Preview redacted .env</summary><p class="muted">Choose an environment to view all current keys as text. Restricted values stay hidden.</p><div class="environment-request-links">{% for environment in workspace.environments %}<a class="button-link secondary compact-button" href="/environments/{{ environment.id }}/preview"><svg class="icon" aria-hidden="true"><use href="#icon-file"></use></svg>{{ environment.name }}</a>{% endfor %}</div></details>
 <section class="environment-selector" aria-labelledby="environment-selector-title" data-environment-selector>
   <div class="environment-selector-heading"><div><h2 id="environment-selector-title">Environments</h2><p>Select which environments to compare.</p></div><span data-environment-count>{{ workspace.environments.len() }} selected</span></div>
   <div class="environment-choice-list">

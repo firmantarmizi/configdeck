@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
 
 use serde::{Deserialize, Serialize};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 pub const MAX_INPUT_BYTES: usize = 256 * 1024;
 pub const MAX_ENTRIES: usize = 500;
@@ -42,7 +42,11 @@ pub fn parse(input: &str) -> ParseReport {
     let mut keys = HashSet::new();
     let mut current_group = None;
     let mut section_boundary = true;
-    for (index, physical_line) in lines.iter().enumerate() {
+    let mut next_line = 0;
+    while next_line < lines.len() {
+        let index = next_line;
+        let physical_line = lines[index];
+        next_line += 1;
         let line_number = index + 1;
         let line = if index == 0 {
             physical_line
@@ -75,7 +79,7 @@ pub fn parse(input: &str) -> ParseReport {
             });
             break;
         }
-        match parse_assignment(trimmed) {
+        match parse_multiline_assignment(line, &lines, &mut next_line) {
             Ok(mut entry) => {
                 if keys.insert(entry.key.clone()) {
                     entry.group.clone_from(&current_group);
@@ -102,6 +106,52 @@ pub fn parse(input: &str) -> ParseReport {
         });
     }
     report
+}
+
+fn parse_multiline_assignment(
+    line: &str,
+    lines: &[&str],
+    next_line: &mut usize,
+) -> Result<Entry, &'static str> {
+    let line = line.trim_start();
+    let assignment = line.strip_prefix("export ").unwrap_or(line);
+    let (key, raw_value) = assignment
+        .split_once('=')
+        .ok_or("expected KEY=VALUE assignment")?;
+    validate_key_syntax(key.trim())?;
+    let raw_value = raw_value.trim_start();
+    let Some(quote @ ('\'' | '"')) = raw_value.chars().next() else {
+        return parse_assignment(line);
+    };
+    if quoted_value_is_closed(&raw_value[1..], quote) {
+        return parse_assignment(line);
+    }
+    let mut logical_line = Zeroizing::new(line.to_owned());
+    while let Some(continuation) = lines.get(*next_line) {
+        *next_line += 1;
+        logical_line.push('\n');
+        logical_line.push_str(continuation);
+        // A physical newline consumes any preceding escape. Invalid escape
+        // sequences are still rejected by parse_value after collection.
+        if quoted_value_is_closed(continuation, quote) {
+            break;
+        }
+    }
+    parse_assignment(&logical_line)
+}
+
+fn quoted_value_is_closed(value: &str, quote: char) -> bool {
+    let mut escaped = false;
+    for character in value.chars() {
+        if escaped {
+            escaped = false;
+        } else if quote == '"' && character == '\\' {
+            escaped = true;
+        } else if character == quote {
+            return true;
+        }
+    }
+    false
 }
 
 fn validate_input(input: &str) -> Option<ParseIssue> {
@@ -293,7 +343,6 @@ fn render_value(value: &str) -> String {
         match character {
             '\\' => result.push_str("\\\\"),
             '"' => result.push_str("\\\""),
-            '\n' => result.push_str("\\n"),
             '\r' => result.push_str("\\r"),
             '\t' => result.push_str("\\t"),
             _ => result.push(character),
@@ -331,6 +380,124 @@ pub(crate) fn valid_key(key: &str) -> bool {
 mod tests {
     use super::{Entry, MAX_ENTRIES, parse, render, valid_key};
 
+    #[test]
+    fn imports_physical_multiline_values_and_preserves_following_keys() {
+        // Deliberately synthetic PEM-shaped data, not a real credential.
+        let source = "SESSION_DRIVER=database\n# [Keys]\nKEY_PRIVATE=\"-----BEGIN PRIVATE KEY-----\nsynthetic-test-only=\n-----END PRIVATE KEY-----\"\n\nBCA_CLIENT_KEY=example-client\nBCA_PUBLIC_KEY=\"-----BEGIN PUBLIC KEY-----\nsynthetic-public-test-only\n-----END PUBLIC KEY-----\"\n";
+        for source in [source.to_owned(), source.replace('\n', "\r\n")] {
+            let report = parse(&source);
+            assert!(report.issues.is_empty(), "{:?}", report.issues);
+            assert_eq!(report.entries.len(), 4);
+            assert_eq!(
+                report.entries[1].value,
+                "-----BEGIN PRIVATE KEY-----\nsynthetic-test-only=\n-----END PRIVATE KEY-----"
+            );
+            assert_eq!(report.entries[2].key, "BCA_CLIENT_KEY");
+            assert_eq!(report.entries[3].group.as_deref(), Some("Keys"));
+            assert_eq!(parse(&render(&report.entries)).entries, report.entries);
+        }
+    }
+
+    #[test]
+    fn multiline_preserves_whitespace_comments_assignments_and_literal_single_quotes() {
+        let report = parse(
+            "\u{feff}export TEXT=\"  first  \n\n# [Not a group]\nOTHER=value\n  last  \"\nLITERAL='first\\n\n$HOME $(command) \\path'\nNEXT=ok\n",
+        );
+        assert!(report.issues.is_empty(), "{:?}", report.issues);
+        assert_eq!(report.entries.len(), 3);
+        assert_eq!(
+            report.entries[0].value,
+            "  first  \n\n# [Not a group]\nOTHER=value\n  last  "
+        );
+        assert_eq!(report.entries[1].value, "first\\n\n$HOME $(command) \\path");
+        assert_eq!(report.entries[2].group, None);
+        assert_eq!(parse(&render(&report.entries)).entries, report.entries);
+    }
+
+    #[test]
+    fn multiline_handles_escaped_quotes_backslashes_and_final_newline() {
+        let report = parse("TEXT=\"first \\\"quoted\\\"\nsecond\\nthird\\\\\n\"\nNEXT=ok\n");
+        assert!(report.issues.is_empty(), "{:?}", report.issues);
+        assert_eq!(
+            report.entries[0].value,
+            "first \"quoted\"\nsecond\nthird\\\n"
+        );
+        assert_eq!(report.entries[1].key, "NEXT");
+    }
+
+    #[test]
+    fn multiline_errors_point_to_opening_line_without_value_content() {
+        for (source, message) in [
+            (
+                "OK=1\nBROKEN=\"synthetic-sensitive\nNEXT=value\n",
+                "unterminated double-quoted value",
+            ),
+            (
+                "OK=1\nBROKEN='synthetic-sensitive\nNEXT=value\n",
+                "unterminated single-quoted value",
+            ),
+            (
+                "OK=1\nBROKEN=\"synthetic-sensitive\nlast\" trailing\n",
+                "unexpected characters after quoted value",
+            ),
+            (
+                "OK=1\nBROKEN=\"synthetic-sensitive\\q\nlast\"\n",
+                "unknown escape in double-quoted value",
+            ),
+            (
+                "OK=1\nBROKEN=\"synthetic-sensitive\\\nlast\"\n",
+                "unknown escape in double-quoted value",
+            ),
+        ] {
+            let report = parse(source);
+            assert_eq!(report.issues.len(), 1);
+            assert_eq!(report.issues[0].line, 2);
+            assert_eq!(report.issues[0].message, message);
+            assert!(!report.issues[0].message.contains("synthetic-sensitive"));
+        }
+        let duplicates = parse("KEY=\"first\nsecond\"\nKEY=duplicate\n");
+        assert_eq!(duplicates.issues[0].line, 3);
+        assert_eq!(duplicates.issues[0].message, "duplicate key");
+    }
+
+    #[test]
+    fn multiline_enforces_decoded_value_and_input_limits() {
+        let value = "x".repeat(super::MAX_VALUE_BYTES - 1);
+        let accepted = parse(&format!("KEY=\"{value}\n\"\n"));
+        assert!(accepted.issues.is_empty());
+        assert_eq!(accepted.entries[0].value.len(), super::MAX_VALUE_BYTES);
+        let rejected = parse(&format!("KEY=\"{value}\nx\"\n"));
+        assert_eq!(rejected.issues[0].message, "value exceeds the 32 KiB limit");
+        assert_eq!(rejected.issues[0].line, 1);
+        assert_eq!(
+            parse("KEY=\"first\n\0\"\n").issues[0].message,
+            "NUL bytes are not allowed"
+        );
+        assert_eq!(
+            parse(&"x".repeat(super::MAX_INPUT_BYTES + 1)).issues[0].message,
+            "input exceeds the 256 KiB limit"
+        );
+    }
+
+    #[test]
+    fn render_preserves_physical_newlines_without_expanding_literal_backslash_n() {
+        // PEM-shaped placeholder text only; never use a real key fixture.
+        let source = "KEY_PRIVATE=\"-----BEGIN PRIVATE KEY-----\nsynthetic-first-line\nsynthetic-last-line=\n-----END PRIVATE KEY-----\"\nAFTER=ok\n";
+        let parsed = parse(source);
+        assert!(parsed.issues.is_empty());
+        assert_eq!(render(&parsed.entries), source);
+        let value = "first\n\n# [Inside value]\nFAKE_KEY=still value\nquote: \"yes\"\nbackslash: \\n\ncarriage:\r\ntab:\t 🌏\n";
+        let entries = vec![Entry {
+            key: "TEXT".into(),
+            value: value.into(),
+            group: None,
+            position: 0,
+        }];
+        let rendered = render(&entries);
+        assert!(rendered.contains("first\n\n# [Inside value]\n"));
+        assert!(rendered.contains("backslash: \\\\n\n"));
+        assert_eq!(parse(&rendered).entries, entries);
+    }
     #[test]
     fn parses_data_without_shell_interpolation() {
         let report = parse(

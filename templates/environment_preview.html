@@ -1,0 +1,10 @@
+{% extends "app_base.html" %}
+{% block title %}Redacted .env preview · ConfigDeck{% endblock %}
+{% block content %}
+<nav class="breadcrumbs" aria-label="Breadcrumb"><a href="/services">Configurations</a><span>/</span><a href="/environments/{{ environment.id }}/variables">{{ environment.service_name }} / {{ environment.name }}</a><span>/</span><span>Redacted preview</span></nav>
+<div class="hero-heading compact-heading"><div><p class="eyebrow">Current environment</p><h1>Redacted .env preview</h1><p class="lead">All current keys for {{ environment.service_name }} / {{ environment.name }}.</p></div></div>
+<div class="notice"><strong>Restricted values are hidden</strong><span>Restricted values are replaced with ********. This view excludes pending changes and is not a complete configuration for deployment.</span></div>
+<label for="dotenv-output">Current configuration (redacted)</label>
+<textarea id="dotenv-output" class="dotenv-output" rows="18" readonly spellcheck="false">{{ dotenv }}</textarea>
+<div class="action-row"><a class="button-link secondary" href="/environments/{{ environment.id }}/variables">Back to environment</a></div>
+{% endblock %}

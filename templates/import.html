@@ -7,7 +7,7 @@
 {% if !issues.is_empty() %}<section class="error-panel"><h2>Fix these input issues</h2><ul>{% for issue in issues %}<li>{% if issue.line > 0 %}Line {{ issue.line }}: {% endif %}{{ issue.message }}</li>{% endfor %}</ul></section>{% endif %}
 <form method="post" action="/environments/{{ environment.id }}/import/preview" class="panel stack">
   <input type="hidden" name="csrf_token" value="{{ chrome.csrf_token }}">
-  <label>.env content<textarea name="dotenv" class="code-input" rows="18" maxlength="262144" spellcheck="false" required placeholder="# [Application]\napp.baseURL=https://example.test"></textarea><small class="field-hint">Keys may use letters, numbers, underscores, and dots; start with a letter or underscore. Use # [Group] to create sections. Other comments are ignored.</small></label>
+  <label>.env content<textarea name="dotenv" class="code-input" rows="18" maxlength="262144" spellcheck="false" required placeholder="# [Application]\napp.baseURL=https://example.test"></textarea><small class="field-hint">Keys may use letters, numbers, underscores, and dots; start with a letter or underscore. Use # [Group] to create sections. Other comments are ignored. Wrap multiline values in single or double quotes; line breaks inside quotes are preserved.</small></label>
   <div class="form-actions"><a class="button-link tertiary" href="/services/{{ environment.service_id }}/environments"><svg class="icon" aria-hidden="true"><use href="#icon-x"></use></svg>Cancel</a><button type="submit"><svg class="icon" aria-hidden="true"><use href="#icon-file"></use></svg>Review deployed state</button></div>
 </form>
 {% endblock %}

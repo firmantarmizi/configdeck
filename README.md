@@ -101,6 +101,18 @@ docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --build
 
 Do not add `-v` to `docker compose down`, because that would remove the local database and backup volumes.
 
+### Multiline values and redacted preview
+
+Quoted `.env` values may span multiple lines, including PEM-shaped keys and certificates:
+
+```env
+MESSAGE="First line
+Second line"
+```
+
+Both single and double quotes preserve physical line breaks (LF and CRLF are normalized to LF), inner spaces, and blank lines. Double quotes also decode `\n`, `\r`, `\t`, `\\`, and `\"`; single quotes keep backslashes literal. No interpolation or command substitution is performed. Preview, copy, download, and API export preserve actual newlines inside double-quoted values, as shown above. Copy Selected includes the complete multiline value. Literal backslash-n text remains literal. Loader compatibility should be checked on the destination platform. Input is limited to 256 KiB, 500 variables, and 32 KiB per decoded value; request imports allow up to 50 variables.
+
+**Preview redacted .env**, available from the App workspace or environment page, shows all active current keys with public values and fixed `********` masks for restricted values. Contributors can view only assigned Apps. Restricted values are never decrypted for this view, pending changes are excluded, and the page is not a complete configuration for deployment. Full resolved preview, copy, and download remain Operator/Administrator actions with recent authentication.
 ## Verification
 
 ```bash

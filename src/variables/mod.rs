@@ -918,13 +918,39 @@ pub async fn reveal_version(
     Ok((row.key, row.version, Zeroizing::new(plaintext)))
 }
 
+/// A text projection of the normal authorized list, never a resolved export.
+pub async fn preview_redacted_environment(
+    pool: &SqlitePool,
+    crypto: &CryptoManager,
+    session: &AuthenticatedSession,
+    environment_id: &str,
+) -> Result<(EnvironmentContext, Zeroizing<String>), AppError> {
+    let (environment, variables) =
+        list_for_environment(pool, crypto, session, environment_id).await?;
+    let entries = variables
+        .into_iter()
+        .map(|variable| dotenv::Entry {
+            key: variable.key,
+            value: variable.value.unwrap_or_else(|| "********".to_owned()),
+            group: variable.group_name,
+            position: variable.display_order,
+        })
+        .collect::<Vec<_>>();
+    Ok((environment, Zeroizing::new(dotenv::render(&entries))))
+}
+
+pub struct EnvironmentExport {
+    pub environment: EnvironmentContext,
+    pub dotenv: Zeroizing<String>,
+    pub keys: Vec<String>,
+}
 pub async fn export_environment(
     pool: &SqlitePool,
     crypto: &CryptoManager,
     session_manager: &crate::auth::SessionManager,
     session: &AuthenticatedSession,
     environment_id: &str,
-) -> Result<(EnvironmentContext, Zeroizing<String>), AppError> {
+) -> Result<EnvironmentExport, AppError> {
     session.require_full()?;
     if !session.user.role.allows(Capability::ExportEnvironment)
         || !session_manager.has_recent_auth(session, PrivilegedAuthLevel::Standard)
@@ -968,7 +994,12 @@ pub async fn export_environment(
     .bind(format!("{{\"variable_count\":{}}}", entries.len()))
     .execute(pool)
     .await?;
-    Ok((environment, rendered))
+    let keys = entries.iter().map(|entry| entry.key.clone()).collect();
+    Ok(EnvironmentExport {
+        environment,
+        dotenv: rendered,
+        keys,
+    })
 }
 
 pub async fn copy_current(
@@ -1732,11 +1763,11 @@ mod tests {
             &crypto,
             &operator,
             &environment_id,
-            vec![api_url, database_url],
+            vec![api_url, database_url, input("KEY_PRIVATE", "-----BEGIN PRIVATE KEY-----\nsynthetic-payload=\nFAKE_KEY=inside-value\n-----END PRIVATE KEY-----", "restricted", "multiline")],
         )
         .await
         .unwrap();
-        assert_eq!(imported, 2);
+        assert_eq!(imported, 3);
         let import_audits: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM audit_logs WHERE action = 'IMPORT_ENV'")
                 .fetch_one(&pool)
@@ -1756,16 +1787,33 @@ mod tests {
         let mut recent_operator = operator;
         recent_operator.privileged_authenticated_at = Some(OffsetDateTime::now_utc());
         recent_operator.privileged_auth_level = Some(PrivilegedAuthLevel::Standard);
-        let (_, exported) =
+        let exported =
             export_environment(&pool, &crypto, &manager, &recent_operator, &environment_id)
                 .await
                 .unwrap();
-        assert!(exported.contains("API_URL=\"https://example.test/a=b\""));
-        assert!(exported.contains("DATABASE_URL=postgres://user:secret@example.test/db"));
-        assert!(exported.contains("# [Application]\nAPI_URL="));
-        assert!(exported.contains("# [Database]\nDATABASE_URL="));
-        assert!(!exported.contains("Public application URL"));
-        assert!(!exported.contains("Primary database connection"));
+        assert!(
+            exported
+                .dotenv
+                .contains("API_URL=\"https://example.test/a=b\"")
+        );
+        assert!(
+            exported
+                .dotenv
+                .contains("DATABASE_URL=postgres://user:secret@example.test/db")
+        );
+        assert!(exported.dotenv.contains("# [Application]\nAPI_URL="));
+        assert!(exported.dotenv.contains("# [Database]\nDATABASE_URL="));
+        assert!(!exported.dotenv.contains("Public application URL"));
+        assert!(!exported.dotenv.contains("Primary database connection"));
+        assert_eq!(exported.keys.len(), 3);
+        assert!(exported.keys.iter().any(|key| key == "KEY_PRIVATE"));
+        assert!(
+            !exported
+                .keys
+                .iter()
+                .any(|key| key == "FAKE_KEY" || key == "synthetic-payload")
+        );
+        assert!(exported.dotenv.contains("KEY_PRIVATE=\"-----BEGIN PRIVATE KEY-----\nsynthetic-payload=\nFAKE_KEY=inside-value\n-----END PRIVATE KEY-----\"\n"));
     }
 
     fn input(key: &str, value: &str, visibility: &str, value_type: &str) -> AppliedVariableInput {

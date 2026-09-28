@@ -293,6 +293,55 @@ function initializeCustomSelects(root = document) {
   root.querySelectorAll(".comparison-shared-fields select, .comparison-value-row select, .comparison-add-form select").forEach(enhanceComparisonSelect);
 }
 
+// The server renders quoted values with real newlines. Select whole records,
+// never interpret a continuation line as a key or a group heading.
+function closesDotenvQuote(value) {
+  let escaped = false;
+  for (const character of value) {
+    if (escaped) escaped = false;
+    else if (character === "\\") escaped = true;
+    else if (character === '"') return true;
+  }
+  return false;
+}
+
+function selectDotenvEntries(text, selected) {
+  const lines = text.split("\n");
+  const output = [];
+  let currentGroup;
+  let emittedGroup;
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const trimmed = line.trim();
+    if (trimmed.match(/^#\s*\[(.+)]$/)) {
+      currentGroup = line;
+      continue;
+    }
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const separator = line.indexOf("=");
+    if (separator < 0) return null;
+    const key = line.slice(0, separator).trim();
+    const value = line.slice(separator + 1);
+    const record = [line];
+    if (value.startsWith('"')) {
+      let closed = closesDotenvQuote(value.slice(1));
+      while (!closed && index + 1 < lines.length) {
+        index += 1;
+        record.push(lines[index]);
+        closed = closesDotenvQuote(lines[index]);
+      }
+      if (!closed) return null;
+    }
+    if (!selected.has(key)) continue;
+    if (currentGroup && currentGroup !== emittedGroup) {
+      if (output.length) output.push("");
+      output.push(currentGroup);
+      emittedGroup = currentGroup;
+    }
+    output.push(...record);
+  }
+  return output.length ? `${output.join("\n")}\n` : "";
+}
 async function writeClipboard(text, status) {
   try {
     await navigator.clipboard.writeText(text);
@@ -716,42 +765,11 @@ document.addEventListener("click", (event) => {
       Array.from(document.querySelectorAll('input[name="export_line"]:checked'))
         .map((input) => input.value)
     );
-    const selectedLines = [];
-    let pendingComments = [];
-    let currentGroup;
-    let emittedGroup;
-    text.split("\n").forEach((line) => {
-      const trimmed = line.trim();
-      const group = trimmed.match(/^#\s*\[(.+)]$/);
-      if (group) {
-        currentGroup = line;
-        pendingComments = [];
-        return;
-      }
-      if (!trimmed) {
-        currentGroup = undefined;
-        pendingComments = [];
-        return;
-      }
-      if (trimmed.startsWith("#")) {
-        pendingComments.push(line);
-        return;
-      }
-      const separator = line.indexOf("=");
-      const key = separator < 0 ? "" : line.slice(0, separator).trim();
-      if (selected.has(key)) {
-        if (currentGroup && currentGroup !== emittedGroup) {
-          if (selectedLines.length) selectedLines.push("");
-          selectedLines.push(currentGroup);
-          emittedGroup = currentGroup;
-        } else if (!currentGroup) {
-          emittedGroup = undefined;
-        }
-        selectedLines.push(...pendingComments, line);
-      }
-      pendingComments = [];
-    });
-    text = selectedLines.length ? `${selectedLines.join("\n")}\n` : "";
+    text = selectDotenvEntries(text, selected);
+    if (text === null) {
+      status.textContent = "Copy failed. Reload the configuration preview and try again.";
+      return;
+    }
   }
   void writeClipboard(text, status);
 });
