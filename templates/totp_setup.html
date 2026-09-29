@@ -5,13 +5,13 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Set up TOTP · ConfigDeck</title>
   <meta name="color-scheme" content="light dark">
-  <link rel="icon" type="image/svg+xml" href="/static/configdeck-logo.svg">
-  <link rel="stylesheet" href="/static/app.css">
-  <script src="/static/theme.js"></script>
+  <link rel="icon" type="image/svg+xml" href="/static/configdeck-logo.svg?v={{ crate::web::asset_version() }}">
+  <link rel="stylesheet" href="/static/app.css?v={{ crate::web::asset_version() }}">
+  <script src="/static/theme.js?v={{ crate::web::asset_version() }}"></script>
 </head>
 <body class="auth-body">
   <main class="auth-card">
-    <a class="auth-brand" href="/dashboard"><img class="brand-logo" src="/static/configdeck-logo.svg" alt=""><span><strong>ConfigDeck</strong><small>Configuration Management Platform</small></span></a>
+    <a class="auth-brand" href="/dashboard"><img class="brand-logo" src="/static/configdeck-logo.svg?v={{ crate::web::asset_version() }}" alt=""><span><strong>ConfigDeck</strong><small>Configuration Management Platform</small></span></a>
     <h1>Set up two-factor authentication</h1>
     <p>Scan this QR code with Google Authenticator or another TOTP application.</p>
     <div class="qr-code">

@@ -311,7 +311,12 @@ fn require_recent_administrator(
     capability: Capability,
 ) -> Result<(), AppError> {
     require_administrator(session, capability)?;
-    if sessions.has_recent_auth(session, PrivilegedAuthLevel::Standard) {
+    let level = if capability == Capability::CreateRestoreIntent {
+        PrivilegedAuthLevel::HighImpact
+    } else {
+        PrivilegedAuthLevel::Standard
+    };
+    if sessions.has_recent_auth(session, level) {
         Ok(())
     } else {
         Err(AppError::Forbidden)
@@ -825,6 +830,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restore_requires_explicit_high_impact_authentication() {
+        let pool = crate::db::test_pool().await;
+        let manager = SessionManager::new(
+            pool,
+            CryptoManager::new(zeroize::Zeroizing::new([31; 32])),
+            crate::config::SessionSettings {
+                cookie_name: "test".into(),
+                secure_cookie: false,
+                idle_timeout: time::Duration::minutes(30),
+                absolute_timeout: time::Duration::hours(12),
+                recent_auth_timeout: time::Duration::minutes(5),
+            },
+        );
+        let mut session = recent_administrator();
+        session.privileged_auth_level = Some(PrivilegedAuthLevel::Standard);
+        assert!(
+            super::require_recent_administrator(
+                &manager,
+                &session,
+                crate::users::Capability::CreateBackup
+            )
+            .is_ok()
+        );
+        assert!(
+            super::require_recent_administrator(
+                &manager,
+                &session,
+                crate::users::Capability::CreateRestoreIntent
+            )
+            .is_err()
+        );
+        session.privileged_auth_level = Some(PrivilegedAuthLevel::HighImpact);
+        assert!(
+            super::require_recent_administrator(
+                &manager,
+                &session,
+                crate::users::Capability::CreateRestoreIntent
+            )
+            .is_ok()
+        );
+        session.privileged_authenticated_at =
+            Some(OffsetDateTime::now_utc() - time::Duration::minutes(3));
+        assert!(
+            super::require_recent_administrator(
+                &manager,
+                &session,
+                crate::users::Capability::CreateRestoreIntent
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn operator_cannot_list_or_create_backups() {
         let root = tempdir().unwrap();
         let operations = OperationsSettings {
@@ -875,7 +933,7 @@ mod tests {
             },
             authentication_state: AuthenticationState::Full,
             privileged_authenticated_at: Some(OffsetDateTime::now_utc()),
-            privileged_auth_level: Some(PrivilegedAuthLevel::Standard),
+            privileged_auth_level: Some(PrivilegedAuthLevel::HighImpact),
         }
     }
 }

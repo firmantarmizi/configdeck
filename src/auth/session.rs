@@ -110,6 +110,7 @@ struct SessionRow {
     authentication_state: String,
     auth_version: i64,
     last_seen_at: String,
+    created_at: String,
     idle_expires_at: String,
     absolute_expires_at: String,
     privileged_authenticated_at: Option<String>,
@@ -141,6 +142,13 @@ impl SessionManager {
         user_agent: Option<&str>,
     ) -> Result<SessionTokens, AppError> {
         let now = OffsetDateTime::now_utc();
+        let absolute_timeout = if state == AuthenticationState::PasswordOnly {
+            self.settings
+                .absolute_timeout
+                .min(time::Duration::minutes(5))
+        } else {
+            self.settings.absolute_timeout
+        };
         let raw = random_token()?;
         let csrf = self.crypto.csrf_token(&raw).map_err(|_| AppError::Crypto)?;
         let token_hash = hash(raw.as_bytes());
@@ -160,8 +168,8 @@ impl SessionManager {
         .bind(state.as_str())
         .bind(format_time(now)?)
         .bind(format_time(now)?)
-        .bind(format_time(now + self.settings.idle_timeout)?)
-        .bind(format_time(now + self.settings.absolute_timeout)?)
+        .bind(format_time(now + self.settings.idle_timeout.min(absolute_timeout))?)
+        .bind(format_time(now + absolute_timeout)?)
         .bind(client_ip)
         .bind(user_agent_hash)
         .execute(&self.pool)
@@ -176,7 +184,7 @@ impl SessionManager {
         let token_hash = hash(raw_token.as_bytes());
         let row = sqlx::query_as::<_, SessionRow>(
             "SELECT s.id AS session_id, s.token_hash, s.csrf_token_hash, s.authentication_state, \
-                    s.auth_version, s.last_seen_at, s.idle_expires_at, s.absolute_expires_at, \
+                    s.auth_version, s.created_at, s.last_seen_at, s.idle_expires_at, s.absolute_expires_at, \
                     s.privileged_authenticated_at, s.privileged_auth_level, \
                     u.id AS user_id, u.organization_id, u.email, u.role, u.auth_version AS user_auth_version, \
                     u.active, u.totp_enabled_at, u.must_change_password \
@@ -198,6 +206,8 @@ impl SessionManager {
             || row.auth_version != row.user_auth_version
             || now >= idle_expires
             || now >= absolute_expires
+            || row.authentication_state == "PASSWORD_ONLY"
+                && now >= parse_time(&row.created_at)? + time::Duration::minutes(5)
         {
             self.revoke_by_id(&row.session_id, "expired_or_invalidated")
                 .await?;
@@ -277,6 +287,16 @@ impl SessionManager {
         state: AuthenticationState,
         privileged_level: Option<PrivilegedAuthLevel>,
     ) -> Result<SessionTokens, AppError> {
+        // Claim the old session once before issuing a replacement. A failure leaves it revoked.
+        let now = format_time(OffsetDateTime::now_utc())?;
+        if old.user.id != user.id {
+            return Err(AppError::Forbidden);
+        }
+        let claimed = sqlx::query("UPDATE sessions SET revoked_at = ?, revoke_reason = 'rotated' WHERE id = ? AND revoked_at IS NULL AND idle_expires_at > ? AND absolute_expires_at > ? AND ? = (SELECT auth_version FROM users WHERE id = sessions.user_id AND active = 1)")
+            .bind(&now).bind(&old.id).bind(&now).bind(&now).bind(user.auth_version).execute(&self.pool).await?;
+        if claimed.rows_affected() != 1 {
+            return Err(AppError::Unauthorized);
+        }
         let tokens = self.create(user, state, None, None).await?;
         if let Some(level) = privileged_level {
             let token_hash = hash(tokens.session_token.as_bytes());
@@ -290,7 +310,6 @@ impl SessionManager {
             .execute(&self.pool)
             .await?;
         }
-        self.revoke_by_id(&old.id, "rotated").await?;
         Ok(tokens)
     }
 
@@ -299,6 +318,11 @@ impl SessionManager {
         session: &AuthenticatedSession,
         required: PrivilegedAuthLevel,
     ) -> bool {
+        if session.authentication_state != AuthenticationState::Full
+            || session.user.must_change_password
+        {
+            return false;
+        }
         let Some(at) = session.privileged_authenticated_at else {
             return false;
         };
@@ -310,7 +334,15 @@ impl SessionManager {
                     PrivilegedAuthLevel::Standard
                 )
         );
-        level_ok && OffsetDateTime::now_utc() - at <= self.settings.recent_auth_timeout
+        let timeout = match required {
+            PrivilegedAuthLevel::Standard => self.settings.recent_auth_timeout,
+            PrivilegedAuthLevel::HighImpact => self
+                .settings
+                .recent_auth_timeout
+                .min(time::Duration::minutes(2)),
+        };
+        let elapsed = OffsetDateTime::now_utc() - at;
+        level_ok && elapsed >= time::Duration::ZERO && elapsed < timeout
     }
 
     async fn revoke_by_id(&self, id: &str, reason: &str) -> Result<(), AppError> {
@@ -410,6 +442,92 @@ mod tests {
             .await
             .unwrap();
         assert!(restarted_manager.load(&tokens.session_token).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn partial_sessions_expire_absolutely_and_rotate_only_once() {
+        let pool = test_pool().await;
+        seed_user(&pool).await;
+        let manager = manager(pool.clone());
+        let tokens = manager
+            .create(&user(), AuthenticationState::PasswordOnly, None, None)
+            .await
+            .unwrap();
+        let old = manager.load(&tokens.session_token).await.unwrap();
+        let lifetime: i64 = sqlx::query_scalar("SELECT unixepoch(absolute_expires_at) - unixepoch(created_at) FROM sessions WHERE id = ?")
+            .bind(&old.id).fetch_one(&pool).await.unwrap();
+        assert_eq!(lifetime, 300);
+        let new = manager
+            .rotate(
+                &old,
+                &old.user,
+                AuthenticationState::Full,
+                Some(super::PrivilegedAuthLevel::Standard),
+            )
+            .await
+            .unwrap();
+        assert!(manager.load(&tokens.session_token).await.is_err());
+        assert_ne!(new.csrf_token, tokens.csrf_token);
+        assert!(
+            manager
+                .rotate(&old, &old.user, AuthenticationState::Full, None)
+                .await
+                .is_err()
+        );
+        let expired = manager
+            .create(&user(), AuthenticationState::PasswordOnly, None, None)
+            .await
+            .unwrap();
+        let stale = manager.load(&expired.session_token).await.unwrap();
+        sqlx::query(
+            "UPDATE sessions SET absolute_expires_at = '2000-01-01T00:00:00Z' WHERE id = ?",
+        )
+        .bind(&stale.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(
+            manager
+                .rotate(&stale, &stale.user, AuthenticationState::Full, None)
+                .await
+                .is_err()
+        );
+        assert!(manager.load(&expired.session_token).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn recent_auth_requires_full_session_and_fixed_risk_windows() {
+        use super::PrivilegedAuthLevel::{HighImpact, Standard};
+        let pool = test_pool().await;
+        seed_user(&pool).await;
+        let manager = manager(pool);
+        let tokens = manager
+            .create(&user(), AuthenticationState::Full, None, None)
+            .await
+            .unwrap();
+        let mut session = manager.load(&tokens.session_token).await.unwrap();
+        session.privileged_authenticated_at = Some(time::OffsetDateTime::now_utc());
+        session.privileged_auth_level = Some(Standard);
+        assert!(manager.has_recent_auth(&session, Standard));
+        assert!(!manager.has_recent_auth(&session, HighImpact));
+        session.privileged_auth_level = Some(HighImpact);
+        assert!(manager.has_recent_auth(&session, HighImpact));
+        session.privileged_authenticated_at =
+            Some(time::OffsetDateTime::now_utc() - Duration::minutes(3));
+        assert!(!manager.has_recent_auth(&session, HighImpact));
+        assert!(manager.has_recent_auth(&session, Standard));
+        session.privileged_authenticated_at =
+            Some(time::OffsetDateTime::now_utc() - Duration::minutes(5));
+        assert!(!manager.has_recent_auth(&session, Standard));
+        session.privileged_authenticated_at =
+            Some(time::OffsetDateTime::now_utc() + Duration::minutes(1));
+        assert!(!manager.has_recent_auth(&session, Standard));
+        session.privileged_authenticated_at = Some(time::OffsetDateTime::now_utc());
+        session.authentication_state = AuthenticationState::PasswordOnly;
+        assert!(!manager.has_recent_auth(&session, Standard));
+        session.authentication_state = AuthenticationState::Full;
+        session.user.must_change_password = true;
+        assert!(!manager.has_recent_auth(&session, Standard));
     }
 
     fn manager(pool: sqlx::SqlitePool) -> SessionManager {

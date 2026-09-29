@@ -39,6 +39,7 @@ pub struct AuthService {
 pub struct AuthOutcome {
     pub tokens: SessionTokens,
     pub enrollment_required: bool,
+    pub challenge_required: bool,
     pub password_change_required: bool,
 }
 
@@ -99,14 +100,7 @@ impl AuthService {
     ) -> Result<AuthOutcome, AppError> {
         self.maybe_prune_ephemeral_auth_state().await;
         let normalized = normalize_email(email).map_err(|_| AppError::Authentication)?;
-        let account_hash = self
-            .crypto
-            .blind_index(b"login-account-index-v1", normalized.as_bytes())
-            .map_err(|_| AppError::Crypto)?;
-        let client_hash = self
-            .crypto
-            .blind_index(b"login-client-index-v1", client_identity.as_bytes())
-            .map_err(|_| AppError::Crypto)?;
+        let (account_hash, client_hash) = self.attempt_keys(&normalized, client_identity)?;
         if self.is_rate_limited(&account_hash, &client_hash).await? {
             return Err(AppError::RateLimited);
         }
@@ -152,27 +146,19 @@ impl AuthService {
             .role
             .parse()
             .map_err(|_: RoleParseError| AppError::Authentication)?;
-        let requires_totp = role.requires_totp() || user.require_totp_all;
-        let state = if requires_totp && user.totp_enabled_at.is_none() {
-            if user.totp_secret_ciphertext.is_none() {
-                self.create_pending_totp(&mut user).await?;
-            }
-            AuthenticationState::PasswordOnly
-        } else {
-            if requires_totp || user.totp_enabled_at.is_some() {
-                let code = totp_code.ok_or(AppError::Authentication)?;
-                self.verify_and_consume_totp(&user, code).await?;
-            }
-            AuthenticationState::Full
-        };
+        let state = self
+            .login_state(&mut user, role, totp_code, &account_hash, &client_hash)
+            .await?;
 
         let now = now_rfc3339().map_err(AppError::Internal)?;
-        sqlx::query("UPDATE users SET last_login_at = ?, updated_at = ? WHERE id = ?")
-            .bind(&now)
-            .bind(&now)
-            .bind(&user.id)
-            .execute(&self.pool)
-            .await?;
+        if state == AuthenticationState::Full {
+            sqlx::query("UPDATE users SET last_login_at = ?, updated_at = ? WHERE id = ?")
+                .bind(&now)
+                .bind(&now)
+                .bind(&user.id)
+                .execute(&self.pool)
+                .await?;
+        }
         self.record_attempt(&account_hash, &client_hash, true)
             .await?;
         self.audit_login(&user.id, client_identity, state).await?;
@@ -190,11 +176,118 @@ impl AuthService {
             .sessions
             .create(&session_user, state, Some(client_identity), user_agent)
             .await?;
+        let tokens = if state == AuthenticationState::Full
+            && session_user.totp_enabled
+            && !session_user.must_change_password
+        {
+            let initial = self.sessions.load(&tokens.session_token).await?;
+            self.sessions
+                .rotate(
+                    &initial,
+                    &session_user,
+                    AuthenticationState::Full,
+                    Some(PrivilegedAuthLevel::Standard),
+                )
+                .await?
+        } else {
+            tokens
+        };
         Ok(AuthOutcome {
             tokens,
-            enrollment_required: state == AuthenticationState::PasswordOnly,
+            enrollment_required: state == AuthenticationState::PasswordOnly
+                && !session_user.totp_enabled,
+            challenge_required: state == AuthenticationState::PasswordOnly
+                && session_user.totp_enabled,
             password_change_required: user.must_change_password,
         })
+    }
+
+    async fn login_state(
+        &self,
+        user: &mut UserAuthRow,
+        role: Role,
+        totp_code: Option<&str>,
+        account_hash: &[u8],
+        client_hash: &[u8],
+    ) -> Result<AuthenticationState, AppError> {
+        let requires_totp = role.requires_totp() || user.require_totp_all;
+        let state = if requires_totp && user.totp_enabled_at.is_none() {
+            if user.totp_secret_ciphertext.is_none() {
+                self.create_pending_totp(user).await?;
+            }
+            AuthenticationState::PasswordOnly
+        } else if user.totp_enabled_at.is_some() {
+            if let Some(code) = totp_code {
+                let verified = self.verify_and_consume_totp(user, code).await;
+                if verified.is_err() {
+                    self.record_attempt(account_hash, client_hash, false)
+                        .await?;
+                }
+                verified?;
+                AuthenticationState::Full
+            } else {
+                AuthenticationState::PasswordOnly
+            }
+        } else {
+            AuthenticationState::Full
+        };
+        Ok(state)
+    }
+
+    /// Completes a password-verified, short-lived session without retaining the password.
+    pub async fn complete_login_totp(
+        &self,
+        session: &AuthenticatedSession,
+        code: &str,
+        client_identity: &str,
+    ) -> Result<SessionTokens, AppError> {
+        if session.authentication_state != AuthenticationState::PasswordOnly
+            || !session.user.totp_enabled
+        {
+            return Err(AppError::Forbidden);
+        }
+        let user = self.load_user_auth(&session.user.id).await?;
+        if !user.active
+            || user.auth_version != session.user.auth_version
+            || user.totp_enabled_at.is_none()
+        {
+            return Err(AppError::Unauthorized);
+        }
+        let (account_hash, client_hash) = self.attempt_keys(&user.email, client_identity)?;
+        if self.is_rate_limited(&account_hash, &client_hash).await? {
+            return Err(AppError::RateLimited);
+        }
+        let verified = self.verify_and_consume_totp(&user, code).await;
+        self.record_attempt(&account_hash, &client_hash, verified.is_ok())
+            .await?;
+        verified?;
+        let level = (!user.must_change_password).then_some(PrivilegedAuthLevel::Standard);
+        let tokens = self
+            .sessions
+            .rotate(session, &session.user, AuthenticationState::Full, level)
+            .await?;
+        let now = now_rfc3339().map_err(AppError::Internal)?;
+        sqlx::query("UPDATE users SET last_login_at = ?, updated_at = ? WHERE id = ?")
+            .bind(&now)
+            .bind(&now)
+            .bind(&user.id)
+            .execute(&self.pool)
+            .await?;
+        self.audit_login(&user.id, client_identity, AuthenticationState::Full)
+            .await?;
+        Ok(tokens)
+    }
+
+    fn attempt_keys(&self, email: &str, client: &str) -> Result<(Vec<u8>, Vec<u8>), AppError> {
+        let email = normalize_email(email).map_err(|_| AppError::Authentication)?;
+        Ok((
+            self.crypto
+                .blind_index(b"login-account-index-v1", email.as_bytes())
+                .map_err(|_| AppError::Crypto)?,
+            self.crypto
+                .blind_index(b"login-client-index-v1", client.as_bytes())
+                .map_err(|_| AppError::Crypto)?,
+        ))
     }
 
     pub async fn enrollment_data(
@@ -227,14 +320,22 @@ impl AuthService {
         if row.totp_enabled_at.is_some() {
             return Err(AppError::Forbidden);
         }
+        let (account_hash, client_hash) =
+            self.attempt_keys(&row.email, &format!("enrollment:{}", row.id))?;
+        if self.is_rate_limited(&account_hash, &client_hash).await? {
+            return Err(AppError::RateLimited);
+        }
         let seed = self.decrypt_seed(&row)?;
-        let step = totp::verify_at(
+        let verified = totp::verify_at(
             &seed,
             code,
             OffsetDateTime::now_utc().unix_timestamp(),
             None,
         )
-        .map_err(|_| AppError::Authentication)?;
+        .map_err(|_| AppError::Authentication);
+        self.record_attempt(&account_hash, &client_hash, verified.is_ok())
+            .await?;
+        let step = verified?;
         let now = now_rfc3339().map_err(AppError::Internal)?;
         let mut transaction = self.pool.begin().await?;
         let result = sqlx::query(
@@ -287,12 +388,19 @@ impl AuthService {
     ) -> Result<SessionTokens, AppError> {
         session.require_full()?;
         let user = self.load_user_auth(&session.user.id).await?;
+        let (account_hash, client_hash) =
+            self.attempt_keys(&user.email, &format!("recent:{}", user.id))?;
+        if self.is_rate_limited(&account_hash, &client_hash).await? {
+            return Err(AppError::RateLimited);
+        }
         let valid = self
             .passwords
             .verify(password, user.password_hash.clone())
             .await
             .map_err(|error| AppError::Internal(anyhow!(error)))?;
-        if !valid || !user.active {
+        if !valid || !user.active || user.auth_version != session.user.auth_version {
+            self.record_attempt(&account_hash, &client_hash, false)
+                .await?;
             return Err(AppError::Authentication);
         }
         if user
@@ -303,8 +411,14 @@ impl AuthService {
             || user.require_totp_all
             || user.totp_enabled_at.is_some()
         {
-            self.verify_and_consume_totp(&user, totp_code.ok_or(AppError::Authentication)?)
-                .await?;
+            let verified = self
+                .verify_and_consume_totp(&user, totp_code.unwrap_or(""))
+                .await;
+            if verified.is_err() {
+                self.record_attempt(&account_hash, &client_hash, false)
+                    .await?;
+            }
+            verified?;
         }
         self.sessions
             .rotate(
@@ -388,11 +502,12 @@ impl AuthService {
         .map_err(|_| AppError::Authentication)?;
         let result = sqlx::query(
             "UPDATE users SET totp_last_used_step = ? WHERE id = ? \
-             AND (totp_last_used_step IS NULL OR totp_last_used_step < ?)",
+             AND (totp_last_used_step IS NULL OR totp_last_used_step < ?) AND active = 1 AND auth_version = ? AND totp_enabled_at IS NOT NULL",
         )
         .bind(step)
         .bind(&user.id)
         .bind(step)
+        .bind(user.auth_version)
         .execute(&self.pool)
         .await?;
         if result.rows_affected() == 1 {
@@ -641,6 +756,277 @@ mod tests {
         let full = sessions.load(&full_tokens.session_token).await.unwrap();
         assert_eq!(full.authentication_state, AuthenticationState::Full);
         assert!(full.user.totp_enabled);
+        assert!(!sessions.has_recent_auth(&full, crate::auth::PrivilegedAuthLevel::Standard));
+    }
+
+    async fn enrolled_login_fixture() -> (sqlx::SqlitePool, AuthService, SessionManager, Vec<u8>) {
+        let pool = test_pool().await;
+        let crypto = CryptoManager::new(Zeroizing::new([21; 32]));
+        initialize_and_validate_key_registry(&pool, &crypto)
+            .await
+            .unwrap();
+        let passwords = PasswordService::for_tests();
+        bootstrap_initial_admin(
+            &pool,
+            &crypto,
+            &passwords,
+            &BootstrapSettings {
+                admin_email: Some("admin@example.test".into()),
+                admin_password: Some(Zeroizing::new("synthetic-password".into())),
+            },
+        )
+        .await
+        .unwrap();
+        let sessions = SessionManager::new(
+            pool.clone(),
+            crypto.clone(),
+            SessionSettings {
+                cookie_name: "test".into(),
+                secure_cookie: false,
+                idle_timeout: Duration::minutes(30),
+                absolute_timeout: Duration::hours(12),
+                recent_auth_timeout: Duration::minutes(5),
+            },
+        );
+        let auth = AuthService::new(pool.clone(), crypto, passwords, sessions.clone())
+            .await
+            .unwrap();
+        let pending = auth
+            .authenticate(
+                "admin@example.test",
+                Zeroizing::new("synthetic-password".into()),
+                None,
+                "test-client",
+                None,
+            )
+            .await
+            .unwrap();
+        let enrollment = auth
+            .enrollment_data(&sessions.load(&pending.tokens.session_token).await.unwrap())
+            .await
+            .unwrap();
+        let seed = BASE32_NOPAD
+            .decode(enrollment.encoded_secret.as_bytes())
+            .unwrap();
+        // Model an already enrolled account; no authenticator code has been consumed yet.
+        sqlx::query("UPDATE users SET totp_enabled_at = '2026-01-01T00:00:00Z', must_change_password = 0, auth_version = auth_version + 1").execute(&pool).await.unwrap();
+        (pool, auth, sessions, seed)
+    }
+
+    #[tokio::test]
+    async fn enrolled_login_requires_second_step_and_grants_only_standard_recent_auth() {
+        use crate::auth::PrivilegedAuthLevel::{HighImpact, Standard};
+        let (pool, auth, sessions, seed) = enrolled_login_fixture().await;
+        assert!(
+            auth.authenticate(
+                "admin@example.test",
+                Zeroizing::new("wrong".into()),
+                None,
+                "test-client",
+                None
+            )
+            .await
+            .is_err()
+        );
+        let outcome = auth
+            .authenticate(
+                "admin@example.test",
+                Zeroizing::new("synthetic-password".into()),
+                None,
+                "test-client",
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(outcome.challenge_required);
+        assert!(!outcome.enrollment_required);
+        let partial = sessions.load(&outcome.tokens.session_token).await.unwrap();
+        assert!(partial.require_full().is_err());
+        assert!(!sessions.has_recent_auth(&partial, Standard));
+        assert!(auth.enrollment_data(&partial).await.is_err());
+        assert!(auth.confirm_totp(&partial, "000000").await.is_err());
+        assert!(
+            auth.recent_authenticate(
+                &partial,
+                Zeroizing::new("synthetic-password".into()),
+                None,
+                HighImpact
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            auth.complete_login_totp(&partial, "invalid", "test-client")
+                .await
+                .is_err()
+        );
+        let expired_code = totp::code_at(
+            &seed,
+            time::OffsetDateTime::now_utc().unix_timestamp() - 300,
+        );
+        assert!(
+            auth.complete_login_totp(&partial, &expired_code, "test-client")
+                .await
+                .is_err()
+        );
+        let code = totp::code_at(&seed, time::OffsetDateTime::now_utc().unix_timestamp());
+        let tokens = auth
+            .complete_login_totp(&partial, &code, "test-client")
+            .await
+            .unwrap();
+        assert!(sessions.load(&outcome.tokens.session_token).await.is_err());
+        let full = sessions.load(&tokens.session_token).await.unwrap();
+        assert!(full.require_full().is_ok());
+        assert!(sessions.has_recent_auth(&full, Standard));
+        assert!(!sessions.has_recent_auth(&full, HighImpact));
+        assert!(
+            auth.complete_login_totp(&partial, &code, "test-client")
+                .await
+                .is_err()
+        );
+        let next = auth
+            .authenticate(
+                "admin@example.test",
+                Zeroizing::new("synthetic-password".into()),
+                None,
+                "other-client",
+                None,
+            )
+            .await
+            .unwrap();
+        let next = sessions.load(&next.tokens.session_token).await.unwrap();
+        assert!(
+            auth.complete_login_totp(&next, &code, "other-client")
+                .await
+                .is_err()
+        );
+        let events: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM audit_logs WHERE action = 'LOGIN'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(events, 1);
+    }
+
+    #[tokio::test]
+    async fn login_with_forced_password_change_does_not_grant_recent_auth() {
+        let (pool, auth, sessions, seed) = enrolled_login_fixture().await;
+        sqlx::query("UPDATE users SET must_change_password = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let outcome = auth
+            .authenticate(
+                "admin@example.test",
+                Zeroizing::new("synthetic-password".into()),
+                None,
+                "test",
+                None,
+            )
+            .await
+            .unwrap();
+        let partial = sessions.load(&outcome.tokens.session_token).await.unwrap();
+        let code = totp::code_at(&seed, time::OffsetDateTime::now_utc().unix_timestamp());
+        let tokens = auth
+            .complete_login_totp(&partial, &code, "test")
+            .await
+            .unwrap();
+        let full = sessions.load(&tokens.session_token).await.unwrap();
+        assert!(full.user.must_change_password);
+        assert!(full.privileged_authenticated_at.is_none());
+        assert!(!sessions.has_recent_auth(&full, crate::auth::PrivilegedAuthLevel::Standard));
+    }
+
+    #[tokio::test]
+    async fn recent_auth_wrong_password_attempts_are_throttled() {
+        let (_, auth, sessions, seed) = enrolled_login_fixture().await;
+        let outcome = auth
+            .authenticate(
+                "admin@example.test",
+                Zeroizing::new("synthetic-password".into()),
+                None,
+                "test",
+                None,
+            )
+            .await
+            .unwrap();
+        let partial = sessions.load(&outcome.tokens.session_token).await.unwrap();
+        let code = totp::code_at(&seed, time::OffsetDateTime::now_utc().unix_timestamp());
+        let tokens = auth
+            .complete_login_totp(&partial, &code, "test")
+            .await
+            .unwrap();
+        let full = sessions.load(&tokens.session_token).await.unwrap();
+        for _ in 0..5 {
+            assert!(matches!(
+                auth.recent_authenticate(
+                    &full,
+                    Zeroizing::new("wrong".into()),
+                    None,
+                    crate::auth::PrivilegedAuthLevel::HighImpact
+                )
+                .await,
+                Err(AppError::Authentication)
+            ));
+        }
+        assert!(matches!(
+            auth.recent_authenticate(
+                &full,
+                Zeroizing::new("wrong".into()),
+                None,
+                crate::auth::PrivilegedAuthLevel::HighImpact
+            )
+            .await,
+            Err(AppError::RateLimited)
+        ));
+    }
+
+    #[tokio::test]
+    async fn second_factor_attempts_are_throttled_and_cannot_bypass_revocation() {
+        let (pool, auth, sessions, seed) = enrolled_login_fixture().await;
+        let outcome = auth
+            .authenticate(
+                "admin@example.test",
+                Zeroizing::new("synthetic-password".into()),
+                None,
+                "test-client",
+                None,
+            )
+            .await
+            .unwrap();
+        let partial = sessions.load(&outcome.tokens.session_token).await.unwrap();
+        for _ in 0..5 {
+            assert!(matches!(
+                auth.complete_login_totp(&partial, "invalid", "test-client")
+                    .await,
+                Err(AppError::Authentication)
+            ));
+        }
+        assert!(matches!(
+            auth.complete_login_totp(&partial, "invalid", "test-client")
+                .await,
+            Err(AppError::RateLimited)
+        ));
+        sqlx::query("DELETE FROM login_attempts")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sessions
+            .revoke(&outcome.tokens.session_token, "test")
+            .await
+            .unwrap();
+        let code = totp::code_at(&seed, time::OffsetDateTime::now_utc().unix_timestamp());
+        assert!(
+            auth.complete_login_totp(&partial, &code, "test-client")
+                .await
+                .is_err()
+        );
+        let full: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE authentication_state = 'FULL'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(full, 0);
     }
 
     #[tokio::test]

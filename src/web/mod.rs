@@ -65,6 +65,10 @@ const BUILD_INFO: BuildInfo = BuildInfo {
     revision: env!("CONFIGDECK_BUILD_REVISION"),
 };
 
+fn asset_version() -> &'static str {
+    BUILD_INFO.id
+}
+
 #[derive(Clone, Copy)]
 struct AppPermissions {
     can_manage_users: bool,
@@ -76,6 +80,13 @@ struct AppPermissions {
 #[template(path = "login.html")]
 struct LoginTemplate<'a> {
     csrf_token: &'a str,
+}
+
+#[derive(Template)]
+#[template(path = "login_totp.html")]
+struct LoginTotpTemplate<'a> {
+    csrf_token: &'a str,
+    error: &'a str,
 }
 
 #[derive(Template)]
@@ -309,6 +320,7 @@ struct RecentAuthTemplate<'a> {
     return_to: &'a str,
     cancel_to: &'a str,
     high_impact: bool,
+    totp_required: bool,
 }
 
 #[derive(Template)]
@@ -325,7 +337,6 @@ struct ErrorPageTemplate<'a> {
 struct LoginForm {
     email: String,
     password: String,
-    totp_code: Option<String>,
     csrf_token: String,
 }
 
@@ -618,6 +629,11 @@ fn core_routes() -> Router<AppState> {
             "/maintenance/environments/{id}/rotate-dek",
             post(dek_rotate),
         )
+        .route(
+            "/auth/totp/challenge",
+            get(login_totp_page).post(login_totp),
+        )
+        .route("/auth/totp/cancel", post(login_totp_cancel))
         .route("/auth/totp/setup", get(totp_setup).post(totp_confirm))
         .route("/auth/recent", get(recent_auth_page).post(recent_auth))
 }
@@ -865,12 +881,14 @@ async fn login(
         .authenticate(
             &form.email,
             Zeroizing::new(form.password),
-            form.totp_code.as_deref().filter(|value| !value.is_empty()),
+            None,
             client_identity,
             user_agent,
         )
         .await?;
-    let destination = if outcome.enrollment_required {
+    let destination = if outcome.challenge_required {
+        "/auth/totp/challenge"
+    } else if outcome.enrollment_required {
         "/auth/totp/setup"
     } else if outcome.password_change_required {
         "/account/password"
@@ -892,13 +910,108 @@ async fn login(
     Ok(response)
 }
 
+async fn login_totp_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    let (raw, session) = match authenticated_raw(&state, &headers).await {
+        Ok(value) => value,
+        Err(AppError::Unauthorized) => return Ok(Redirect::to("/login").into_response()),
+        Err(error) => return Err(error),
+    };
+    if session.authentication_state == crate::auth::AuthenticationState::Full {
+        return Ok(Redirect::to("/dashboard").into_response());
+    }
+    if !session.user.totp_enabled {
+        return Ok(Redirect::to("/auth/totp/setup").into_response());
+    }
+    let csrf = state
+        .crypto
+        .csrf_token(&raw)
+        .map_err(|_| AppError::Crypto)?;
+    Ok(Html(
+        LoginTotpTemplate {
+            csrf_token: &csrf,
+            error: "",
+        }
+        .render()?,
+    )
+    .into_response())
+}
+
+async fn login_totp(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    client: Option<axum::extract::Extension<ClientIdentity>>,
+    Form(form): Form<TotpConfirmForm>,
+) -> Result<Response, AppError> {
+    let (_, session) = authenticated_raw(&state, &headers).await?;
+    state.sessions.verify_csrf(&session, &form.csrf_token)?;
+    let identity = client
+        .as_ref()
+        .map_or("unknown", |value| value.0.0.as_str());
+    let tokens = match state
+        .auth
+        .complete_login_totp(&session, &form.code, identity)
+        .await
+    {
+        Ok(tokens) => tokens,
+        Err(error @ (AppError::Authentication | AppError::RateLimited)) => {
+            let limited = matches!(error, AppError::RateLimited);
+            return Ok((if limited { StatusCode::TOO_MANY_REQUESTS } else { StatusCode::BAD_REQUEST }, Html(LoginTotpTemplate {
+                csrf_token: &form.csrf_token,
+                error: if limited { "Too many attempts. Wait briefly before trying again." } else { "Code invalid or already used. Enter the latest code from your authenticator." },
+            }.render()?)).into_response());
+        }
+        Err(error) => return Err(error),
+    };
+    let destination = if session.user.must_change_password {
+        "/account/password"
+    } else {
+        "/dashboard"
+    };
+    let mut response = Redirect::to(destination).into_response();
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        session_cookie(&state, &tokens.session_token)?,
+    );
+    Ok(response)
+}
+
+async fn login_totp_cancel(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<CsrfForm>,
+) -> Result<Response, AppError> {
+    let (raw, session) = authenticated_raw(&state, &headers).await?;
+    state.sessions.verify_csrf(&session, &form.csrf_token)?;
+    if session.authentication_state != crate::auth::AuthenticationState::PasswordOnly {
+        return Err(AppError::Forbidden);
+    }
+    state.sessions.revoke(&raw, "login_cancelled").await?;
+    let mut response = Redirect::to("/login").into_response();
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        expire_cookie(
+            &state.settings.session.cookie_name,
+            state.settings.session.secure_cookie,
+        )?,
+    );
+    Ok(response)
+}
+
 async fn dashboard(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
     let (raw, session) = authenticated_raw(&state, &headers).await?;
     if session.authentication_state != crate::auth::AuthenticationState::Full {
-        return Ok(Redirect::to("/auth/totp/setup").into_response());
+        return Ok(Redirect::to(if session.user.totp_enabled {
+            "/auth/totp/challenge"
+        } else {
+            "/auth/totp/setup"
+        })
+        .into_response());
     }
     if session.user.must_change_password {
         return Ok(Redirect::to("/account/password").into_response());
@@ -1202,9 +1315,9 @@ async fn restore_intent_create(
     }
     if !state
         .sessions
-        .has_recent_auth(&session, PrivilegedAuthLevel::Standard)
+        .has_recent_auth(&session, PrivilegedAuthLevel::HighImpact)
     {
-        return Ok(Redirect::to("/auth/recent?return_to=/maintenance").into_response());
+        return Ok(Redirect::to("/auth/recent?return_to=/maintenance&level=high").into_response());
     }
     operations::create_restore_intent(
         &state.pool,
@@ -2824,6 +2937,7 @@ async fn recent_auth_page(
             return_to: &return_to,
             cancel_to: &cancel_to,
             high_impact: query.level == "high",
+            totp_required: session.user.totp_enabled || session.user.role.requires_totp(),
         }
         .render()?,
     )
@@ -2867,7 +2981,7 @@ fn recent_auth_cancel_target(return_to: &str) -> String {
     match segments.as_slice() {
         [
             "",
-            "dashboard" | "users" | "maintenance" | "change-requests",
+            "dashboard" | "users" | "maintenance" | "change-requests" | "services",
         ] => path.to_owned(),
         [
             "",
@@ -2877,6 +2991,14 @@ fn recent_auth_cancel_target(return_to: &str) -> String {
         ] if Uuid::parse_str(id).is_ok() => {
             format!("/environments/{id}/variables")
         }
+        ["", "change-requests", "preview"] => "/change-requests".to_owned(),
+        ["", "change-requests", id, "preview"] if Uuid::parse_str(id).is_ok() => {
+            format!("/change-requests/{id}")
+        }
+        ["", "variables", id, "reveal" | "copy"] if Uuid::parse_str(id).is_ok() => {
+            format!("/variables/{id}/history")
+        }
+        ["", "services", id, "environments"] if Uuid::parse_str(id).is_ok() => path.to_owned(),
         ["", "variables", id, "history"] | ["", "change-requests", id]
             if Uuid::parse_str(id).is_ok() =>
         {
@@ -3040,7 +3162,7 @@ fn friendly_error_copy(status: StatusCode, path: &str) -> (&'static str, &'stati
     if status == StatusCode::BAD_REQUEST && path == "/login" {
         return (
             "Sign-in unsuccessful",
-            "Check your email, password, and six-digit authenticator code, then try again.",
+            "Check your email and password, then try again.",
         );
     }
     match status {
@@ -3304,6 +3426,14 @@ mod tests {
                 format!("/environments/{id}/variables")
             );
         }
+        assert_eq!(
+            recent_auth_cancel_target(&format!("/change-requests/{id}/preview?selected=anything")),
+            format!("/change-requests/{id}")
+        );
+        assert_eq!(
+            recent_auth_cancel_target(&format!("/variables/{id}/reveal")),
+            format!("/variables/{id}/history")
+        );
         for path in [
             "/dashboard".to_owned(),
             "/users".to_owned(),
@@ -3518,6 +3648,152 @@ mod tests {
         assert!(cookie.contains("HttpOnly"));
         assert!(cookie.contains("SameSite=Strict"));
         assert!(cookie.starts_with("__Host-configdeck_login_csrf="));
+    }
+
+    async fn auth_form(
+        state: &AppState,
+        path: &str,
+        cookie: &str,
+        body: String,
+    ) -> axum::response::Response {
+        router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header(header::COOKIE, cookie)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn login_page_versions_assets_and_does_not_ask_for_totp_before_password() {
+        let state = response_state().await;
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/login")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let html = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(html.contains("name=\"password\""));
+        assert!(!html.contains("name=\"totp_code\""));
+        for asset in ["app.css", "theme.js", "configdeck-logo.svg"] {
+            let url = format!("/static/{asset}?v={}", super::asset_version());
+            assert!(html.contains(&url));
+            let response = router(state.clone())
+                .oneshot(Request::builder().uri(url).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+    }
+
+    #[tokio::test]
+    async fn challenge_routes_enforce_csrf_isolation_and_cancellation() {
+        let state = response_state().await;
+        seed_registry_identities(&state.pool).await;
+        let encrypted = state
+            .crypto
+            .encrypt_totp_seed("admin", 1, &[42; 20])
+            .unwrap();
+        sqlx::query("UPDATE users SET totp_enabled_at = '2026-01-01T00:00:00Z', totp_secret_ciphertext = ?, totp_secret_nonce = ?, totp_crypto_version = 1, totp_kek_version = 1 WHERE id = 'admin'")
+            .bind(encrypted.ciphertext)
+            .bind(encrypted.nonce.to_vec())
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let tokens = state
+            .sessions
+            .create(
+                &test_session("admin", Role::Administrator).user,
+                AuthenticationState::PasswordOnly,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let cookie = format!("__Host-configdeck_session={}", tokens.session_token);
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/auth/totp/challenge")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(html.contains("autocomplete=\"one-time-code\""));
+        assert!(!html.contains("name=\"password\""));
+        for path in ["/auth/totp/challenge", "/auth/totp/cancel"] {
+            let response =
+                auth_form(&state, path, &cookie, "csrf_token=wrong&code=123456".into()).await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+        for path in [
+            "/users",
+            "/maintenance",
+            "/api/services",
+            "/auth/recent",
+            "/auth/totp/setup",
+        ] {
+            let response = router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .header(header::COOKIE, &cookie)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "partial session accessed {path}"
+            );
+        }
+        let response = auth_form(
+            &state,
+            "/auth/totp/cancel",
+            &cookie,
+            format!("csrf_token={}", tokens.csrf_token),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers()[header::LOCATION], "/login");
+        assert!(state.sessions.load(&tokens.session_token).await.is_err());
+        let response = auth_form(
+            &state,
+            "/auth/totp/challenge",
+            &cookie,
+            format!("csrf_token={}&code=123456", tokens.csrf_token),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -4089,6 +4365,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancel_recent_auth_from_administration_returns_to_unprivileged_get() {
+        let mut fixture = preview_fixture().await;
+        fixture.tokens = fixture
+            .state
+            .sessions
+            .create(
+                &test_session("admin", Role::Administrator).user,
+                AuthenticationState::Full,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        for target in ["/users", "/change-requests", "/services"] {
+            let response = preview_get(
+                &fixture,
+                &format!("/auth/recent?return_to={target}&level=high"),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let html = String::from_utf8(
+                axum::body::to_bytes(response.into_body(), 64 * 1024)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            assert!(html.contains(&format!("class=\"auth-cancel\" href=\"{target}\"")));
+            assert_eq!(preview_get(&fixture, target).await.status(), StatusCode::OK);
+            let session = fixture
+                .state
+                .sessions
+                .load(&fixture.tokens.session_token)
+                .await
+                .unwrap();
+            assert!(session.privileged_authenticated_at.is_none());
+        }
+    }
+
+    #[tokio::test]
     async fn redacted_preview_preserves_public_data_and_never_decrypts_restricted_values() {
         let fixture = preview_fixture().await;
         let path = format!("/environments/{}/preview", fixture.environment_id);
@@ -4289,7 +4605,10 @@ mod tests {
         )
         .unwrap();
         assert!(workspace.contains("Archive environment staging"));
-        assert!(workspace.contains(&format!("ConfigDeck v{}", env!("CARGO_PKG_VERSION"))));
+        assert!(workspace.contains(&format!(
+            "ConfigDeck <strong>v{}</strong>",
+            env!("CARGO_PKG_VERSION")
+        )));
         assert!(workspace.contains(env!("CONFIGDECK_BUILD_ID")));
         sqlx::query("UPDATE variables SET encrypted_value = zeroblob(16)")
             .execute(&fixture.state.pool)

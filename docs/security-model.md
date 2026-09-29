@@ -22,7 +22,9 @@ Back up the database and the matching master key separately. Losing the master k
 - Account and client throttling uses exponential backoff without a permanent count-based lockout.
 - CSRF tokens are bound to the session and required for unsafe requests.
 
-Sensitive actions use just-in-time recent authentication. Reveal, export, backup, restore intent, and key rotation require fresh password/TOTP assurance in addition to normal role and scope checks.
+Login verifies email and password before asking enrolled users for a TOTP code. The intermediate session expires after five minutes, has no application access, and retains no password. Completing TOTP rotates the session and CSRF token. Enrollment and accounts requiring a password change do not receive recent-auth assurance.
+
+A completed enrolled MFA login grants standard recent authentication for five minutes, so ordinary protected actions such as reveal, export, and backup do not immediately ask again. This is a fixed window, not extended by activity. Restore intent and key rotation require separate high-impact password/TOTP verification with a two-minute window. Every operation still checks role and scope. TOTP timesteps cannot be reused, including between login and high-impact verification; a new authenticator code may be required. Failed second-factor and recent-auth attempts are throttled.
 
 ## Authorization
 
@@ -34,7 +36,8 @@ Sensitive actions use just-in-time recent authentication. Reveal, export, backup
 | Review, fulfill, reject, and record applied changes | No | Yes | Yes |
 | Preview/export a resolved environment | No | Recent auth | Recent auth |
 | Manage Apps, environments, users, and grants | No | No | Yes |
-| Backup, restore intent, and key rotation | No | No | High-impact recent auth |
+| Backup | No | No | Recent auth |
+| Restore intent and key rotation | No | No | High-impact recent auth |
 | View audit log | No | Yes | Yes |
 
 Inactive users are always denied. Contributor access is App-scoped. The backend performs the same checks regardless of whether a request originated from the HTML interface or a direct HTTP call.
@@ -43,6 +46,7 @@ Inactive users are always denied. Contributor access is App-scoped. The backend 
 
 - Askama escaping, a restrictive Content Security Policy, frame denial, MIME sniffing protection, and a strict referrer policy reduce browser attack surface.
 - Sensitive pages use `Cache-Control: no-store` and `Pragma: no-cache`.
+- Public static asset URLs include a build fingerprint, allowing browsers to refresh styles and scripts after deployment while caching each build.
 - Plaintext values are never placed in URLs, browser storage, global JavaScript state, logs, or audit metadata.
 - Reveal and export are explicit actions. Restricted values remain masked on ordinary pages.
 - The comparison workspace only decrypts a logical key when its visibility is consistently public. Any restricted current value or proposal makes the complete key fail closed and masked across environments until the metadata is normalized.

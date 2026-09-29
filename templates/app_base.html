@@ -5,10 +5,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
   <title>{% block title %}ConfigDeck{% endblock %}</title>
-  <link rel="icon" type="image/svg+xml" href="/static/configdeck-logo.svg">
-  <link rel="stylesheet" href="/static/app.css">
-  <script src="/static/theme.js"></script>
-  <script src="/static/app.js" defer></script>
+  <link rel="icon" type="image/svg+xml" href="/static/configdeck-logo.svg?v={{ crate::web::asset_version() }}">
+  <link rel="stylesheet" href="/static/app.css?v={{ crate::web::asset_version() }}">
+  <script src="/static/theme.js?v={{ crate::web::asset_version() }}"></script>
+  <script src="/static/app.js?v={{ crate::web::asset_version() }}" defer></script>
 </head>
 <body class="app-body">
   <svg class="icon-sprite" aria-hidden="true" focusable="false">
@@ -45,7 +45,7 @@
   </svg>
   <div class="app-shell">
     <aside class="sidebar" aria-label="Primary navigation">
-      <a class="brand" href="/dashboard"><img class="brand-logo" src="/static/configdeck-logo.svg" alt=""><span class="brand-copy"><strong>ConfigDeck</strong><small>Configuration Management Platform</small></span></a>
+      <a class="brand" href="/dashboard"><img class="brand-logo" src="/static/configdeck-logo.svg?v={{ crate::web::asset_version() }}" alt=""><span class="brand-copy"><strong>ConfigDeck</strong><small>Configuration Management Platform</small></span></a>
       <nav class="primary-nav">
         <a href="/dashboard" class="nav-item{% if chrome.active_nav == "overview" %} is-active{% endif %}" title="Overview"><span class="nav-icon" aria-hidden="true"><svg class="icon"><use href="#icon-home"></use></svg></span><span class="nav-copy"><strong>Overview</strong></span></a>
         <a href="/services" class="nav-item{% if chrome.active_nav == "configurations" %} is-active{% endif %}" title="Configurations"><span class="nav-icon" aria-hidden="true"><svg class="icon"><use href="#icon-layers"></use></svg></span><span class="nav-copy"><strong>Configurations</strong></span></a>
@@ -54,7 +54,7 @@
         {% if chrome.permissions.can_view_audit %}<a href="/audit" class="nav-item{% if chrome.active_nav == "audit" %} is-active{% endif %}" title="Audit log"><span class="nav-icon" aria-hidden="true"><svg class="icon"><use href="#icon-audit"></use></svg></span><span class="nav-copy"><strong>Audit log</strong></span></a>{% endif %}
         {% if chrome.permissions.can_manage_system %}<a href="/maintenance" class="nav-item{% if chrome.active_nav == "maintenance" %} is-active{% endif %}" title="Maintenance"><span class="nav-icon" aria-hidden="true"><svg class="icon"><use href="#icon-maintenance"></use></svg></span><span class="nav-copy"><strong>Maintenance</strong></span></a>{% endif %}
       </nav>
-      <div class="app-version" title="Build {{ chrome.build.id }} · revision {{ chrome.build.revision }}">v{{ chrome.build.version }}<small>Build {{ chrome.build.id }}</small></div>
+      <div class="app-version">ConfigDeck <span>v{{ chrome.build.version }}</span></div>
       <div class="sidebar-footer">
         <button type="button" class="sidebar-collapse" data-sidebar-toggle aria-expanded="true" aria-label="Collapse sidebar" title="Collapse sidebar"><span class="sidebar-arrow sidebar-arrow-collapse" aria-hidden="true">&lt;</span><span class="sidebar-arrow sidebar-arrow-expand" aria-hidden="true">&gt;</span></button>
       </div>
@@ -68,7 +68,8 @@
           <details class="account-menu topbar-account">
             <summary aria-label="Open account menu for {{ chrome.user_email }}"><span class="account-avatar" aria-hidden="true">●</span><span class="account-copy"><strong>{{ chrome.user_email }}</strong><small>{{ chrome.user_role }}</small></span><svg class="icon account-chevron" aria-hidden="true"><use href="#icon-chevron-down"></use></svg></summary>
             <div class="account-popover">
-              <p class="account-version">ConfigDeck v{{ chrome.build.version }}<small>Build {{ chrome.build.id }}</small><small>Revision {{ chrome.build.revision }}</small></p>
+              <p class="account-version">ConfigDeck <strong>v{{ chrome.build.version }}</strong></p>
+              <details class="build-details"><summary>Build details</summary><dl><dt>Build ID</dt><dd>{{ chrome.build.id }}</dd><dt>Revision</dt><dd>{{ chrome.build.revision }}</dd></dl></details>
               {% if chrome.recent_active %}<p class="security-state is-active"><span></span>Sensitive actions unlocked briefly</p>{% endif %}
               <form method="post" action="/logout" class="account-logout"><input type="hidden" name="csrf_token" value="{{ chrome.csrf_token }}"><button type="submit" class="menu-button">Sign out</button></form>
             </div>

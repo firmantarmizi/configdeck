@@ -15,7 +15,7 @@ Keep database and master-key backups in separate protected locations. A backup i
 
 ## Offline restore
 
-ConfigDeck never replaces its live database through HTTP.
+ConfigDeck never replaces its live database through HTTP. Creating a restore intent requires separate high-impact password/TOTP verification, valid for two minutes. Recent MFA sign-in alone does not authorize restore or key rotation. Use a new authenticator code if the previous code has already been consumed.
 
 1. In **Maintenance**, select the snapshot and create a restore intent using a non-secret reason.
 2. Record the identifier and expected SHA-256 displayed by ConfigDeck.

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.3
+
+- Refresh static assets automatically per build; simplify version details and tighten preview line-number spacing.
+- Separate password and authenticator login steps with a short-lived, restricted challenge session.
+- Count completed MFA sign-in as five-minute standard recent authentication; retain explicit two-minute verification for restore/key rotation.
+- Rate-limit authenticator and reauthentication attempts, rotate sessions after verification, and expand safe cancellation navigation.
+
 ## 0.1.2
 
 ### Added
