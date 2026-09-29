@@ -5,9 +5,53 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use crate::{auth::AuthenticatedSession, error::AppError, users::Capability};
 
 const PAGE_LIMIT: i64 = 25;
-const MAX_PAGE: u32 = 100_000;
+const ACTIONS: &[&str] = &[
+    "ARCHIVE_AUDIT",
+    "LOGIN",
+    "LOGIN_PASSWORD_ONLY",
+    "LOGOUT",
+    "VIEW_SECRET",
+    "VIEW_PREVIOUS_SECRET",
+    "COPY_SECRET",
+    "COPY_VARIABLE",
+    "EXPORT_ENV",
+    "IMPORT_ENV",
+    "DIRECT_APPLY_VARIABLE",
+    "DELETE_VARIABLE",
+    "CREATE_REQUEST",
+    "APPROVE_REQUEST",
+    "REJECT_REQUEST",
+    "APPLY_REQUEST",
+    "FULFILL_REQUEST_VALUE",
+    "PREVIEW_REQUEST",
+    "CREATE_SERVICE",
+    "UPDATE_SERVICE",
+    "ARCHIVE_SERVICE",
+    "RESTORE_SERVICE",
+    "CREATE_ENVIRONMENT",
+    "UPDATE_ENVIRONMENT",
+    "ARCHIVE_ENVIRONMENT",
+    "RESTORE_ENVIRONMENT",
+    "CREATE_USER",
+    "UPDATE_USER_ACCESS",
+    "UPDATE_USER_ROLE",
+    "UPDATE_USER_STATUS",
+    "RESET_USER_PASSWORD",
+    "RESET_USER_TOTP",
+    "CHANGE_PASSWORD",
+    "ENABLE_TOTP",
+    "COMPLETE_ORGANIZATION_SETUP",
+    "ROTATE_KEK",
+    "ROTATE_DEK",
+    "CREATE_BACKUP",
+    "CREATE_RESTORE_INTENT",
+    "RESTORE_BACKUP",
+];
 const METADATA_ALLOWLIST: &[&str] = &[
     "active",
+    "archive_identifier",
+    "archive_sha256",
+    "retention_days",
     "backup_identifier",
     "backup_sha256",
     "backup_size_bytes",
@@ -47,20 +91,19 @@ pub struct AuditFilter {
     #[serde(default)]
     pub actor: String,
     #[serde(default)]
-    pub page: u32,
+    pub before: i64,
+    #[serde(default)]
+    pub after: i64,
 }
 
 #[derive(Debug)]
 pub struct AuditPage {
     pub entries: Vec<AuditEntry>,
     pub actions: Vec<String>,
-    pub current_page: u32,
-    pub total_pages: u32,
-    pub total_items: i64,
     pub has_previous: bool,
     pub has_next: bool,
-    pub previous_page: u32,
-    pub next_page: u32,
+    pub newer: i64,
+    pub older: i64,
 }
 
 #[derive(Debug)]
@@ -109,16 +152,6 @@ pub async fn list(
         return Err(AppError::Forbidden);
     }
     validate_filter(filter)?;
-    let mut count_query = QueryBuilder::<Sqlite>::new(
-        "SELECT COUNT(*) FROM audit_logs a LEFT JOIN users actor ON actor.id = a.actor_user_id WHERE 1 = 1",
-    );
-    push_filters(&mut count_query, filter);
-    let total_items: i64 = count_query.build_query_scalar().fetch_one(pool).await?;
-    let total_pages = u32::try_from(((total_items + PAGE_LIMIT - 1) / PAGE_LIMIT).max(1))
-        .map_err(|_| AppError::InvalidRequest)?;
-    let current_page = filter.page.max(1).min(total_pages);
-    let offset = i64::from(current_page - 1) * PAGE_LIMIT;
-
     let mut query = QueryBuilder::<Sqlite>::new(
         "SELECT a.id, a.occurred_at, actor.email AS actor_email, a.action, a.outcome, \
                 service.name AS service_name, environment.name AS environment_name, \
@@ -129,26 +162,43 @@ pub async fn list(
          LEFT JOIN environments environment ON environment.id = a.environment_id WHERE 1 = 1",
     );
     push_filters(&mut query, filter);
+    if filter.before > 0 {
+        query.push(" AND a.id < ").push_bind(filter.before);
+    }
+    if filter.after > 0 {
+        query.push(" AND a.id > ").push_bind(filter.after);
+    }
     query
-        .push(" ORDER BY a.id DESC LIMIT ")
-        .push_bind(PAGE_LIMIT)
-        .push(" OFFSET ")
-        .push_bind(offset);
-    let rows: Vec<AuditRow> = query.build_query_as().fetch_all(pool).await?;
-    let actions =
-        sqlx::query_scalar::<_, String>("SELECT DISTINCT action FROM audit_logs ORDER BY action")
-            .fetch_all(pool)
-            .await?;
+        .push(if filter.after > 0 {
+            " ORDER BY a.id ASC LIMIT "
+        } else {
+            " ORDER BY a.id DESC LIMIT "
+        })
+        .push_bind(PAGE_LIMIT + 1);
+    let mut rows: Vec<AuditRow> = query.build_query_as().fetch_all(pool).await?;
+    let more = rows.len() > usize::try_from(PAGE_LIMIT).unwrap_or(25);
+    rows.truncate(usize::try_from(PAGE_LIMIT).unwrap_or(25));
+    if filter.after > 0 {
+        rows.reverse();
+    }
+    let newer = rows.first().map_or(filter.before, |row| row.id);
+    let older = rows.last().map_or(filter.after, |row| row.id);
+    let mut actions = ACTIONS
+        .iter()
+        .map(|value| (*value).to_owned())
+        .collect::<Vec<_>>();
+    actions.sort();
     Ok(AuditPage {
         entries: rows.into_iter().map(entry_from_row).collect(),
         actions,
-        current_page,
-        total_pages,
-        total_items,
-        has_previous: current_page > 1,
-        has_next: current_page < total_pages,
-        previous_page: current_page.saturating_sub(1).max(1),
-        next_page: (current_page + 1).min(total_pages),
+        has_previous: if filter.after > 0 {
+            more
+        } else {
+            filter.before > 0
+        },
+        has_next: if filter.after > 0 { true } else { more },
+        newer,
+        older,
     })
 }
 
@@ -161,8 +211,9 @@ fn push_filters(query: &mut QueryBuilder<Sqlite>, filter: &AuditFilter) {
     }
     if !filter.actor.is_empty() {
         query
-            .push(" AND actor.email_normalized LIKE ")
-            .push_bind(format!("%{}%", filter.actor.trim().to_lowercase()));
+            .push(" AND a.actor_user_id IN (SELECT id FROM users WHERE email_normalized LIKE ")
+            .push_bind(format!("%{}%", filter.actor.trim().to_lowercase()))
+            .push(")");
     }
 }
 
@@ -173,7 +224,9 @@ fn validate_filter(filter: &AuditFilter) -> Result<(), AppError> {
             filter.outcome.as_str(),
             "" | "SUCCESS" | "DENIED" | "FAILED"
         )
-        || filter.page > MAX_PAGE
+        || filter.before < 0
+        || filter.after < 0
+        || (filter.before > 0 && filter.after > 0)
     {
         return Err(AppError::InvalidRequest);
     }
@@ -295,7 +348,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn audit_log_is_paginated_without_losing_total_count() {
+    async fn audit_cursor_pagination_is_stable_across_new_events() {
         let pool = test_pool().await;
         for index in 0..31 {
             sqlx::query("INSERT INTO audit_logs(occurred_at, action) VALUES(?, 'LOGIN')")
@@ -325,15 +378,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(first.entries.len(), 25);
-        assert_eq!(first.total_items, 31);
-        assert_eq!(first.total_pages, 2);
+
         assert!(first.has_next);
 
         let second = list(
             &pool,
             &session,
             &AuditFilter {
-                page: 2,
+                before: first.older,
                 ..AuditFilter::default()
             },
         )
@@ -342,5 +394,50 @@ mod tests {
         assert_eq!(second.entries.len(), 6);
         assert!(second.has_previous);
         assert!(!second.has_next);
+        sqlx::query(
+            "INSERT INTO audit_logs(occurred_at, action) VALUES('2026-08-19T00:00:00Z', 'LOGOUT')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let newer = list(
+            &pool,
+            &session,
+            &AuditFilter {
+                after: second.newer,
+                ..AuditFilter::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            newer.entries.iter().map(|row| row.id).collect::<Vec<_>>(),
+            first.entries.iter().map(|row| row.id).collect::<Vec<_>>()
+        );
+        assert!(newer.has_previous);
+        let filtered = list(
+            &pool,
+            &session,
+            &AuditFilter {
+                action: "LOGOUT".into(),
+                ..AuditFilter::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(filtered.entries.len(), 1);
+        assert!(
+            list(
+                &pool,
+                &session,
+                &AuditFilter {
+                    before: 2,
+                    after: 1,
+                    ..AuditFilter::default()
+                }
+            )
+            .await
+            .is_err()
+        );
     }
 }

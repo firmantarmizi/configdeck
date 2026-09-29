@@ -22,13 +22,19 @@
 
 <details class="panel create-panel secondary-create"><summary>Preview redacted .env</summary><p class="muted">Choose an environment to view all current keys as text. Restricted values stay hidden.</p><div class="environment-request-links">{% for environment in workspace.environments %}<a class="button-link secondary compact-button" href="/environments/{{ environment.id }}/preview"><svg class="icon" aria-hidden="true"><use href="#icon-file"></use></svg>{{ environment.name }}</a>{% endfor %}</div></details>
 <section class="environment-selector" aria-labelledby="environment-selector-title" data-environment-selector>
-  <div class="environment-selector-heading"><div><h2 id="environment-selector-title">Environments</h2><p>Select which environments to compare.</p></div><span data-environment-count>{{ workspace.environments.len() }} selected</span></div>
+  <div class="environment-selector-heading"><div><h2 id="environment-selector-title">Environments</h2><p>Select which environments to compare. Archived environments can be restored; finish open requests before archiving.</p></div><span data-environment-count>{{ workspace.environments.len() }} selected</span></div>
   <div class="environment-choice-list">
     <label class="environment-choice all-environments"><input type="checkbox" checked data-environment-toggle-all><span class="environment-check" aria-hidden="true"><svg class="icon"><use href="#icon-check"></use></svg></span><span>All</span></label>
     {% for environment in workspace.environments %}
     <div class="environment-choice-group">
       <label class="environment-choice"><input type="checkbox" value="{{ environment.id }}" checked data-environment-toggle><span class="environment-check" aria-hidden="true"><svg class="icon"><use href="#icon-check"></use></svg></span><span>{{ environment.name }}</span><small>{{ environment.variable_count }}</small></label>
-      {% if can_manage && !environment.is_standard && workspace.service.archived_at.is_none() %}<form method="post" action="/environments/{{ environment.id }}/archive" class="inline-form"><input type="hidden" name="csrf_token" value="{{ chrome.csrf_token }}"><button type="submit" class="environment-archive-button" title="Archive custom environment {{ environment.name }}" aria-label="Archive custom environment {{ environment.name }}"><svg class="icon" aria-hidden="true"><use href="#icon-trash"></use></svg></button></form>{% endif %}
+      {% if can_manage && workspace.service.archived_at.is_none() %}
+      <button type="button" class="environment-archive-button" data-card-dialog-open="archive-env-{{ environment.id }}" aria-haspopup="dialog" aria-controls="archive-env-{{ environment.id }}" title="Archive environment {{ environment.name }}" aria-label="Archive environment {{ environment.name }}"><svg class="icon" aria-hidden="true"><use href="#icon-archive"></use></svg></button>
+      <dialog class="card-tool-dialog compact-dialog" id="archive-env-{{ environment.id }}" aria-labelledby="archive-env-title-{{ environment.id }}"><div class="panel card-tool-panel compact-confirm"><div class="card-tool-panel-heading"><strong id="archive-env-title-{{ environment.id }}">Archive {{ environment.name }}?</strong><button type="button" class="icon-button" data-card-dialog-close aria-label="Close archive dialog"><svg class="icon" aria-hidden="true"><use href="#icon-x"></use></svg></button></div><p>{{ environment.variable_count }} active keys, configuration history, and encryption keys remain available for restore.</p>
+      {% if environment.open_request_count > 0 %}<p class="error-panel">Complete or reject {{ environment.open_request_count }} open request(s) in <a href="/change-requests">Changes</a> first.</p>{% endif %}
+      {% if workspace.environments.len() == 1 %}<p class="error-panel">Keep at least one active environment in this App.</p>{% endif %}
+      <form method="post" action="/environments/{{ environment.id }}/archive"><input type="hidden" name="csrf_token" value="{{ chrome.csrf_token }}"><button type="submit" class="secondary"{% if environment.open_request_count > 0 || workspace.environments.len() == 1 %} disabled{% endif %}>Archive environment</button></form></div></dialog>
+      {% endif %}
     </div>
     {% endfor %}
   </div>

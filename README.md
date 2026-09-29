@@ -88,7 +88,7 @@ Administrators use **Maintenance → Backup & recovery** to create verified SQLi
 
 **Maintenance → Key rotation** supports atomic KEK re-wrap/TOTP re-encryption and synchronous resumable per-environment DEK rotation. Both require high-impact identity confirmation. Follow [`docs/operations.md`](docs/operations.md); never replace the active master-key file without first preserving it as the temporary previous-key secret.
 
-For initial migration, refresh privileged authentication and select **Record deployed configuration**. This Operator-only workflow is explicitly for values already active on the deployment platform. Its preview never repeats plaintext values and defaults every row to `restricted`; search/filter keys, review detected groups, apply bulk visibility only to the currently visible rows, and review the suggested type before recording the state. Keys are case-sensitive and may contain dots, such as `app.baseURL`; they are preserved verbatim. Use `# [Database]` as a portable group heading. Ordinary comments are ignored. **Preview .env** preserves group sections, decrypts the complete current environment only after recent authentication, and supports Copy `.env`, Copy Selected, and download. Close the preview after use because it contains plaintext restricted values.
+For initial migration, refresh privileged authentication and select **Record deployed configuration**. This Operator-only workflow is explicitly for values already active on the deployment platform. Its preview never repeats plaintext values and defaults new/historical keys to `restricted`, and locks known keys to the consistent visibility found within the same App; search/filter keys, review detected groups, apply bulk visibility only to the currently visible rows, and review the suggested type before recording the state. Keys are case-sensitive and may contain dots, such as `app.baseURL`; they are preserved verbatim. Use `# [Database]` as a portable group heading. Ordinary comments are ignored. **Preview .env** preserves group sections, decrypts the complete current environment only after recent authentication, and supports Copy `.env`, Copy Selected, and download. Close the preview after use because it contains plaintext restricted values.
 
 An Administrator opens **Manage Contributor access** on an App. Grant/revoke immediately invalidates the affected Contributor's sessions. An assigned Contributor adds one or more keys through the progressive builder, updates or deletes an existing key from its row, or pastes up to 50 `.env` entries as one request. Bulk paste detects ADD versus UPDATE, keeps values out of preview HTML, defaults visibility to `restricted`, and does not mutate current state. “I provide it” encrypts the submitted value immediately; a restricted value is write-only afterward. “Operator provides it” remains `NEEDS_INPUT` until fulfilled. Operator/Administrator approval, resulting `.env` preview, external deployment, and explicit Mark Applied preserve the difference between proposed and deployed state.
 
@@ -143,7 +143,7 @@ Pull requests and pushes are checked by [`.github/workflows/ci.yml`](.github/wor
 - Test backup restore and key rotation on disposable data before relying on them operationally.
 - Treat Preview/Download `.env` and restricted reveal as sensitive browser surfaces; finish the task and close them.
 - Review audit events and copy important backups off-host.
-- Define audit and backup retention before production. Authentication housekeeping is bounded automatically, while audit/history/archive and verified snapshots are never deleted silently.
+- Use Maintenance to archive audit older than 180 days in verified batches, and define an off-host archive/backup lifecycle. Authentication housekeeping is automatic; configuration history and verified snapshots are preserved.
 
 ## Current limitations
 
@@ -157,3 +157,11 @@ Pull requests and pushes are checked by [`.github/workflows/ci.yml`](.github/wor
 ## License
 
 ConfigDeck is available under the [MIT License](LICENSE). Copyright © 2026 Firman Tarmizi.
+
+## Version and import review
+
+The authenticated sidebar shows the package version and build identifier; the account menu also shows the build revision when supplied at build time. A build identifier distinguishes source revisions that share a package version.
+
+Deployed-import review matches exact keys within the current App without reading existing values. Consistent active visibility is preselected; new and historical-only keys default to restricted. Conflicts and stale previews must be resolved before recording. Default and custom environments can be archived and restored by Administrators, while preserving at least one active environment and completing open requests first.
+
+Dotenv text previews and paste editors show physical line numbers in a separate gutter; copy/download content stays unchanged. Existing key positions survive value/visibility edits and partial imports, with new keys appended within canonical grouping.

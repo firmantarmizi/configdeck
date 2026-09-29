@@ -22,9 +22,9 @@
     <td>{% if event.metadata.is_empty() %}<span class="muted">—</span>{% else %}<dl class="audit-metadata">{% for item in event.metadata %}<div><dt>{{ item.key }}</dt><dd>{{ item.value }}</dd></div>{% endfor %}</dl>{% endif %}{% match event.change_request_id %}{% when Some with (id) %}<small>Request <code>{{ id }}</code></small>{% when None %}{% endmatch %}</td>
   </tr>{% endfor %}{% if page.entries.is_empty() %}<tr><td colspan="5"><div class="empty-state"><span class="empty-icon">i</span><div><strong>No matching events</strong><p>Adjust the filters to see more activity.</p></div></div></td></tr>{% endif %}</tbody></table>
 </section>
-{% if page.total_pages > 1 %}<nav class="pagination" aria-label="Audit log pages">
-  <form method="get" action="/audit"><input type="hidden" name="action" value="{{ filter.action }}"><input type="hidden" name="outcome" value="{{ filter.outcome }}"><input type="hidden" name="actor" value="{{ filter.actor }}"><button type="submit" name="page" value="{{ page.previous_page }}" class="pagination-button secondary"{% if !page.has_previous %} disabled{% endif %} aria-label="Previous page">‹</button></form>
-  <span><strong>Page {{ page.current_page }}</strong> of {{ page.total_pages }} <small>· {{ page.total_items }} events</small></span>
-  <form method="get" action="/audit"><input type="hidden" name="action" value="{{ filter.action }}"><input type="hidden" name="outcome" value="{{ filter.outcome }}"><input type="hidden" name="actor" value="{{ filter.actor }}"><button type="submit" name="page" value="{{ page.next_page }}" class="pagination-button secondary"{% if !page.has_next %} disabled{% endif %} aria-label="Next page">›</button></form>
+{% if page.has_previous || page.has_next %}<nav class="pagination" aria-label="Audit log pages">
+  <form method="get" action="/audit"><input type="hidden" name="action" value="{{ filter.action }}"><input type="hidden" name="outcome" value="{{ filter.outcome }}"><input type="hidden" name="actor" value="{{ filter.actor }}"><button type="submit" name="after" value="{{ page.newer }}" class="pagination-button secondary"{% if !page.has_previous %} disabled{% endif %} aria-label="Newer events">‹</button></form>
+  <span>Showing {{ page.entries.len() }} events · <a href="/audit">Latest</a></span>
+  <form method="get" action="/audit"><input type="hidden" name="action" value="{{ filter.action }}"><input type="hidden" name="outcome" value="{{ filter.outcome }}"><input type="hidden" name="actor" value="{{ filter.actor }}"><button type="submit" name="before" value="{{ page.older }}" class="pagination-button secondary"{% if !page.has_next %} disabled{% endif %} aria-label="Older events">›</button></form>
 </nav>{% endif %}
 {% endblock %}

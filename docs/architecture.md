@@ -83,7 +83,7 @@ Saving a request in ConfigDeck never implies that a deployment happened. Current
 - Backup uses SQLite `VACUUM INTO`; restore is an offline operator procedure.
 - KEK rotation re-wraps environment DEKs and re-encrypts TOTP seeds.
 - DEK rotation re-encrypts current values, history, and pending proposals in resumable batches.
-- Container logs and disposable authentication state are bounded. Audit, history, and archived domain records require an explicit organizational retention policy.
+- Container logs and disposable authentication state are bounded. Audit supports verified archival after 180 days through Administrator maintenance. Configuration history remains immutable and is read in bounded pages. Archive files and snapshots need an off-host lifecycle.
 - Deployment-platform integration, dynamic secrets, SSO, and background workers are outside the current scope.
 
 See [Security model](security-model.md), [Deployment](deployment.md), and [Operations](operations.md) for the corresponding controls and procedures.

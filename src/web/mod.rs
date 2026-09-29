@@ -43,6 +43,7 @@ struct ClientIdentity(String);
 
 #[derive(Clone, Copy)]
 struct AppChrome<'a> {
+    build: BuildInfo,
     csrf_token: &'a str,
     active_nav: &'a str,
     section_label: &'static str,
@@ -51,6 +52,18 @@ struct AppChrome<'a> {
     recent_active: bool,
     permissions: AppPermissions,
 }
+
+#[derive(Clone, Copy)]
+struct BuildInfo {
+    version: &'static str,
+    id: &'static str,
+    revision: &'static str,
+}
+const BUILD_INFO: BuildInfo = BuildInfo {
+    version: env!("CARGO_PKG_VERSION"),
+    id: env!("CONFIGDECK_BUILD_ID"),
+    revision: env!("CONFIGDECK_BUILD_REVISION"),
+};
 
 #[derive(Clone, Copy)]
 struct AppPermissions {
@@ -100,6 +113,7 @@ struct AuditTemplate<'a> {
 struct MaintenanceTemplate<'a> {
     chrome: AppChrome<'a>,
     backups: &'a [operations::BackupRecord],
+    archived_count: Option<usize>,
     restore_intent: &'a Option<operations::RestoreIntent>,
     rotations: &'a rotations::RotationOverview,
 }
@@ -229,6 +243,9 @@ struct VariableHistoryTemplate<'a> {
     key: &'a str,
     can_reveal_restricted: bool,
     history: &'a [variables::HistoryView],
+    has_older: bool,
+    older: i64,
+    paged: bool,
 }
 
 #[derive(Template)]
@@ -246,6 +263,9 @@ struct ImportPreviewTemplate<'a> {
     environment: &'a variables::EnvironmentContext,
     preview_token: &'a str,
     entries: &'a [ImportPreviewEntry],
+    conflict_count: usize,
+    new_count: usize,
+    known_count: usize,
 }
 
 struct ImportPreviewEntry {
@@ -253,6 +273,7 @@ struct ImportPreviewEntry {
     group_name: Option<String>,
     starts_group: bool,
     suggested_type: &'static str,
+    review: variables::import_review::ImportReview,
 }
 
 #[derive(Template)]
@@ -464,6 +485,7 @@ struct ImportPreviewPayload {
     purpose: String,
     expires_at: i64,
     entries: Vec<crate::dotenv::Entry>,
+    reviews: Vec<variables::import_review::ImportReview>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -589,6 +611,7 @@ fn core_routes() -> Router<AppState> {
         .route("/audit", get(audit_list))
         .route("/maintenance", get(maintenance_page))
         .route("/maintenance/backups", post(backup_create))
+        .route("/maintenance/audit-archive", post(audit_archive))
         .route("/maintenance/restore-intent", post(restore_intent_create))
         .route("/maintenance/rotate-kek", post(kek_rotate))
         .route(
@@ -1030,6 +1053,7 @@ async fn user_list(
 async fn maintenance_page(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
 ) -> Result<Response, AppError> {
     let (_, session, csrf) = authenticated_full_with_csrf(&state, &headers).await?;
     let backups = operations::list_backups(&state.settings.operations, &session).await?;
@@ -1040,6 +1064,9 @@ async fn maintenance_page(
         MaintenanceTemplate {
             chrome: app_chrome(&state, &session, &csrf, "maintenance"),
             backups: &backups,
+            archived_count: query
+                .get("audit_archived")
+                .and_then(|value| value.parse().ok()),
             restore_intent: &restore_intent,
             rotations: &rotation_overview,
         }
@@ -1106,6 +1133,33 @@ async fn dek_rotate(
     )
     .await?;
     Ok(Redirect::to("/maintenance").into_response())
+}
+
+async fn audit_archive(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<CsrfForm>,
+) -> Result<Response, AppError> {
+    let (_, session) = authenticated(&state, &headers).await?;
+    state.sessions.verify_csrf(&session, &form.csrf_token)?;
+    session.require_full()?;
+    if !session.user.role.allows(Capability::CreateBackup) {
+        return Err(AppError::Forbidden);
+    }
+    if !state
+        .sessions
+        .has_recent_auth(&session, PrivilegedAuthLevel::Standard)
+    {
+        return Ok(Redirect::to("/auth/recent?return_to=/maintenance").into_response());
+    }
+    let archived = operations::audit_archive::archive(
+        &state.pool,
+        &state.settings.operations,
+        &state.sessions,
+        &session,
+    )
+    .await?;
+    Ok(Redirect::to(&format!("/maintenance?audit_archived={archived}")).into_response())
 }
 
 async fn backup_create(
@@ -1869,6 +1923,7 @@ async fn request_import_commit(
     }
     let title = fields.remove("title");
     let reason = fields.remove("reason").unwrap_or_default();
+    let next_order = variables::next_display_order(&state.pool, &environment_id).await?;
     let mut items = Vec::with_capacity(payload.entries.len());
     for (index, mut payload_entry) in payload.entries.into_iter().enumerate() {
         let visibility = fields
@@ -1886,7 +1941,7 @@ async fn request_import_commit(
             value_type: Some(value_type),
             description: None,
             group_name: fields.remove(&format!("group_name_{index}")),
-            display_order: Some(payload_entry.entry.position),
+            display_order: Some(next_order + payload_entry.entry.position),
         });
     }
     let id = requests::create(
@@ -2326,9 +2381,8 @@ async fn import_preview(
     let (_, session, csrf) = authenticated_full_with_csrf(&state, &headers).await?;
     state.sessions.verify_csrf(&session, &form.csrf_token)?;
     require_recent_import(&state, &session)?;
-    let (environment, _) =
-        variables::list_for_environment(&state.pool, &state.crypto, &session, &environment_id)
-            .await?;
+    let environment =
+        variables::environment_context(&state.pool, &session, &environment_id).await?;
     let report = crate::dotenv::parse(&form.dotenv);
     if !report.issues.is_empty() {
         let html = ImportTemplate {
@@ -2339,10 +2393,18 @@ async fn import_preview(
         .render()?;
         return Ok((StatusCode::UNPROCESSABLE_ENTITY, Html(html)).into_response());
     }
+    let keys = report
+        .entries
+        .iter()
+        .map(|entry| entry.key.clone())
+        .collect::<Vec<_>>();
+    let (_, reviews) =
+        variables::import_review::preview(&state.pool, &session, &environment_id, &keys).await?;
     let payload = ImportPreviewPayload {
         purpose: "APPLIED_IMPORT".to_owned(),
         expires_at: time::OffsetDateTime::now_utc().unix_timestamp() + 30 * 60,
         entries: report.entries,
+        reviews,
     };
     let serialized = Zeroizing::new(
         serde_json::to_vec(&payload)
@@ -2356,7 +2418,8 @@ async fn import_preview(
     let preview_entries = payload
         .entries
         .iter()
-        .map(|entry| {
+        .zip(&payload.reviews)
+        .map(|(entry, review)| {
             let starts_group = entry.group.is_some() && entry.group != previous_group;
             previous_group.clone_from(&entry.group);
             ImportPreviewEntry {
@@ -2364,6 +2427,7 @@ async fn import_preview(
                 group_name: entry.group.clone(),
                 starts_group,
                 suggested_type: variables::suggest_value_type(&entry.value),
+                review: review.clone(),
             }
         })
         .collect::<Vec<_>>();
@@ -2372,6 +2436,21 @@ async fn import_preview(
         environment: &environment,
         preview_token: &preview_token,
         entries: &preview_entries,
+        conflict_count: payload
+            .reviews
+            .iter()
+            .filter(|review| review.conflict)
+            .count(),
+        new_count: payload
+            .reviews
+            .iter()
+            .filter(|review| review.status == "new")
+            .count(),
+        known_count: payload
+            .reviews
+            .iter()
+            .filter(|review| review.locked && !review.conflict)
+            .count(),
     }
     .render()?;
     Ok(Html(html).into_response())
@@ -2426,12 +2505,13 @@ async fn import_commit(
             reason: reason.clone(),
         });
     }
-    variables::import_applied(
+    variables::import_applied_reviewed(
         &state.pool,
         &state.crypto,
         &session,
         &environment_id,
         inputs,
+        Some(&payload.reviews),
     )
     .await?;
     Ok(Redirect::to(&format!("/environments/{environment_id}/variables")).into_response())
@@ -2581,10 +2661,20 @@ async fn variable_history(
     State(state): State<AppState>,
     Path(variable_id): Path<String>,
     headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
 ) -> Result<Response, AppError> {
     let (_, session, csrf) = authenticated_full_with_csrf(&state, &headers).await?;
-    let (key, history) =
-        variables::history(&state.pool, &state.crypto, &session, &variable_id).await?;
+    let before = query
+        .get("before")
+        .map(|value| value.parse::<i64>())
+        .transpose()
+        .map_err(|_| AppError::InvalidRequest)?
+        .unwrap_or(0);
+    let (key, mut history) =
+        variables::history_page(&state.pool, &state.crypto, &session, &variable_id, before).await?;
+    let has_older = history.len() > 25;
+    history.truncate(25);
+    let older = history.last().map_or(0, |entry| entry.version);
     let html = VariableHistoryTemplate {
         chrome: app_chrome(&state, &session, &csrf, "configurations"),
         variable_id: &variable_id,
@@ -2594,6 +2684,9 @@ async fn variable_history(
             .role
             .allows(crate::users::Capability::ReadRestrictedValue),
         history: &history,
+        has_older,
+        older,
+        paged: before > 0,
     }
     .render()?;
     Ok(Html(html).into_response())
@@ -2859,6 +2952,7 @@ fn app_chrome<'a>(
     active_nav: &'a str,
 ) -> AppChrome<'a> {
     AppChrome {
+        build: crate::web::BUILD_INFO,
         csrf_token,
         active_nav,
         user_email: &session.user.email,
@@ -2913,7 +3007,11 @@ async fn friendly_error_pages(request: Request, next: Next) -> Response {
     {
         return response;
     }
-    let (title, message) = friendly_error_copy(status, &path);
+    let (title, fallback) = friendly_error_copy(status, &path);
+    let message = response
+        .extensions()
+        .get::<crate::error::SafeConflictMessage>()
+        .map_or(fallback, |message| message.0);
     let (back_href, back_label) = if status == StatusCode::UNAUTHORIZED || path == "/login" {
         ("/login", "Back to sign in")
     } else {
@@ -3004,15 +3102,21 @@ async fn request_context(
     if let Ok(value) = HeaderValue::from_str(&request_id) {
         response.headers_mut().insert("x-request-id", value);
     }
-    tracing::info!(
-        request_id,
-        method = %method,
-        path,
-        status = status.as_u16(),
-        duration_ms = started.elapsed().as_millis(),
-        client_ip,
-        "request completed"
-    );
+    if status.is_success()
+        && (matches!(path.as_str(), "/health" | "/ready") || path.starts_with("/static/"))
+    {
+        tracing::debug!(request_id, method = %method, path, status = status.as_u16(), "routine request completed");
+    } else {
+        tracing::info!(
+            request_id,
+            method = %method,
+            path,
+            status = status.as_u16(),
+            duration_ms = started.elapsed().as_millis(),
+            client_ip,
+            "request completed"
+        );
+    }
     response
 }
 
@@ -3273,9 +3377,12 @@ mod tests {
             group_name: Some("Database".into()),
             starts_group: true,
             suggested_type: "string",
+            review: variables::import_review::review(&[], "env", &["DATABASE_URL".into()])
+                .remove(0),
         }];
         let html = ImportPreviewTemplate {
             chrome: AppChrome {
+                build: crate::web::BUILD_INFO,
                 csrf_token: "csrf",
                 active_nav: "configurations",
                 section_label: "Configurations",
@@ -3291,6 +3398,9 @@ mod tests {
             environment: &environment,
             preview_token: "authenticated-ciphertext-token",
             entries: &entries,
+            conflict_count: 0,
+            new_count: 1,
+            known_count: 0,
         }
         .render()
         .unwrap();
@@ -3322,6 +3432,7 @@ mod tests {
         }];
         let html = RequestImportPreviewTemplate {
             chrome: AppChrome {
+                build: crate::web::BUILD_INFO,
                 csrf_token: "csrf",
                 active_nav: "changes",
                 section_label: "Changes",
@@ -3744,23 +3855,70 @@ mod tests {
             )
             .await
             .unwrap();
-        let response = router(state)
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/maintenance/backups")
-                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                    .header(
-                        "cookie",
-                        format!("__Host-configdeck_session={}", tokens.session_token),
-                    )
-                    .body(Body::from(format!("csrf_token={}", tokens.csrf_token)))
-                    .unwrap(),
+        for path in ["/maintenance/backups", "/maintenance/audit-archive"] {
+            let response = router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                        .header(
+                            "cookie",
+                            format!("__Host-configdeck_session={}", tokens.session_token),
+                        )
+                        .body(Body::from(format!("csrf_token={}", tokens.csrf_token)))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert!(response.headers().get("location").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn audit_archive_requires_csrf_and_recent_admin_authentication() {
+        let state = response_state().await;
+        seed_registry_identities(&state.pool).await;
+        let tokens = state
+            .sessions
+            .create(
+                &test_session("admin", Role::Administrator).user,
+                AuthenticationState::Full,
+                Some("127.0.0.1"),
+                Some("test"),
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        assert!(response.headers().get("location").is_none());
+        for (csrf, expected) in [
+            ("invalid", StatusCode::FORBIDDEN),
+            (tokens.csrf_token.as_str(), StatusCode::SEE_OTHER),
+        ] {
+            let response = router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/maintenance/audit-archive")
+                        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                        .header(
+                            "cookie",
+                            format!("__Host-configdeck_session={}", tokens.session_token),
+                        )
+                        .body(Body::from(format!("csrf_token={csrf}")))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+            if expected == StatusCode::SEE_OTHER {
+                assert!(
+                    response.headers()["location"]
+                        .to_str()
+                        .unwrap()
+                        .starts_with("/auth/recent?")
+                );
+            }
+        }
     }
 
     struct PreviewFixture {
@@ -4059,6 +4217,161 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(download.status(), StatusCode::FORBIDDEN);
+    }
+
+    async fn import_review_post(
+        fixture: &PreviewFixture,
+        suffix: &str,
+        body: String,
+    ) -> axum::response::Response {
+        router(fixture.state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/environments/{}/import/{suffix}",
+                        fixture.environment_id
+                    ))
+                    .header(
+                        "cookie",
+                        format!("__Host-configdeck_session={}", fixture.tokens.session_token),
+                    )
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn deployed_import_review_preserves_auth_and_revalidates_encrypted_snapshot() {
+        let mut fixture = preview_fixture().await;
+        let source = "API_URL=synthetic-new-public\nPRIVATE_KEY=synthetic-new-secret\nBRAND_NEW=synthetic-new-value\nREMOVED=synthetic-history";
+        let encoded =
+            percent_encoding::utf8_percent_encode(source, percent_encoding::NON_ALPHANUMERIC);
+        let body = format!("csrf_token={}&dotenv={encoded}", fixture.tokens.csrf_token);
+        assert_eq!(
+            import_review_post(&fixture, "preview", body).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        fixture.tokens = fixture
+            .state
+            .sessions
+            .create(
+                &test_session("admin", Role::Administrator).user,
+                AuthenticationState::Full,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let body = format!("csrf_token={}&dotenv={encoded}", fixture.tokens.csrf_token);
+        assert_eq!(
+            import_review_post(&fixture, "preview", body.clone())
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        sqlx::query("UPDATE sessions SET privileged_authenticated_at = ?, privileged_auth_level = 'STANDARD' WHERE user_id = 'admin'")
+            .bind(crate::db::now_rfc3339().unwrap()).execute(&fixture.state.pool).await.unwrap();
+        let workspace = preview_get(
+            &fixture,
+            &format!("/services/{}/environments", fixture.service_id),
+        )
+        .await;
+        let workspace = String::from_utf8(
+            axum::body::to_bytes(workspace.into_body(), 256 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(workspace.contains("Archive environment staging"));
+        assert!(workspace.contains(&format!("ConfigDeck v{}", env!("CARGO_PKG_VERSION"))));
+        assert!(workspace.contains(env!("CONFIGDECK_BUILD_ID")));
+        sqlx::query("UPDATE variables SET encrypted_value = zeroblob(16)")
+            .execute(&fixture.state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            import_review_post(
+                &fixture,
+                "preview",
+                format!("csrf_token=wrong&dotenv={encoded}")
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        let response = import_review_post(&fixture, "preview", body.clone()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        let html = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), 256 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        for value in [
+            "synthetic-new-public",
+            "synthetic-new-secret",
+            "synthetic-new-value",
+            "synthetic-history",
+        ] {
+            assert!(!html.contains(value));
+        }
+        assert!(html.contains("data-import-kind=\"new\""));
+        assert!(html.contains("data-import-kind=\"historical\""));
+        assert!(html.contains("value=\"public\" selected"));
+        assert!(html.contains("data-import-visibility disabled"));
+        if let Ok(directory) = std::env::var("CONFIGDECK_UI_FIXTURE_DIR") {
+            std::fs::write(std::path::Path::new(&directory).join("import.html"), &html).unwrap();
+            std::fs::write(
+                std::path::Path::new(&directory).join("workspace.html"),
+                &workspace,
+            )
+            .unwrap();
+        }
+        let token = html
+            .split("name=\"preview_token\" value=\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap();
+        let token =
+            percent_encoding::utf8_percent_encode(token, percent_encoding::NON_ALPHANUMERIC);
+        let form = format!(
+            "csrf_token={}&preview_token={token}&reason=Test&visibility_0=public&visibility_1=restricted&visibility_2=restricted&visibility_3=restricted&value_type_0=string&value_type_1=string&value_type_2=string&value_type_3=string",
+            fixture.tokens.csrf_token
+        );
+        let tampered = form.replace("visibility_1=restricted", "visibility_1=public");
+        assert_eq!(
+            import_review_post(&fixture, "commit", tampered)
+                .await
+                .status(),
+            StatusCode::CONFLICT
+        );
+        sqlx::query("UPDATE variables SET visibility = 'restricted', version = version + 1 WHERE key = 'API_URL'").execute(&fixture.state.pool).await.unwrap();
+        let response = import_review_post(&fixture, "commit", form).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let message = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), 128 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(message.contains("metadata changed since preview"));
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM variables WHERE key = 'BRAND_NEW'")
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[tokio::test]

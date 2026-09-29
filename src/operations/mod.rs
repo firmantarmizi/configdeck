@@ -1,3 +1,5 @@
+pub mod audit_archive;
+
 use std::{
     fmt::Write as _,
     fs::{self, File, OpenOptions},

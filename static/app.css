@@ -735,3 +735,30 @@ summary { cursor: pointer; font-weight: 700; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; }
 }
+
+.app-version { margin-top: auto; padding: 1rem .85rem 2.6rem; color: var(--muted); font-size: .75rem; }
+.app-version small, .account-version small { display: block; font-size: .65rem; overflow-wrap: anywhere; }
+.account-version { padding: .55rem .6rem; margin: 0; color: var(--muted); font-size: .8rem; }
+:root[data-sidebar="collapsed"] .app-version { display: none; }
+@media (max-width: 760px) { .app-version { display: none; } }
+
+.import-key-cell { flex-wrap: wrap; }
+.import-key-status { display: inline-block; padding: .15rem .4rem; border-radius: .35rem; background: var(--surface-soft); color: var(--muted); font-size: .68rem; font-weight: 700; }
+.import-key-status.status-new { background: var(--accent-soft); color: var(--accent-hover); }
+.import-key-status.status-conflict { background: var(--danger-soft); color: var(--danger); }
+.import-review-table tr[data-import-kind="new"] td:first-child { border-left: 3px solid var(--accent); }
+.import-review-table tr[data-import-kind="conflict"] td:first-child { border-left: 3px solid var(--danger); }
+.import-metadata-source { max-width: 24rem; overflow-wrap: anywhere; }
+
+.metadata-import-toolbar { grid-template-columns: minmax(12rem, 1.3fr) minmax(10rem, 1fr) minmax(12rem, 1fr) auto; }
+.metadata-import-toolbar .copy-status { grid-column: 1 / -1; min-height: 0; }
+@media (max-width: 1150px) { .metadata-import-toolbar { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 760px) { .metadata-import-toolbar { grid-template-columns: 1fr; } }
+
+.numbered-env { display: flex; min-width: 0; overflow: hidden; border: 1px solid var(--border-strong); border-radius: .7rem; margin-block: .5rem 1rem; background: #070b14; }
+.numbered-env textarea { flex: 1; min-width: 0; width: 0; margin: 0; border: 0; border-radius: 0; resize: vertical; padding: 1rem; white-space: pre; overflow-wrap: normal; }
+.numbered-env textarea, .env-line-numbers { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; font-size: .875rem; line-height: 1.6; tab-size: 4; }
+.env-line-numbers { flex: 0 0 4.5rem; align-self: stretch; max-height: 100%; height: auto; padding: 1rem .75rem; color: #93a4bd; text-align: right; white-space: pre; overflow: hidden; user-select: none; pointer-events: none; border-right: 1px solid #384258; }
+.numbered-env { position: relative; padding-left: 4.5rem; }
+.env-line-numbers { position: absolute; inset: 0 auto 0 0; width: 4.5rem; }
+:root[data-theme="light"] .numbered-env { background: #172033; }

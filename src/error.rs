@@ -36,6 +36,9 @@ pub enum ConfigError {
     InvalidTrustedProxy,
 }
 
+#[derive(Clone)]
+pub struct SafeConflictMessage(pub &'static str);
+
 #[derive(Debug, Error)]
 pub enum AppError {
     #[error("database operation failed")]
@@ -60,6 +63,12 @@ pub enum AppError {
     InvalidRequest,
     #[error("resource was not found")]
     NotFound,
+    #[error("the last active environment cannot be archived")]
+    LastActiveEnvironment,
+    #[error("finish or reject open requests before archiving this environment")]
+    EnvironmentHasOpenRequests,
+    #[error("import metadata changed or conflicts with App visibility")]
+    ImportReviewConflict,
     #[error("resource conflicts with existing state")]
     Conflict,
     #[error("template rendering failed")]
@@ -76,6 +85,12 @@ impl IntoResponse for AppError {
         if matches!(self, Self::PasswordChangeRequired) {
             return Redirect::to("/account/password").into_response();
         }
+        let specific_conflict = matches!(
+            &self,
+            Self::LastActiveEnvironment
+                | Self::EnvironmentHasOpenRequests
+                | Self::ImportReviewConflict
+        );
         let (status, message) = match self {
             Self::Authentication | Self::InvalidRequest => {
                 (StatusCode::BAD_REQUEST, "Unable to process request.")
@@ -83,6 +98,18 @@ impl IntoResponse for AppError {
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "Authentication required."),
             Self::Forbidden => (StatusCode::FORBIDDEN, "Operation not permitted."),
             Self::NotFound => (StatusCode::NOT_FOUND, "Resource not found."),
+            Self::LastActiveEnvironment => (
+                StatusCode::CONFLICT,
+                "Keep at least one active environment in this App.",
+            ),
+            Self::EnvironmentHasOpenRequests => (
+                StatusCode::CONFLICT,
+                "Complete or reject this environment's open requests in Changes before archiving.",
+            ),
+            Self::ImportReviewConflict => (
+                StatusCode::CONFLICT,
+                "Visibility conflicts or metadata changed since preview. Resolve open changes and visibility in the App workspace, then preview the import again.",
+            ),
             Self::Conflict => (
                 StatusCode::CONFLICT,
                 "Unable to save because the resource already exists or changed.",
@@ -101,6 +128,12 @@ impl IntoResponse for AppError {
             }
             Self::OrganizationSetupRequired | Self::PasswordChangeRequired => unreachable!(),
         };
-        (status, Json(json!({ "error": message }))).into_response()
+        let mut response = (status, Json(json!({ "error": message }))).into_response();
+        if specific_conflict {
+            response
+                .extensions_mut()
+                .insert(SafeConflictMessage(message));
+        }
+        response
     }
 }

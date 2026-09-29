@@ -20,6 +20,7 @@ pub struct EnvironmentRecord {
     pub description: Option<String>,
     pub archived_at: Option<String>,
     pub variable_count: i64,
+    pub open_request_count: i64,
     pub is_standard: bool,
 }
 
@@ -395,6 +396,7 @@ pub async fn list_for_service(
     let rows = sqlx::query_as::<_, EnvironmentRecord>(
         "SELECT e.id, e.name, e.description, e.archived_at, \
                 COUNT(v.id) AS variable_count, \
+                (SELECT COUNT(*) FROM change_requests r WHERE r.environment_id = e.id AND r.status IN ('REQUESTED','NEEDS_INPUT','READY_TO_APPLY')) AS open_request_count, \
                 e.name_normalized IN ('development', 'staging', 'production') AS is_standard \
          FROM environments e \
          LEFT JOIN variables v ON v.environment_id = e.id AND v.lifecycle_status = 'ACTIVE' \
@@ -638,7 +640,7 @@ pub async fn set_archived(
 ) -> Result<String, AppError> {
     require_manage_metadata(session)?;
     let now = now_rfc3339().map_err(AppError::Internal)?;
-    let mut transaction = pool.begin().await?;
+    let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
     let service_id: String = sqlx::query_scalar(
         "SELECT e.service_id FROM environments e \
          JOIN services s ON s.id = e.service_id \
@@ -649,6 +651,27 @@ pub async fn set_archived(
     .fetch_optional(&mut *transaction)
     .await?
     .ok_or(AppError::NotFound)?;
+    let currently_archived: Option<String> =
+        sqlx::query_scalar("SELECT archived_at FROM environments WHERE id = ?")
+            .bind(environment_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+    if archived && currently_archived.is_none() {
+        let active: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM environments WHERE service_id = ? AND archived_at IS NULL",
+        )
+        .bind(&service_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if active <= 1 {
+            return Err(AppError::LastActiveEnvironment);
+        }
+        let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM change_requests WHERE environment_id = ? AND status IN ('REQUESTED','NEEDS_INPUT','READY_TO_APPLY')")
+            .bind(environment_id).fetch_one(&mut *transaction).await?;
+        if pending > 0 {
+            return Err(AppError::EnvironmentHasOpenRequests);
+        }
+    }
     sqlx::query(
         "UPDATE environments SET archived_at = ?, updated_at = ?, updated_by = ? WHERE id = ?",
     )
@@ -893,8 +916,9 @@ mod tests {
             .await
             .unwrap();
         let admin = session("admin", Role::Administrator);
-        let service_id = services::create(
+        let service_id = services::create_with_default_environments(
             &pool,
+            &crypto,
             &admin,
             ServiceInput {
                 name: "Custom targets".into(),
@@ -1278,6 +1302,113 @@ mod tests {
         let debug = format!("{workspace:?}");
         assert!(!debug.contains("current-public"));
         assert!(!debug.contains("mixed-public-proposal"));
+    }
+
+    #[tokio::test]
+    async fn standard_archive_preserves_data_and_rejects_last_active_and_wrong_role() {
+        let pool = test_pool().await;
+        seed_identity(&pool).await;
+        let crypto = CryptoManager::new(Zeroizing::new([61; 32]));
+        initialize_and_validate_key_registry(&pool, &crypto)
+            .await
+            .unwrap();
+        let admin = session("admin", Role::Administrator);
+        let app = services::create_with_default_environments(
+            &pool,
+            &crypto,
+            &admin,
+            ServiceInput {
+                name: "Archive standard".into(),
+                description: None,
+            },
+        )
+        .await
+        .unwrap();
+        let (_, envs) = list_for_service(&pool, &admin, &app).await.unwrap();
+        assert!(
+            set_archived(
+                &pool,
+                &session("contributor", Role::Contributor),
+                &envs[0].id,
+                true
+            )
+            .await
+            .is_err()
+        );
+        set_archived(&pool, &admin, &envs[0].id, true)
+            .await
+            .unwrap();
+        set_archived(&pool, &admin, &envs[1].id, true)
+            .await
+            .unwrap();
+        assert!(matches!(
+            set_archived(&pool, &admin, &envs[2].id, true).await,
+            Err(AppError::LastActiveEnvironment)
+        ));
+        let (_, archived) = list_for_service(&pool, &admin, &app).await.unwrap();
+        assert_eq!(archived.len(), 3);
+        assert_eq!(
+            archived
+                .iter()
+                .filter(|env| env.archived_at.is_none())
+                .count(),
+            1
+        );
+        let deks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM environment_keys WHERE environment_id IN (SELECT id FROM environments WHERE service_id = ?)").bind(&app).fetch_one(&pool).await.unwrap();
+        assert_eq!(deks, 3);
+        set_archived(&pool, &admin, &envs[0].id, false)
+            .await
+            .unwrap();
+        let (_, restored) = list_for_service(&pool, &admin, &app).await.unwrap();
+        assert_eq!(
+            restored
+                .iter()
+                .filter(|env| env.archived_at.is_none())
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn archive_rejects_every_open_request_status() {
+        let pool = test_pool().await;
+        seed_identity(&pool).await;
+        let crypto = CryptoManager::new(Zeroizing::new([62; 32]));
+        initialize_and_validate_key_registry(&pool, &crypto)
+            .await
+            .unwrap();
+        let admin = session("admin", Role::Administrator);
+        let app = services::create_with_default_environments(
+            &pool,
+            &crypto,
+            &admin,
+            ServiceInput {
+                name: "Open changes".into(),
+                description: None,
+            },
+        )
+        .await
+        .unwrap();
+        let (_, envs) = list_for_service(&pool, &admin, &app).await.unwrap();
+        for status in ["REQUESTED", "NEEDS_INPUT", "READY_TO_APPLY"] {
+            sqlx::query("INSERT INTO change_requests(id, service_id, environment_id, reason, status, requested_by, requested_at, approved_by, approved_at) VALUES(?, ?, ?, 'Synthetic test', ?, 'admin', '2026-09-28T00:00:00Z', ?, ?)")
+                .bind(status).bind(&app).bind(&envs[0].id).bind(status)
+                .bind((status == "READY_TO_APPLY").then_some("admin"))
+                .bind((status == "READY_TO_APPLY").then_some("2026-09-28T00:00:00Z"))
+                .execute(&pool).await.unwrap();
+            assert!(matches!(
+                set_archived(&pool, &admin, &envs[0].id, true).await,
+                Err(AppError::EnvironmentHasOpenRequests)
+            ));
+            sqlx::query("DELETE FROM change_requests WHERE id = ?")
+                .bind(status)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        set_archived(&pool, &admin, &envs[0].id, true)
+            .await
+            .unwrap();
     }
 
     async fn seed_identity(pool: &sqlx::SqlitePool) {

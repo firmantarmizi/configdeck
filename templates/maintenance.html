@@ -15,6 +15,14 @@
 </section>
 {% when None %}{% endmatch %}
 
+<section class="panel">
+  <h2>Audit retention · 180 days</h2>
+  {% match archived_count %}{% when Some with (count) %}<p role="status"><strong>{{ count }} older events archived.</strong> {% if *count == 0 %}There are no expired audit events to archive.{% endif %}</p>{% when None %}{% endmatch %}
+  <p>Move up to 1,000 older events to a verified JSONL archive in the backup volume. Recent events and configuration history stay in the database. Run again if older events remain.</p>
+  <p class="muted">Archive files are retained. Include them in your off-host backup lifecycle. SQLite reuses the freed space; its file size may not immediately decrease.</p>
+  <form method="post" action="/maintenance/audit-archive"><input type="hidden" name="csrf_token" value="{{ chrome.csrf_token }}"><button type="submit" class="secondary">Archive older audit events</button></form>
+</section>
+
 <div class="maintenance-grid">
   <section class="panel">
     <div class="card-heading"><div><h2>Database snapshots</h2><p>Verified snapshots stored in the backup volume.</p></div>

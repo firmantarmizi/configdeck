@@ -1,6 +1,28 @@
 (function () {
 "use strict";
 
+function initializeLineNumbers() {
+  document.querySelectorAll('textarea.dotenv-output, textarea[name="dotenv"]').forEach((input) => {
+    if (input.closest(".numbered-env")) return;
+    const wrapper = document.createElement("div");
+    wrapper.className = "numbered-env";
+    const gutter = document.createElement("div");
+    gutter.className = "env-line-numbers";
+    gutter.setAttribute("aria-hidden", "true");
+    input.before(wrapper);
+    wrapper.append(gutter, input);
+    input.wrap = "off";
+    const update = () => {
+      const lines = input.value.split("\n").length;
+      gutter.textContent = Array.from({ length: lines }, (_, i) => i + 1).join("\n");
+      gutter.scrollTop = input.scrollTop;
+    };
+    input.addEventListener("input", update);
+    input.addEventListener("scroll", () => { gutter.scrollTop = input.scrollTop; });
+    update();
+  });
+}
+
 function currentTheme() {
   return document.documentElement.dataset.theme === "light" ? "light" : "dark";
 }
@@ -729,12 +751,13 @@ document.addEventListener("click", (event) => {
   if (applyVisible) {
     const visibility = document.querySelector("[data-import-bulk-visibility]")?.value;
     const visibleRows = Array.from(document.querySelectorAll("[data-import-row]:not([hidden])"));
+    let changed = 0;
     visibleRows.forEach((row) => {
       const select = row.querySelector("[data-import-visibility]");
-      if (select) select.value = visibility;
+      if (select && !select.disabled) { select.value = visibility; changed += 1; }
     });
     const status = document.querySelector("[data-import-status]");
-    if (status) status.textContent = `${visibleRows.length} visible row(s) set to ${visibility}.`;
+    if (status) status.textContent = `${changed} editable row(s) set to ${visibility}.`;
     return;
   }
   const addItem = event.target.closest("[data-request-add]");
@@ -788,7 +811,24 @@ document.addEventListener("submit", (event) => {
     .catch(() => { status.textContent = "Copy failed. Refresh privileged authentication when required."; });
 });
 
+function updateImportFilter() {
+  const query = document.querySelector("[data-import-search]")?.value.trim().toLowerCase() || "";
+  const kind = document.querySelector("[data-import-status-filter]")?.value || "all";
+  const rows = Array.from(document.querySelectorAll("[data-import-row]"));
+  let visible = 0;
+  rows.forEach((row) => {
+    const status = row.dataset.importKind;
+    const matches = row.dataset.importKey.toLowerCase().includes(query)
+      && (kind === "all" || kind === status || kind === "known" && ["existing", "inherited"].includes(status));
+    row.hidden = !matches;
+    if (matches) visible += 1;
+  });
+  const status = document.querySelector("[data-import-status]");
+  if (status) status.textContent = `Showing ${visible} of ${rows.length}`;
+}
+
 document.addEventListener("change", (event) => {
+  if (event.target.matches("[data-import-status-filter]")) { updateImportFilter(); return; }
   const environmentAll = event.target.closest("[data-environment-toggle-all]");
   if (environmentAll) {
     const toggles = Array.from(document.querySelectorAll("[data-environment-toggle]"));
@@ -894,20 +934,12 @@ document.addEventListener("input", (event) => {
   }
   const search = event.target.closest("[data-import-search]");
   if (!search) return;
-  const query = search.value.trim().toLowerCase();
-  const rows = Array.from(document.querySelectorAll("[data-import-row]"));
-  let visible = 0;
-  rows.forEach((row) => {
-    const matches = !query || row.dataset.importKey.toLowerCase().includes(query);
-    row.hidden = !matches;
-    if (matches) visible += 1;
-  });
-  const status = document.querySelector("[data-import-status]");
-  if (status) status.textContent = `Showing ${visible} of ${rows.length}`;
+  updateImportFilter();
 });
 
 document.addEventListener("DOMContentLoaded", () => {
   updateThemeControls();
+  initializeLineNumbers();
   initializeApplicationShell();
   initializeGlobalSearch();
   initializeServiceCatalog();

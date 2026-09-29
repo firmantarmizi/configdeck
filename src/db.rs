@@ -195,8 +195,9 @@ mod tests {
         }
         for required_index in [
             "ix_login_attempts_time",
-            "ix_audit_action_time",
-            "ix_audit_outcome_time",
+            "ix_audit_action_id",
+            "ix_audit_outcome_id",
+            "ix_audit_actor_id",
             "idx_variables_environment_group_order",
         ] {
             let exists: i64 = sqlx::query_scalar(
@@ -208,6 +209,49 @@ mod tests {
             .unwrap();
             assert_eq!(exists, 1);
         }
+    }
+
+    #[tokio::test]
+    async fn audit_cursor_migration_upgrades_existing_database_and_uses_indexes() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::raw_sql(include_str!("../migrations/0001_initial.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO audit_logs(occurred_at, action) VALUES('2026-09-28T00:00:00Z', 'LOGIN')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(include_str!("../migrations/0002_audit_cursor_indexes.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_logs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+        let plan = sqlx::query("EXPLAIN QUERY PLAN SELECT id FROM audit_logs WHERE action = 'LOGIN' AND id < 99 ORDER BY id DESC LIMIT 26").fetch_all(&pool).await.unwrap();
+        assert!(plan.iter().any(|row| {
+            row.get::<String, _>("detail")
+                .contains("ix_audit_action_id")
+        }));
+        assert!(
+            sqlx::query("DELETE FROM audit_logs")
+                .execute(&pool)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

@@ -1,11 +1,13 @@
 # syntax=docker/dockerfile:1.7
 FROM rust:1.98.0-bookworm AS builder
 WORKDIR /build
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock build.rs ./
 COPY migrations ./migrations
 COPY templates ./templates
 COPY static ./static
 COPY src ./src
+ARG CONFIGDECK_BUILD_REVISION=local
+ENV CONFIGDECK_BUILD_REVISION=${CONFIGDECK_BUILD_REVISION}
 RUN --mount=type=cache,id=configdeck-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=configdeck-release-target,target=/build/target,sharing=locked \
     cargo build --locked --release \

@@ -90,7 +90,7 @@ Monitor health/readiness, restart count, CPU, memory, data/backup free space, ba
 
 ## Upgrades
 
-Version 0.1.1 adds multiline import and redacted environment preview without schema or encryption-format changes. Keep the published v0.1.0 database, data/backup volumes, and existing master key. Do not reset volumes or rerun bootstrap to upgrade. Follow the backup and validation steps below.
+The original version 0.1.1 release added multiline import and redacted environment preview without schema or encryption-format changes. Version 0.1.2 includes migration `0002_audit_cursor_indexes.sql`, which replaces audit filter indexes for cursor navigation. It preserves all records and encryption formats. Validate the upgrade against a disposable backup copy. The sidebar/account menu displays the version and build identity after deployment. Keep the existing database, data/backup volumes, and master key. Do not reset volumes or rerun bootstrap. Follow the backup and validation steps below.
 
 1. Create a verified backup and copy it off-host.
 2. Preserve the exact active master-key file.

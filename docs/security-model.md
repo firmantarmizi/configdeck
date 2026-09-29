@@ -63,7 +63,7 @@ Inactive users are always denied. Contributor access is App-scoped. The backend 
 
 ## Audit and retention
 
-Audit events contain allowlisted metadata, never configuration plaintext or authentication secrets. Configuration history and audit records are durable by design. Login-attempt rows older than 24 hours and sessions older than 30 days past absolute expiry are pruned opportunistically. Backup and audit retention must be set according to the deploying organization's recovery, legal, and incident-response requirements.
+Audit events contain allowlisted metadata, never configuration plaintext or authentication secrets. Configuration history and audit records are durable by design. Login-attempt rows older than 24 hours and sessions older than 30 days past absolute expiry are pruned opportunistically. Audit older than 180 days can be moved to verified archives through Administrator maintenance. Archive files and backups require an off-host lifecycle suitable for recovery and incident response.
 
 ## Reporting vulnerabilities
 
@@ -72,3 +72,7 @@ Follow the private reporting process in [`SECURITY.md`](../SECURITY.md). Never i
 ### Redacted environment preview
 
 The read-only `/environments/{id}/preview` page uses the same backend-authorized projection as the normal variable list. It decrypts public values only; restricted values are fixed masks, including for their original requester. Every request checks the session and service scope. It needs no recent authentication because it reveals no additional information, uses no-store/no-cache headers, and grants no full-export, download, or request-apply capability.
+
+Deployed-import metadata matching is scoped to the authorized App and selects no ciphertext or plaintext. Known visibility is locked in review and enforced again inside the write transaction. Conflicting visibility, incompatible pending changes, manipulated selections, and stale encrypted preview snapshots reject the batch without partial writes. Archiving an environment is reversible and transactionally blocked for the last active environment or an environment with open requests.
+
+Audit archival is an Administrator-only, recent-authenticated, CSRF-protected maintenance action with a fixed 180-day cutoff and bounded batches. A durable verified archive precedes deletion. The delete guard is suspended only inside the exclusive writer transaction and reinstated before commit; rollback restores both rows and guard. No general audit-delete API exists. Archive files are private operational evidence and must be protected with backups.

@@ -300,7 +300,8 @@ pub async fn create(
     let active_dek_version_i64 = i64::try_from(active_dek_version).map_err(|_| AppError::Crypto)?;
     let mut keys = HashSet::with_capacity(input.items.len());
     let mut prepared = Vec::with_capacity(input.items.len());
-    for input_item in input.items {
+    let mut next_order = crate::variables::next_display_order(pool, &input.environment_id).await?;
+    for mut input_item in input.items {
         let key = validate_key(&input_item.key)?;
         if !keys.insert(key.clone()) {
             return Err(AppError::InvalidRequest);
@@ -312,6 +313,10 @@ pub async fn create(
         .bind(&key)
         .fetch_optional(pool)
         .await?;
+        if existing.is_none() && input_item.display_order.is_none() {
+            input_item.display_order = Some(next_order);
+            next_order += 1;
+        }
         let item_id = Uuid::new_v4().to_string();
         let item = prepare_item(
             crypto,
@@ -404,19 +409,20 @@ pub async fn create_inline_edit(
     environment_id: &str,
     input: InlineEditInput,
 ) -> Result<String, AppError> {
-    let current_key: String = sqlx::query_scalar(
-        "SELECT v.key FROM variables v \
+    let (current_key, current_group, current_order): (String, Option<String>, i64) =
+        sqlx::query_as(
+            "SELECT v.key, v.group_name, v.display_order FROM variables v \
          JOIN environments e ON e.id = v.environment_id \
          JOIN services s ON s.id = e.service_id \
          WHERE v.id = ? AND v.environment_id = ? AND v.lifecycle_status = 'ACTIVE' \
            AND s.organization_id = ?",
-    )
-    .bind(&input.variable_id)
-    .bind(environment_id)
-    .bind(&session.user.organization_id)
-    .fetch_optional(pool)
-    .await?
-    .ok_or(AppError::NotFound)?;
+        )
+        .bind(&input.variable_id)
+        .bind(environment_id)
+        .bind(&session.user.organization_id)
+        .fetch_optional(pool)
+        .await?
+        .ok_or(AppError::NotFound)?;
     let new_key = validate_key(&input.new_key)?;
     let value = if input.value_source == "OPERATOR_PROVIDED" {
         None
@@ -435,8 +441,8 @@ pub async fn create_inline_edit(
         visibility: Some(input.visibility),
         value_type: Some(input.value_type),
         description: input.description,
-        group_name: None,
-        display_order: None,
+        group_name: current_group,
+        display_order: Some(current_order),
     };
     let (title, items) = if new_key == current_key {
         (format!("Update {current_key}"), vec![proposed])
@@ -577,6 +583,13 @@ async fn prepare_shared_request(
     let request_id = Uuid::new_v4().to_string();
     let (dek_version, dek) = environments::active_dek(pool, crypto, environment_id).await?;
     let dek_version_i64 = i64::try_from(dek_version).map_err(|_| AppError::Crypto)?;
+    let (source_group, source_order): (Option<String>, i64) = sqlx::query_as(
+        "SELECT group_name, display_order FROM variables WHERE id = ? AND environment_id = ?",
+    )
+    .bind(expected_variable_id)
+    .bind(environment_id)
+    .fetch_one(pool)
+    .await?;
     let proposed = ChangeRequestItemInput {
         action: if input.new_key == input.current_key {
             "UPDATE".to_owned()
@@ -589,8 +602,8 @@ async fn prepare_shared_request(
         visibility: Some(input.visibility.clone()),
         value_type: Some(input.value_type.clone()),
         description: submitted.description.clone(),
-        group_name: None,
-        display_order: None,
+        group_name: source_group,
+        display_order: Some(source_order),
     };
     let item_inputs = shared_item_inputs(input, proposed);
     let mut items = Vec::with_capacity(item_inputs.len());
@@ -780,9 +793,10 @@ fn prepare_item(
             .as_ref()
             .and_then(|current| current.group_name.clone())
     });
-    let display_order = match input.display_order {
-        Some(order) => validate_display_order(order)?,
-        None => existing.as_ref().map_or(0, |current| current.display_order),
+    let display_order = if let Some(current) = &existing {
+        current.display_order
+    } else {
+        validate_display_order(input.display_order.unwrap_or(0))?
     };
     let value_source = input
         .value_source
@@ -2539,6 +2553,9 @@ mod tests {
         )
         .await
         .unwrap();
+        sqlx::query("UPDATE variables SET group_name = 'Database', display_order = 42 WHERE key = 'UPDATE_ME'").execute(&pool).await.unwrap();
+        let mut edited = proposed_item("UPDATE", "UPDATE_ME", Some("updated"));
+        edited.display_order = Some(0);
         let mut grouped_add = proposed_item("ADD", "ADD_ME", Some("first line\nsecond line"));
         grouped_add.group_name = Some("Application".into());
         grouped_add.display_order = Some(7);
@@ -2552,7 +2569,7 @@ mod tests {
                 reason: "exercise all actions".into(),
                 items: vec![
                     grouped_add,
-                    proposed_item("UPDATE", "UPDATE_ME", Some("updated")),
+                    edited,
                     proposed_item("DELETE", "DELETE_ME", None),
                 ],
             },
@@ -2619,6 +2636,8 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(grouped, (Some("Application".into()), 7));
+        let preserved: (Option<String>, i64) = sqlx::query_as("SELECT group_name, display_order FROM variables WHERE environment_id = ? AND key = 'UPDATE_ME'").bind(&environment_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(preserved, (Some("Database".into()), 42));
         let deleted: String = sqlx::query_scalar(
             "SELECT lifecycle_status FROM variables WHERE environment_id = ? AND key = 'DELETE_ME'",
         )

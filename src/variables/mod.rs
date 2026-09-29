@@ -1,3 +1,5 @@
+pub mod import_review;
+
 use http::Uri;
 use serde::Serialize;
 use sqlx::{FromRow, SqlitePool};
@@ -234,6 +236,7 @@ pub async fn record_applied(
     Ok(write.variable_id)
 }
 
+#[allow(clippy::too_many_lines)]
 async fn prepare_applied(
     pool: &SqlitePool,
     crypto: &CryptoManager,
@@ -254,12 +257,16 @@ async fn prepare_applied(
     let reason = validate_reason(&input.reason)?;
 
     let existing = sqlx::query_as::<_, ExistingVariable>(
-        "SELECT id, version, lifecycle_status FROM variables WHERE environment_id = ? AND key = ?",
+        "SELECT id, version, lifecycle_status, group_name, display_order FROM variables WHERE environment_id = ? AND key = ?",
     )
     .bind(environment_id)
     .bind(&key)
     .fetch_optional(pool)
     .await?;
+    let group_name =
+        group_name.or_else(|| existing.as_ref().and_then(|row| row.group_name.clone()));
+    let display_order =
+        applied_display_order(pool, environment_id, existing.as_ref(), display_order).await?;
     let (variable_id, version, action, base_version, expected_version, mutation) = match existing {
         Some(existing) if existing.lifecycle_status == "ACTIVE" => (
             existing.id,
@@ -349,6 +356,17 @@ pub async fn import_applied(
     environment_id: &str,
     inputs: Vec<AppliedVariableInput>,
 ) -> Result<usize, AppError> {
+    import_applied_reviewed(pool, crypto, session, environment_id, inputs, None).await
+}
+
+pub async fn import_applied_reviewed(
+    pool: &SqlitePool,
+    crypto: &CryptoManager,
+    session: &AuthenticatedSession,
+    environment_id: &str,
+    inputs: Vec<AppliedVariableInput>,
+    expected: Option<&[import_review::ImportReview]>,
+) -> Result<usize, AppError> {
     require_direct_apply(session)?;
     if inputs.is_empty() || inputs.len() > crate::dotenv::MAX_ENTRIES {
         return Err(AppError::InvalidRequest);
@@ -358,7 +376,26 @@ pub async fn import_applied(
         writes.push(prepare_applied(pool, crypto, session, environment_id, input).await?);
     }
     let now = now_rfc3339().map_err(AppError::Internal)?;
-    let mut transaction = pool.begin().await?;
+    let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let active: bool = sqlx::query_scalar("SELECT e.archived_at IS NULL AND s.archived_at IS NULL FROM environments e JOIN services s ON s.id = e.service_id WHERE e.id = ?")
+        .bind(environment_id).fetch_one(&mut *transaction).await?;
+    if !active {
+        return Err(AppError::Conflict);
+    }
+    let references =
+        import_review::load(&mut transaction, &writes[0].environment.service_id).await?;
+    let keys = writes
+        .iter()
+        .map(|write| write.key.clone())
+        .collect::<Vec<_>>();
+    let reviews = import_review::review(&references, environment_id, &keys);
+    if expected.is_some_and(|snapshot| snapshot != reviews.as_slice())
+        || reviews.iter().zip(&writes).any(|(review, write)| {
+            review.conflict || review.locked && review.visibility != write.visibility
+        })
+    {
+        return Err(AppError::ImportReviewConflict);
+    }
     for write in &writes {
         persist_applied_in_transaction(&mut transaction, session, write, &now).await?;
     }
@@ -792,6 +829,19 @@ pub async fn history(
     session: &AuthenticatedSession,
     variable_id: &str,
 ) -> Result<(String, Vec<HistoryView>), AppError> {
+    history_page(pool, crypto, session, variable_id, 0).await
+}
+
+pub async fn history_page(
+    pool: &SqlitePool,
+    crypto: &CryptoManager,
+    session: &AuthenticatedSession,
+    variable_id: &str,
+    before: i64,
+) -> Result<(String, Vec<HistoryView>), AppError> {
+    if before < 0 {
+        return Err(AppError::InvalidRequest);
+    }
     session.require_full()?;
     let current = sqlx::query_as::<_, RevealRow>(
         "SELECT v.id, v.key, v.encrypted_value, v.value_nonce, v.dek_version, v.version, v.visibility, \
@@ -819,9 +869,11 @@ pub async fn history(
                 vv.encrypted_value, vv.value_nonce, vv.dek_version, vv.visibility, vv.value_type, \
                 vv.description, vv.group_name, vv.lifecycle_status, vv.changed_at, u.email AS changed_by \
          FROM variable_versions vv JOIN environments e ON e.id = vv.environment_id \
-         JOIN users u ON u.id = vv.changed_by WHERE vv.variable_id = ? ORDER BY vv.version DESC",
+         JOIN users u ON u.id = vv.changed_by WHERE vv.variable_id = ? AND (? = 0 OR vv.version < ?) ORDER BY vv.version DESC LIMIT 26",
     )
     .bind(variable_id)
+    .bind(before)
+    .bind(before)
     .fetch_all(pool)
     .await?;
     let mut history = Vec::with_capacity(rows.len());
@@ -1048,6 +1100,8 @@ struct ExistingVariable {
     id: String,
     version: i64,
     lifecycle_status: String,
+    group_name: Option<String>,
+    display_order: i64,
 }
 
 #[derive(FromRow)]
@@ -1255,6 +1309,35 @@ pub(crate) fn validate_group_name(value: Option<String>) -> Result<Option<String
     Ok(Some(value.to_owned()))
 }
 
+async fn applied_display_order(
+    pool: &SqlitePool,
+    environment_id: &str,
+    existing: Option<&ExistingVariable>,
+    requested: i64,
+) -> Result<i64, AppError> {
+    if let Some(row) = existing {
+        return Ok(row.display_order);
+    }
+    validate_display_order(
+        next_display_order(pool, environment_id)
+            .await?
+            .checked_add(requested)
+            .ok_or(AppError::InvalidRequest)?,
+    )
+}
+
+pub(crate) async fn next_display_order(
+    pool: &SqlitePool,
+    environment_id: &str,
+) -> Result<i64, AppError> {
+    Ok(sqlx::query_scalar(
+        "SELECT COALESCE(MAX(display_order) + 1, 0) FROM variables WHERE environment_id = ?",
+    )
+    .bind(environment_id)
+    .fetch_one(pool)
+    .await?)
+}
+
 pub(crate) fn validate_display_order(value: i64) -> Result<i64, AppError> {
     let max_entries = i64::try_from(crate::dotenv::MAX_ENTRIES).unwrap_or(i64::MAX);
     if (0..max_entries).contains(&value) {
@@ -1331,9 +1414,9 @@ mod tests {
     };
 
     use super::{
-        AppliedVariableInput, delete_applied, export_environment, history, import_applied,
-        list_for_environment, record_applied, reveal_current, reveal_version, suggest_value_type,
-        validate_key,
+        AppliedVariableInput, delete_applied, export_environment, history, history_page,
+        import_applied, list_for_environment, record_applied, reveal_current, reveal_version,
+        suggest_value_type, validate_key,
     };
 
     #[test]
@@ -1814,6 +1897,283 @@ mod tests {
                 .any(|key| key == "FAKE_KEY" || key == "synthetic-payload")
         );
         assert!(exported.dotenv.contains("KEY_PRIVATE=\"-----BEGIN PRIVATE KEY-----\nsynthetic-payload=\nFAKE_KEY=inside-value\n-----END PRIVATE KEY-----\"\n"));
+    }
+
+    #[tokio::test]
+    async fn edits_and_reimports_keep_group_order_and_history_is_bounded() {
+        let pool = test_pool().await;
+        seed_identity(&pool).await;
+        let crypto = CryptoManager::new(Zeroizing::new([48; 32]));
+        initialize_and_validate_key_registry(&pool, &crypto)
+            .await
+            .unwrap();
+        let admin = session("admin", Role::Administrator);
+        let app = services::create_with_default_environments(
+            &pool,
+            &crypto,
+            &admin,
+            ServiceInput {
+                name: "Stable order".into(),
+                description: None,
+            },
+        )
+        .await
+        .unwrap();
+        let (_, envs) = environments::list_for_service(&pool, &admin, &app)
+            .await
+            .unwrap();
+        let env = &envs[0].id;
+        let mut first = input("Z_FIRST", "one", "public", "string");
+        first.group_name = Some("Database".into());
+        first.display_order = 8;
+        let mut second = input("A_SECOND", "two", "public", "string");
+        second.group_name = Some("Database".into());
+        second.display_order = 9;
+        import_applied(&pool, &crypto, &admin, env, vec![first, second])
+            .await
+            .unwrap();
+        // A partial reimport carries position zero; existing ordering/group must survive.
+        import_applied(
+            &pool,
+            &crypto,
+            &admin,
+            env,
+            vec![input("A_SECOND", "three", "public", "string")],
+        )
+        .await
+        .unwrap();
+        record_applied(
+            &pool,
+            &crypto,
+            &admin,
+            env,
+            input("A_SECOND", "four", "restricted", "string"),
+        )
+        .await
+        .unwrap();
+        let mut new_key = input("B_NEW", "five", "public", "string");
+        new_key.group_name = Some("Database".into());
+        record_applied(&pool, &crypto, &admin, env, new_key)
+            .await
+            .unwrap();
+        let (_, rows) = list_for_environment(&pool, &crypto, &admin, env)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.iter().map(|row| row.key.as_str()).collect::<Vec<_>>(),
+            vec!["Z_FIRST", "A_SECOND", "B_NEW"]
+        );
+        assert_eq!(rows[1].display_order, 9);
+        assert_eq!(rows[1].group_name.as_deref(), Some("Database"));
+        let id = rows[1].id.clone();
+        for _ in 0..28 {
+            record_applied(
+                &pool,
+                &crypto,
+                &admin,
+                env,
+                input("A_SECOND", "synthetic", "restricted", "string"),
+            )
+            .await
+            .unwrap();
+        }
+        let (_, history) = history_page(&pool, &crypto, &admin, &id, 0).await.unwrap();
+        assert_eq!(history.len(), 26);
+        assert!(history.iter().all(|row| row.value.is_none()));
+        let (_, older) = history_page(&pool, &crypto, &admin, &id, history[24].version)
+            .await
+            .unwrap();
+        assert_eq!(older.len(), 6);
+        assert!(older.iter().all(|row| row.version < history[24].version));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn import_metadata_is_scoped_stale_safe_and_never_decrypted() {
+        let pool = test_pool().await;
+        seed_identity(&pool).await;
+        let crypto = CryptoManager::new(Zeroizing::new([47; 32]));
+        initialize_and_validate_key_registry(&pool, &crypto)
+            .await
+            .unwrap();
+        let admin = session("admin", Role::Administrator);
+        let app = services::create_with_default_environments(
+            &pool,
+            &crypto,
+            &admin,
+            ServiceInput {
+                name: "Metadata".into(),
+                description: None,
+            },
+        )
+        .await
+        .unwrap();
+        let (_, envs) = environments::list_for_service(&pool, &admin, &app)
+            .await
+            .unwrap();
+        let source = &envs[0].id;
+        let target = &envs[1].id;
+        let third = &envs[2].id;
+        for (key, visibility) in [
+            ("PUBLIC", "public"),
+            ("SECRET", "restricted"),
+            ("CONFLICT", "public"),
+            ("REMOVED", "public"),
+        ] {
+            let id = record_applied(
+                &pool,
+                &crypto,
+                &admin,
+                source,
+                input(key, "synthetic", visibility, "string"),
+            )
+            .await
+            .unwrap();
+            if key == "REMOVED" {
+                delete_applied(&pool, &crypto, &admin, &id, "Test removal")
+                    .await
+                    .unwrap();
+            }
+        }
+        record_applied(
+            &pool,
+            &crypto,
+            &admin,
+            third,
+            input("CONFLICT", "synthetic", "restricted", "string"),
+        )
+        .await
+        .unwrap();
+        let keys = ["PUBLIC", "SECRET", "CONFLICT", "REMOVED", "NEW", "public"].map(str::to_owned);
+        // Corrupt source ciphertext: preview must not attempt to decrypt even public values.
+        sqlx::query("UPDATE variables SET encrypted_value = zeroblob(16)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (_, reviews) = super::import_review::preview(&pool, &admin, target, &keys)
+            .await
+            .unwrap();
+        assert_eq!(reviews[0].visibility, "public");
+        assert_eq!(reviews[0].status, "inherited");
+        assert!(reviews[0].locked);
+        assert_eq!(reviews[1].visibility, "restricted");
+        assert!(reviews[2].conflict);
+        assert_eq!(reviews[2].visibility, "restricted");
+        assert_eq!(reviews[3].status, "historical");
+        assert_eq!(reviews[3].visibility, "restricted");
+        assert!(!reviews[3].locked);
+        assert_eq!(reviews[4].status, "new");
+        assert_eq!(reviews[5].status, "new");
+        assert!(
+            !serde_json::to_string(&reviews)
+                .unwrap()
+                .contains("synthetic")
+        );
+        assert!(
+            super::import_review::preview(
+                &pool,
+                &session("contributor", Role::Contributor),
+                target,
+                &keys
+            )
+            .await
+            .is_err()
+        );
+        let mut other_org = admin.clone();
+        other_org.user.organization_id = "unassigned".into();
+        assert!(matches!(
+            super::import_review::preview(&pool, &other_org, target, &keys).await,
+            Err(AppError::NotFound)
+        ));
+        let other_app = services::create_with_default_environments(
+            &pool,
+            &crypto,
+            &admin,
+            ServiceInput {
+                name: "Other metadata".into(),
+                description: None,
+            },
+        )
+        .await
+        .unwrap();
+        let (_, other_envs) = environments::list_for_service(&pool, &admin, &other_app)
+            .await
+            .unwrap();
+        let (_, isolated) = super::import_review::preview(&pool, &admin, &other_envs[0].id, &keys)
+            .await
+            .unwrap();
+        assert!(isolated.iter().all(|review| review.status == "new"));
+        // Hand-crafted visibility cannot downgrade an inherited restricted key.
+        assert!(matches!(
+            super::import_applied_reviewed(
+                &pool,
+                &crypto,
+                &admin,
+                target,
+                vec![input("SECRET", "new synthetic", "public", "string")],
+                Some(&reviews[1..2])
+            )
+            .await,
+            Err(AppError::ImportReviewConflict)
+        ));
+        assert!(matches!(
+            import_applied(
+                &pool,
+                &crypto,
+                &admin,
+                target,
+                vec![
+                    input("NEW", "synthetic", "restricted", "string"),
+                    input("CONFLICT", "synthetic", "restricted", "string")
+                ]
+            )
+            .await,
+            Err(AppError::ImportReviewConflict)
+        ));
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM variables WHERE environment_id = ?")
+                .bind(target)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 0);
+        // A new restriction since preview invalidates the entire reviewed batch.
+        sqlx::query("UPDATE variables SET visibility = 'restricted', version = version + 1 WHERE key = 'PUBLIC'").execute(&pool).await.unwrap();
+        assert!(matches!(
+            super::import_applied_reviewed(
+                &pool,
+                &crypto,
+                &admin,
+                target,
+                vec![input("PUBLIC", "synthetic", "public", "string")],
+                Some(&reviews[..1])
+            )
+            .await,
+            Err(AppError::ImportReviewConflict)
+        ));
+        let (_, fresh) = super::import_review::preview(&pool, &admin, target, &["PUBLIC".into()])
+            .await
+            .unwrap();
+        super::import_applied_reviewed(
+            &pool,
+            &crypto,
+            &admin,
+            target,
+            vec![input("PUBLIC", "synthetic", "restricted", "string")],
+            Some(&fresh),
+        )
+        .await
+        .unwrap();
+        // Archiving sources makes their old public metadata historical only.
+        environments::set_archived(&pool, &admin, source, true)
+            .await
+            .unwrap();
+        let (_, archived) =
+            super::import_review::preview(&pool, &admin, target, &["SECRET".into()])
+                .await
+                .unwrap();
+        assert_eq!(archived[0].status, "historical");
+        assert!(!archived[0].locked);
     }
 
     fn input(key: &str, value: &str, visibility: &str, value_type: &str) -> AppliedVariableInput {
