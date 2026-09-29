@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.7
-FROM rust:1.98.0-bookworm AS builder
+FROM rust:1.98.1-bookworm AS builder
 WORKDIR /build
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY migrations ./migrations

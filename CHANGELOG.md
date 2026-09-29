@@ -16,6 +16,12 @@
 - Bound audit and version-history reads using cursor navigation; avoid full audit counts and deep offsets.
 - Reduce successful health/readiness/static request logging to debug level.
 
+### Maintenance
+
+- Update Askama, ipnet, thiserror, and uuid dependencies and pinned Docker GitHub Actions.
+- Align container builds and CI/release verification on Rust 1.98.1; minimum supported Rust remains 1.94.0.
+- Group routine Dependabot updates to reduce separate maintenance pull requests.
+
 ### Upgrade
 
 - Migration `0002_audit_cursor_indexes.sql` replaces audit filter indexes without changing stored values or encryption formats. Back up the database before upgrading.
