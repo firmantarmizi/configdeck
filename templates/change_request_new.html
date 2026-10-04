@@ -19,11 +19,12 @@
       <label class="request-value-field" data-value-field>Value<input name="value_0" maxlength="32768" data-value-input><small>Restricted values become write-only after submission.</small></label>
       <label>Visibility<select name="visibility_0"><option value="restricted">Restricted</option><option value="public">Public</option></select></label>
       <label>Type<select name="value_type_0" data-value-type><option value="string">String</option><option value="boolean">Boolean</option><option value="integer">Integer</option><option value="url">URL</option><option value="multiline">Multiline</option></select></label>
-      <label><span>Group <span class="field-hint">(Optional)</span></span><input name="group_name_0" maxlength="80" placeholder="Database"></label>
+      <label><span>Group <span class="field-hint">(Optional)</span></span><input name="group_name_0" list="environment-groups" maxlength="80" placeholder="Choose or propose a group"><small>Choose an existing group or type a new name. Leave blank for ungrouped keys.</small></label>
       <label class="span-two">Description <span class="field-hint">Optional</span><input name="description_0" maxlength="1000" placeholder="What this key controls"></label>
     </fieldset>
   </div>
   <button type="button" class="secondary request-add-item" data-request-add><svg class="icon" aria-hidden="true"><use href="#icon-plus"></use></svg>Add another key</button>
   <div class="form-actions"><a class="button-link tertiary" href="/services/{{ environment.service_id }}/environments">Cancel</a><button type="submit"><svg class="icon" aria-hidden="true"><use href="#icon-check"></use></svg>Submit request</button></div>
 </form>
+<datalist id="environment-groups">{% for group in groups %}<option value="{{ group }}">{% endfor %}</datalist>
 {% endblock %}

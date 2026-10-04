@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.4
+
+- Highlight new and updated assignments in resulting preview, including complete multiline values, and list deleted keys separately. Copy keeps the canonical final `.env` without review markers or removed keys.
+
+- Offer existing groups and new group names when preparing configuration requests; confirm receipt of encrypted imported values without revealing them back to Contributors.
+- Let Operators and Administrators correct requested values, groups, and ordering from resulting preview, with explicit approval, audit, and a fresh deployment checkpoint.
+- Skip identical rows when recording deployed configuration, preserving existing versions, timestamps, and audit history. Mixed imports record only real changes and retain existing type/description defaults.
+
 ## 0.1.3
 
 - Refresh static assets automatically per build; simplify version details and tighten preview line-number spacing.

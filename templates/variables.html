@@ -1,6 +1,7 @@
 {% extends "app_base.html" %}
 {% block title %}{{ environment.service_name }} / {{ environment.name }} · ConfigDeck{% endblock %}
 {% block content %}
+{% match recorded %}{% when Some with (count) %}<div class="notice" role="status">{% if *count == 0 %}No changes detected. The pasted configuration matches the recorded values and metadata; no change history or audit events were added.{% else %}Recorded {{ count }} changed keys. Unchanged keys kept their existing history.{% endif %}</div>{% when None %}{% endmatch %}
 <nav class="breadcrumbs" aria-label="Breadcrumb"><a href="/services">Configurations</a><span>/</span><a href="/services/{{ environment.service_id }}/environments">{{ environment.service_name }}</a><span>/</span><span>{{ environment.name }}</span></nav>
 <div class="page-heading">
   <div><p class="eyebrow">Environment</p><h1>{{ environment.name }}</h1><p class="lead">Manage values for {{ environment.service_name }}.</p></div>

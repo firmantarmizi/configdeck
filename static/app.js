@@ -937,6 +937,21 @@ document.addEventListener("input", (event) => {
   updateImportFilter();
 });
 
+document.addEventListener("input", (event) => {
+  const form = event.target.closest("[data-preview-edit]");
+  if (!form) return;
+  if (event.target.matches("[data-review-replace]")) {
+    form.querySelector("[data-review-value]").readOnly = !event.target.checked;
+  }
+  document.querySelectorAll("[data-preview-confirm], [data-copy-all='#resulting-dotenv']").forEach((control) => { control.disabled = true; });
+  const warning = document.querySelector("[data-preview-unsaved]");
+  if (warning) warning.hidden = false;
+  // Save one correction at a time so another form cannot discard unsaved edits.
+  document.querySelectorAll("[data-preview-edit]").forEach((other) => {
+    if (other !== form) other.querySelectorAll("input, textarea, button").forEach((control) => { control.disabled = true; });
+  });
+});
+
 document.addEventListener("DOMContentLoaded", () => {
   updateThemeControls();
   initializeLineNumbers();

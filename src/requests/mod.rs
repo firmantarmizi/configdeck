@@ -1,5 +1,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+mod review;
+pub use review::{DeletedPreviewItem, EditablePreviewItem, PreviewEdit, PreviewLine, edit_preview};
+
 use data_encoding::HEXLOWER;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -172,13 +175,16 @@ struct CurrentRow {
     lifecycle_status: String,
 }
 
-#[derive(Debug)]
 pub struct ResultingPreview {
     pub environment: EnvironmentContext,
     pub dotenv: Zeroizing<String>,
     pub fingerprint: String,
     pub request_ids: Vec<String>,
     pub item_count: usize,
+    pub editable_items: Vec<EditablePreviewItem>,
+    pub groups: Vec<String>,
+    pub lines: Vec<PreviewLine>,
+    pub deleted_items: Vec<DeletedPreviewItem>,
 }
 
 struct PreparedApply {
@@ -1283,7 +1289,27 @@ pub async fn preview_resulting(
     validate_selection(&requests, &items)?;
     let current = load_current_rows(pool, environment_id).await?;
     let fingerprint = selection_fingerprint(&requests, &items, &current);
-    let dotenv = resolve_dotenv(pool, crypto, &environment, &items, &current).await?;
+    let (dotenv, lines) = resolve_dotenv(pool, crypto, &environment, &items, &current).await?;
+    let deleted_items = items
+        .iter()
+        .filter(|item| item.action == "DELETE")
+        .map(|item| DeletedPreviewItem {
+            key: item.key.clone(),
+            group_name: item.proposed_group_name.clone(),
+        })
+        .collect();
+    let editable_items = review::editable_items(pool, crypto, &environment, &items).await?;
+    let groups = current
+        .iter()
+        .filter_map(|row| row.group_name.clone())
+        .chain(
+            items
+                .iter()
+                .filter_map(|item| item.proposed_group_name.clone()),
+        )
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
 
     let now = now_rfc3339()?;
     let mut transaction = pool.begin().await?;
@@ -1317,6 +1343,10 @@ pub async fn preview_resulting(
         fingerprint: HEXLOWER.encode(&fingerprint),
         request_ids,
         item_count: items.len(),
+        editable_items,
+        groups,
+        lines,
+        deleted_items,
     })
 }
 
@@ -1661,7 +1691,7 @@ async fn resolve_dotenv(
     environment: &EnvironmentContext,
     items: &[ItemRow],
     current: &[CurrentRow],
-) -> Result<Zeroizing<String>, AppError> {
+) -> Result<(Zeroizing<String>, Vec<PreviewLine>), AppError> {
     let mut values = BTreeMap::<String, (String, Option<String>, i64)>::new();
     for row in current
         .iter()
@@ -1743,7 +1773,9 @@ async fn resolve_dotenv(
             },
         )
         .collect::<Vec<_>>();
-    Ok(Zeroizing::new(crate::dotenv::render(&entries)))
+    let dotenv = Zeroizing::new(crate::dotenv::render(&entries));
+    let lines = review::annotate_lines(&dotenv, &entries, items);
+    Ok((dotenv, lines))
 }
 
 async fn decrypt_current_row(
@@ -2556,7 +2588,8 @@ mod tests {
         sqlx::query("UPDATE variables SET group_name = 'Database', display_order = 42 WHERE key = 'UPDATE_ME'").execute(&pool).await.unwrap();
         let mut edited = proposed_item("UPDATE", "UPDATE_ME", Some("updated"));
         edited.display_order = Some(0);
-        let mut grouped_add = proposed_item("ADD", "ADD_ME", Some("first line\nsecond line"));
+        let mut grouped_add =
+            proposed_item("ADD", "ADD_ME", Some("first line\nUPDATE_ME=inside-value"));
         grouped_add.group_name = Some("Application".into());
         grouped_add.display_order = Some(7);
         let request_id = create(
@@ -2599,11 +2632,49 @@ mod tests {
         assert!(
             preview
                 .dotenv
-                .contains("ADD_ME=\"first line\nsecond line\"\n")
+                .contains("ADD_ME=\"first line\nUPDATE_ME=inside-value\"\n")
         );
         assert!(preview.dotenv.contains("# [Application]\n"));
         assert!(preview.dotenv.contains("UPDATE_ME=updated\n"));
         assert!(!preview.dotenv.contains("DELETE_ME"));
+        assert_eq!(
+            preview
+                .lines
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            preview.dotenv.as_str()
+        );
+        assert_eq!(
+            preview
+                .lines
+                .iter()
+                .find(|line| line.text.starts_with("ADD_ME="))
+                .unwrap()
+                .label,
+            "NEW"
+        );
+        assert_eq!(
+            preview
+                .lines
+                .iter()
+                .find(|line| line.text.starts_with("UPDATE_ME=inside-value"))
+                .unwrap()
+                .label,
+            "NEW"
+        );
+        assert_eq!(
+            preview
+                .lines
+                .iter()
+                .find(|line| line.text.as_str() == "UPDATE_ME=updated")
+                .unwrap()
+                .label,
+            "UPDATE"
+        );
+        assert_eq!(preview.deleted_items.len(), 1);
+        assert_eq!(preview.deleted_items[0].key, "DELETE_ME");
         mark_applied(
             &pool,
             &crypto,
@@ -2824,6 +2895,150 @@ mod tests {
         assert!(matches!(
             validate_request_reason(&update, ""),
             Err(AppError::InvalidRequest)
+        ));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn reviewer_corrections_are_authorized_atomic_and_invalidate_preview() {
+        let pool = test_pool().await;
+        seed_identity(&pool).await;
+        let crypto = CryptoManager::new(Zeroizing::new([79; 32]));
+        initialize_and_validate_key_registry(&pool, &crypto)
+            .await
+            .unwrap();
+        let admin = recent(session("admin", Role::Administrator));
+        let contributor = recent(session("contributor", Role::Contributor));
+        let app = services::create_with_default_environments(
+            &pool,
+            &crypto,
+            &admin,
+            ServiceInput {
+                name: "Reviewer corrections".into(),
+                description: None,
+            },
+        )
+        .await
+        .unwrap();
+        let (_, envs) = environments::list_for_service(&pool, &admin, &app)
+            .await
+            .unwrap();
+        let env = &envs[0].id;
+        sqlx::query("INSERT INTO user_service_access(user_id, service_id, granted_at, granted_by) VALUES('contributor', ?, '2026-10-04T00:00:00Z', 'admin')")
+            .bind(&app).execute(&pool).await.unwrap();
+        let mut proposal = single_add_request(env, "NEW_KEY", "original");
+        proposal.items[0].visibility = Some("restricted".into());
+        let id = create(&pool, &crypto, &contributor, proposal)
+            .await
+            .unwrap();
+        approve(&pool, &admin, &id).await.unwrap();
+        let manager = session_manager(&pool, &crypto);
+        let preview = preview_resulting(&pool, &crypto, &manager, &admin, vec![id.clone()])
+            .await
+            .unwrap();
+        let edit = || super::PreviewEdit {
+            request_ids: vec![id.clone()],
+            fingerprint: preview.fingerprint.clone(),
+            item_id: preview.editable_items[0].id.clone(),
+            value: Some("corrected\r\nsynthetic-value".into()),
+            group_name: Some("Database".into()),
+            display_order: 7,
+        };
+        for denied in [&contributor, &session("operator", Role::Operator)] {
+            assert!(matches!(
+                super::edit_preview(&pool, &crypto, &manager, denied, edit()).await,
+                Err(AppError::Forbidden)
+            ));
+        }
+        let mut invalid = edit();
+        invalid.item_id = uuid::Uuid::new_v4().to_string();
+        assert!(matches!(
+            super::edit_preview(&pool, &crypto, &manager, &admin, invalid).await,
+            Err(AppError::InvalidRequest)
+        ));
+        let mut invalid = edit();
+        invalid.group_name = Some("bad\ngroup".into());
+        assert!(matches!(
+            super::edit_preview(&pool, &crypto, &manager, &admin, invalid).await,
+            Err(AppError::InvalidRequest)
+        ));
+        let mut outsider = admin.clone();
+        outsider.user.organization_id = "another-org".into();
+        assert!(matches!(
+            super::edit_preview(&pool, &crypto, &manager, &outsider, edit()).await,
+            Err(AppError::NotFound)
+        ));
+        super::edit_preview(&pool, &crypto, &manager, &admin, edit())
+            .await
+            .unwrap();
+        assert!(matches!(
+            super::edit_preview(&pool, &crypto, &manager, &admin, edit()).await,
+            Err(AppError::Conflict)
+        ));
+        assert!(matches!(
+            mark_applied(
+                &pool,
+                &crypto,
+                &manager,
+                &admin,
+                vec![id.clone()],
+                &preview.fingerprint
+            )
+            .await,
+            Err(AppError::Conflict)
+        ));
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM variables")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        let (_, items) = detail(&pool, &crypto, &contributor, &id).await.unwrap();
+        assert!(items[0].value.is_none());
+        assert_eq!(items[0].group_name.as_deref(), Some("Database"));
+        let fresh = preview_resulting(&pool, &crypto, &manager, &admin, vec![id.clone()])
+            .await
+            .unwrap();
+        assert!(
+            fresh
+                .dotenv
+                .contains("# [Database]\nNEW_KEY=\"corrected\\r\nsynthetic-value\"")
+        );
+        assert_ne!(fresh.fingerprint, preview.fingerprint);
+        let mut unchanged = edit();
+        unchanged.value = None;
+        unchanged.fingerprint.clone_from(&fresh.fingerprint);
+        super::edit_preview(&pool, &crypto, &manager, &admin, unchanged)
+            .await
+            .unwrap();
+        let audits: Vec<String> = sqlx::query_scalar(
+            "SELECT metadata_json FROM audit_logs WHERE action = 'EDIT_REQUEST'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(audits.len(), 1);
+        assert!(!audits[0].contains("synthetic-value"));
+        mark_applied(
+            &pool,
+            &crypto,
+            &manager,
+            &admin,
+            vec![id.clone()],
+            &fresh.fingerprint,
+        )
+        .await
+        .unwrap();
+        let applied: (Option<String>, i64) = sqlx::query_as(
+            "SELECT group_name, display_order FROM variable_versions WHERE change_request_id = ?",
+        )
+        .bind(&id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(applied, (Some("Database".into()), 7));
+        assert!(matches!(
+            super::edit_preview(&pool, &crypto, &manager, &admin, edit()).await,
+            Err(AppError::Conflict)
         ));
     }
 

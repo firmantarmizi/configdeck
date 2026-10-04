@@ -19,6 +19,38 @@ use crate::{
 const MAX_VALUE_BYTES: usize = 32 * 1024;
 const MAX_REASON_CHARS: usize = 1_000;
 
+#[derive(FromRow)]
+pub struct VariableMetadata {
+    pub key: String,
+    pub group_name: Option<String>,
+    pub value_type: String,
+}
+
+pub async fn metadata_for_environment(
+    pool: &SqlitePool,
+    session: &AuthenticatedSession,
+    environment_id: &str,
+) -> Result<Vec<VariableMetadata>, AppError> {
+    session.require_full()?;
+    environment_context(pool, session, environment_id).await?;
+    Ok(sqlx::query_as("SELECT key, group_name, value_type FROM variables WHERE environment_id = ? AND lifecycle_status = 'ACTIVE' ORDER BY display_order, key")
+        .bind(environment_id).fetch_all(pool).await?)
+}
+
+pub async fn group_names(
+    pool: &SqlitePool,
+    session: &AuthenticatedSession,
+    environment_id: &str,
+) -> Result<Vec<String>, AppError> {
+    Ok(metadata_for_environment(pool, session, environment_id)
+        .await?
+        .into_iter()
+        .filter_map(|row| row.group_name)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect())
+}
+
 #[derive(Clone, Debug, FromRow, Serialize)]
 pub struct EnvironmentContext {
     pub id: String,
@@ -252,6 +284,7 @@ async fn prepare_applied(
     let value_type = validate_value_type(&input.value_type)?;
     validate_value(&input.value, value_type)?;
     let description = validate_description(input.description)?;
+    let group_is_explicit = input.group_name.is_some();
     let group_name = validate_group_name(input.group_name)?;
     let display_order = validate_display_order(input.display_order)?;
     let reason = validate_reason(&input.reason)?;
@@ -263,8 +296,11 @@ async fn prepare_applied(
     .bind(&key)
     .fetch_optional(pool)
     .await?;
-    let group_name =
-        group_name.or_else(|| existing.as_ref().and_then(|row| row.group_name.clone()));
+    let group_name = if group_is_explicit {
+        group_name
+    } else {
+        existing.as_ref().and_then(|row| row.group_name.clone())
+    };
     let display_order =
         applied_display_order(pool, environment_id, existing.as_ref(), display_order).await?;
     let (variable_id, version, action, base_version, expected_version, mutation) = match existing {
@@ -372,8 +408,26 @@ pub async fn import_applied_reviewed(
         return Err(AppError::InvalidRequest);
     }
     let mut writes = Vec::with_capacity(inputs.len());
-    for input in inputs {
-        writes.push(prepare_applied(pool, crypto, session, environment_id, input).await?);
+    let mut snapshots = Vec::with_capacity(inputs.len());
+    let mut unchanged = Vec::with_capacity(inputs.len());
+    let mut keys_seen = std::collections::HashSet::new();
+    for mut input in inputs {
+        if !keys_seen.insert(validate_key(&input.key)?) {
+            return Err(AppError::InvalidRequest);
+        }
+        let current = sqlx::query_as::<_, DeleteVariableRow>(IMPORT_CURRENT_SQL)
+            .bind(environment_id)
+            .bind(&input.key)
+            .fetch_optional(pool)
+            .await?;
+        if input.description.is_none() {
+            input.description = current.as_ref().and_then(|row| row.description.clone());
+        }
+        let value = Zeroizing::new(input.value.clone());
+        let write = prepare_applied(pool, crypto, session, environment_id, input).await?;
+        unchanged.push(import_is_unchanged(pool, crypto, &write, current.as_ref(), &value).await?);
+        snapshots.push(current);
+        writes.push(write);
     }
     let now = now_rfc3339().map_err(AppError::Internal)?;
     let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -396,8 +450,32 @@ pub async fn import_applied_reviewed(
     {
         return Err(AppError::ImportReviewConflict);
     }
-    for write in &writes {
-        persist_applied_in_transaction(&mut transaction, session, write, &now).await?;
+    let active_dek: i64 = sqlx::query_scalar(
+        "SELECT dek_version FROM environment_keys WHERE environment_id = ? AND status = 'ACTIVE'",
+    )
+    .bind(environment_id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    for (write, snapshot) in writes.iter().zip(&snapshots) {
+        let current = sqlx::query_as::<_, DeleteVariableRow>(IMPORT_CURRENT_SQL)
+            .bind(environment_id)
+            .bind(&write.key)
+            .fetch_optional(&mut *transaction)
+            .await?;
+        if current != *snapshot || write.dek_version != active_dek {
+            return Err(AppError::Conflict);
+        }
+    }
+    let mut changed_count = 0;
+    for (write, unchanged) in writes.iter().zip(unchanged) {
+        if !unchanged {
+            persist_applied_in_transaction(&mut transaction, session, write, &now).await?;
+            changed_count += 1;
+        }
+    }
+    if changed_count == 0 {
+        transaction.commit().await?;
+        return Ok(0);
     }
     sqlx::query(
         "INSERT INTO audit_logs(occurred_at, actor_user_id, action, service_id, environment_id, metadata_json) \
@@ -407,11 +485,50 @@ pub async fn import_applied_reviewed(
     .bind(&session.user.id)
     .bind(&writes[0].environment.service_id)
     .bind(environment_id)
-    .bind(format!("{{\"variable_count\":{}}}", writes.len()))
+    .bind(format!("{{\"variable_count\":{changed_count}}}"))
     .execute(&mut *transaction)
     .await?;
     transaction.commit().await?;
-    Ok(writes.len())
+    Ok(changed_count)
+}
+
+const IMPORT_CURRENT_SQL: &str = "SELECT id, environment_id, key, encrypted_value, value_nonce, dek_version, visibility, value_type, description, group_name, display_order, version FROM variables WHERE environment_id = ? AND key = ? AND lifecycle_status = 'ACTIVE'";
+
+async fn import_is_unchanged(
+    pool: &SqlitePool,
+    crypto: &CryptoManager,
+    write: &AppliedWrite,
+    current: Option<&DeleteVariableRow>,
+    value: &str,
+) -> Result<bool, AppError> {
+    let Some(row) = current else { return Ok(false) };
+    if write.expected_version != Some(row.version)
+        || write.visibility != row.visibility
+        || write.value_type != row.value_type
+        || write.description != row.description
+        || write.group_name != row.group_name
+        || write.display_order != row.display_order
+    {
+        return Ok(false);
+    }
+    let dek_version = u64::try_from(row.dek_version).map_err(|_| AppError::Crypto)?;
+    let dek =
+        environments::dek_by_version(pool, crypto, &write.environment.id, dek_version).await?;
+    let plaintext = crypto
+        .decrypt_current_value(
+            &dek,
+            &CurrentValueContext {
+                service_id: &write.environment.service_id,
+                environment_id: &write.environment.id,
+                variable_id: &row.id,
+                version: u64::try_from(row.version).map_err(|_| AppError::Crypto)?,
+                dek_version,
+            },
+            &row.encrypted_value,
+            &row.value_nonce,
+        )
+        .map_err(|_| AppError::Crypto)?;
+    Ok(plaintext.as_slice() == value.as_bytes())
 }
 
 pub async fn delete_applied(
@@ -1104,7 +1221,7 @@ struct ExistingVariable {
     display_order: i64,
 }
 
-#[derive(FromRow)]
+#[derive(FromRow, PartialEq, Eq)]
 struct DeleteVariableRow {
     id: String,
     environment_id: String,
@@ -2187,6 +2304,149 @@ mod tests {
             display_order: 0,
             reason: "Confirmed as applied in deployment platform".into(),
         }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn repeated_deployed_imports_only_record_real_differences() {
+        let pool = test_pool().await;
+        seed_identity(&pool).await;
+        let crypto = CryptoManager::new(Zeroizing::new([49; 32]));
+        initialize_and_validate_key_registry(&pool, &crypto)
+            .await
+            .unwrap();
+        let admin = session("admin", Role::Administrator);
+        let app = services::create_with_default_environments(
+            &pool,
+            &crypto,
+            &admin,
+            ServiceInput {
+                name: "Idempotent import".into(),
+                description: None,
+            },
+        )
+        .await
+        .unwrap();
+        let (_, envs) = environments::list_for_service(&pool, &admin, &app)
+            .await
+            .unwrap();
+        let env = &envs[0].id;
+        let mut original = input(
+            "PRIVATE",
+            "synthetic\nmultiline=1",
+            "restricted",
+            "multiline",
+        );
+        original.group_name = Some("Database".into());
+        original.description = Some("Keep description".into());
+        let public = input("PUBLIC", "", "public", "string");
+        import_applied(
+            &pool,
+            &crypto,
+            &admin,
+            env,
+            vec![original.clone(), public.clone()],
+        )
+        .await
+        .unwrap();
+        let before: (i64, i64, i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM audit_logs), (SELECT COUNT(*) FROM change_requests), (SELECT COUNT(*) FROM variable_versions)")
+            .fetch_one(&pool).await.unwrap();
+        let timestamps: Vec<(String, String, Vec<u8>)> = sqlx::query_as(
+            "SELECT updated_at, last_applied_at, encrypted_value FROM variables ORDER BY key",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let mut repeat = original.clone();
+        repeat.group_name = None;
+        repeat.description = None;
+        repeat.display_order = 18;
+        assert_eq!(
+            import_applied(
+                &pool,
+                &crypto,
+                &admin,
+                env,
+                vec![public.clone(), repeat.clone()]
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        let after: (i64, i64, i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM audit_logs), (SELECT COUNT(*) FROM change_requests), (SELECT COUNT(*) FROM variable_versions)")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(before, after);
+        let after_timestamps: Vec<(String, String, Vec<u8>)> = sqlx::query_as(
+            "SELECT updated_at, last_applied_at, encrypted_value FROM variables ORDER BY key",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(timestamps, after_timestamps);
+        let denied = session("contributor", Role::Contributor);
+        assert!(matches!(
+            import_applied(&pool, &crypto, &denied, env, vec![repeat.clone()]).await,
+            Err(AppError::Forbidden)
+        ));
+        let mut changed = public.clone();
+        changed.value = "new".into();
+        assert_eq!(
+            import_applied(&pool, &crypto, &admin, env, vec![repeat.clone(), changed])
+                .await
+                .unwrap(),
+            1
+        );
+        repeat.group_name = Some("Application".into());
+        assert_eq!(
+            import_applied(&pool, &crypto, &admin, env, vec![repeat.clone()])
+                .await
+                .unwrap(),
+            1
+        );
+        let version: i64 =
+            sqlx::query_scalar("SELECT version FROM variables WHERE key = 'PRIVATE'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(version, 2);
+        assert!(matches!(
+            import_applied(
+                &pool,
+                &crypto,
+                &admin,
+                env,
+                vec![repeat.clone(), repeat.clone()]
+            )
+            .await,
+            Err(AppError::InvalidRequest)
+        ));
+        let mut invalid = input("INVALID", "not-an-integer", "restricted", "integer");
+        assert!(
+            import_applied(
+                &pool,
+                &crypto,
+                &admin,
+                env,
+                vec![repeat.clone(), invalid.clone()]
+            )
+            .await
+            .is_err()
+        );
+        invalid.value = "42".into();
+        assert_eq!(
+            import_applied(&pool, &crypto, &admin, env, vec![repeat.clone(), invalid])
+                .await
+                .unwrap(),
+            1
+        );
+        sqlx::query("UPDATE variables SET encrypted_value = zeroblob(32) WHERE key = 'PRIVATE'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            import_applied(&pool, &crypto, &admin, env, vec![repeat]).await,
+            Err(AppError::Crypto)
+        ));
     }
 
     fn session_manager(pool: sqlx::SqlitePool, crypto: CryptoManager) -> SessionManager {

@@ -4,8 +4,28 @@
 <nav class="breadcrumbs" aria-label="Breadcrumb"><a href="/change-requests">Changes</a><span>/</span><span>Resulting configuration</span></nav>
 <div class="page-heading"><div><p class="eyebrow">Deployment checkpoint</p><h1>{{ environment.service_name }} / {{ environment.name }}</h1><p class="lead">This is the exact configuration that will exist after the selected approved changes.</p></div><span class="status-badge status-ready_to_apply">{{ item_count }} change items</span></div>
 <div class="notice security-notice"><div><strong>Apply this exact content in your deployment platform first</strong><span>Values shown here can include restricted plaintext. Do not save or share this page, and close it when finished.</span></div></div>
+{% if !editable_items.is_empty() %}
+<details class="panel stack" data-preview-editor><summary>Edit requested values and groups</summary>
+  <p class="muted">Edit one requested key at a time. Choose a group or type a new name; leave blank to move it to Ungrouped. Lower order numbers appear first within a group. Save and approve the correction to refresh the exact configuration below before copying or deploying it. Other current keys and deletions keep their reviewed state.</p>
+  <datalist id="preview-groups">{% for group in groups %}<option value="{{ group }}">{% endfor %}</datalist>
+  {% for item in editable_items %}
+  <form method="post" action="/change-requests/preview/edit" class="stack panel" data-preview-edit>
+    <input type="hidden" name="csrf_token" value="{{ chrome.csrf_token }}"><input type="hidden" name="request_ids" value="{{ request_ids }}"><input type="hidden" name="fingerprint" value="{{ fingerprint }}"><input type="hidden" name="item_id" value="{{ item.id }}">
+    <strong><code>{{ item.key }}</code></strong>
+    <label class="confirmation-check"><input type="checkbox" name="replace_value" value="yes" data-review-replace> Replace the requested value</label>
+    <label>Requested value<textarea name="value" maxlength="32768" rows="3" spellcheck="false" data-review-value readonly>{{ item.value.as_str() }}</textarea><small>Leave replacement unchecked to preserve the exact stored value when moving a key.</small></label>
+    <div class="request-overview"><label>Group<input name="group_name" list="preview-groups" maxlength="80" placeholder="Ungrouped" value="{% match item.group_name %}{% when Some with (group) %}{{ group }}{% when None %}{% endmatch %}"></label><label>Order<input name="display_order" type="number" min="0" max="499" value="{{ item.display_order }}" required></label></div>
+    <div><button type="submit">Save and approve correction</button></div>
+  </form>
+  {% endfor %}
+</details>
+<p class="notice" data-preview-unsaved hidden>Unsaved correction: save it before copying or marking this configuration as applied.</p>
+{% endif %}
 <section class="panel stack">
-  <textarea id="resulting-dotenv" class="dotenv-output" rows="18" readonly spellcheck="false">{{ dotenv }}</textarea>
+  <div class="preview-change-legend"><span class="preview-change-label diff-add">+ NEW</span><span class="preview-change-label diff-update">~ UPDATE</span><span class="preview-change-label diff-delete">− DELETE</span><span class="muted">Review markers are never included in Copy resulting .env.</span></div>
+  <div class="diff-preview" tabindex="0" role="region" aria-label="Resulting configuration with change markers"><div class="diff-lines">{% for line in lines %}<div class="diff-line diff-{{ line.kind }}"><span class="diff-line-number" aria-hidden="true">{{ line.number }}</span><span class="diff-line-marker" aria-label="{{ line.label }}">{{ line.label }}</span><code>{{ line.text.as_str() }}</code></div>{% endfor %}</div></div>
+  {% if !deleted_items.is_empty() %}<div class="preview-deletions"><strong>Removed from the resulting configuration</strong>{% for item in deleted_items %}<div class="diff-deleted-key"><span class="preview-change-label diff-delete">− DELETE</span><code>{{ item.key }}</code>{% match item.group_name %}{% when Some with (group) %}<span class="muted">{{ group }}</span>{% when None %}{% endmatch %}</div>{% endfor %}<small>These keys are omitted from the copied .env.</small></div>{% endif %}
+  <details><summary>Plain .env for manual copy</summary><textarea id="resulting-dotenv" class="dotenv-output" rows="18" readonly spellcheck="false">{{ dotenv }}</textarea></details>
   <div class="action-row"><button type="button" data-copy-all="#resulting-dotenv"><svg class="icon" aria-hidden="true"><use href="#icon-copy"></use></svg>Copy resulting .env</button><span class="copy-status" aria-live="polite"></span></div>
 </section>
 <section class="panel stack">
@@ -15,7 +35,7 @@
     <input type="hidden" name="request_ids" value="{{ request_ids }}">
     <input type="hidden" name="fingerprint" value="{{ fingerprint }}">
     <label class="confirmation-check"><input type="checkbox" required> I confirm this exact configuration is active in the deployment platform.</label>
-    <div class="action-row"><button type="submit"><svg class="icon" aria-hidden="true"><use href="#icon-check"></use></svg>Mark selected changes as applied</button><a class="button-link secondary" href="/change-requests"><svg class="icon" aria-hidden="true"><use href="#icon-x"></use></svg>Cancel</a></div>
+    <div class="action-row"><button type="submit" data-preview-confirm><svg class="icon" aria-hidden="true"><use href="#icon-check"></use></svg>Mark selected changes as applied</button><a class="button-link secondary" href="/change-requests"><svg class="icon" aria-hidden="true"><use href="#icon-x"></use></svg>Cancel</a></div>
   </form>
 </section>
 {% endblock %}

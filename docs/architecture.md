@@ -77,6 +77,14 @@ REQUESTED / NEEDS_INPUT
 
 Saving a request in ConfigDeck never implies that a deployment happened. Current configuration changes only after an authorized user explicitly records the external action.
 
+Manual and pasted requests offer existing environment groups and accept a new group name as proposal metadata. Imported values remain write-only in Contributor preview; the page confirms receipt without returning their plaintext.
+
+Operators and Administrators can correct a selected requested value, group, or order from resulting preview after recent authentication. Saving explicitly approves the correction, increments its revision, re-encrypts the proposal and audits `EDIT_REQUEST`. The previous preview is invalidated; the refreshed result must be copied/deployed before Mark Applied. This editor does not modify unrelated current keys or delete items.
+
+Recording deployed configuration compares values and effective metadata before writing. Identical entries retain their versions, applied timestamps and audit history; a fully identical import adds no change event. Existing types and descriptions are preserved by default. Missing group metadata retains the current group, while clearing the reviewed group explicitly moves it to Ungrouped. Imports retain keys absent from the paste; deletion remains an explicit change request.
+
+Resulting preview marks new and updated assignments across their complete physical lines and lists deleted keys separately. These annotations are presentation only: Copy uses the canonical final `.env`, and a plain view is available for manual selection. Multiline content that resembles another assignment does not create a false change marker.
+
 ## Operational boundaries
 
 - SQLite is intended for one ConfigDeck process and one persistent local volume, not horizontal replicas or a shared network filesystem.

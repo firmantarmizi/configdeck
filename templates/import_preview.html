@@ -5,6 +5,7 @@
 <div class="hero-heading compact-heading"><div><p class="eyebrow">Deployed state preview</p><h1>Review deployed configuration</h1><p class="lead"><strong>{{ entries.len() }} variables</strong> were parsed successfully. Values remain encrypted and are not repeated on this page.</p></div></div>
 
 <div class="notice"><div><strong>{{ new_count }} new · {{ known_count }} known · {{ conflict_count }} conflicts</strong><span>Known keys follow consistent visibility in this App. Public values will be visible to Contributors. New and historical-only keys default to Restricted.</span></div></div>
+<p class="muted">Only changed keys are recorded. Identical values and metadata keep their existing history and do not create change audit events. Keys omitted from this paste are kept.</p>
 {% if conflict_count > 0 %}<div class="error-panel"><strong>Resolve conflicts before recording</strong><p>Review visibility and open requests in the <a href="/services/{{ environment.service_id }}/environments">App workspace</a>, then import again. No environment is changed by this preview.</p></div>{% endif %}
 
 <form method="post" action="/environments/{{ environment.id }}/import/commit" class="stack">

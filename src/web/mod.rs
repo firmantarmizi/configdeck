@@ -157,6 +157,7 @@ struct EnvironmentsTemplate<'a> {
 #[derive(Template)]
 #[template(path = "variables.html")]
 struct VariablesTemplate<'a> {
+    recorded: Option<usize>,
     chrome: AppChrome<'a>,
     can_apply: bool,
     can_reveal_restricted: bool,
@@ -180,6 +181,7 @@ struct ServiceAccessTemplate<'a> {
 struct ChangeRequestNewTemplate<'a> {
     chrome: AppChrome<'a>,
     environment: &'a variables::EnvironmentContext,
+    groups: &'a [String],
 }
 
 #[derive(Template)]
@@ -198,6 +200,7 @@ struct RequestImportPreviewTemplate<'a> {
     preview_token: &'a str,
     entries: &'a [RequestImportPreviewEntry],
     requires_reason: bool,
+    groups: &'a [String],
 }
 
 #[derive(Template)]
@@ -236,6 +239,10 @@ struct ChangeRequestPreviewTemplate<'a> {
     fingerprint: &'a str,
     request_ids: &'a str,
     item_count: usize,
+    editable_items: &'a [requests::EditablePreviewItem],
+    groups: &'a [String],
+    lines: &'a [requests::PreviewLine],
+    deleted_items: &'a [requests::DeletedPreviewItem],
 }
 
 #[derive(Template)]
@@ -283,7 +290,7 @@ struct ImportPreviewEntry {
     key: String,
     group_name: Option<String>,
     starts_group: bool,
-    suggested_type: &'static str,
+    suggested_type: String,
     review: variables::import_review::ImportReview,
 }
 
@@ -522,6 +529,7 @@ struct RequestImportPreviewEntry {
 
 #[derive(Default, Deserialize)]
 struct VariableQuery {
+    recorded: Option<usize>,
     #[serde(default)]
     q: String,
     #[serde(default)]
@@ -727,6 +735,10 @@ fn change_routes() -> Router<AppState> {
             post(change_request_preview_selected),
         )
         .route("/change-requests/apply", post(change_request_apply))
+        .route(
+            "/change-requests/preview/edit",
+            post(change_request_preview_edit),
+        )
         .route(
             "/change-request-items/{id}/fulfill",
             post(change_request_fulfill),
@@ -1853,6 +1865,7 @@ async fn variable_list(
     )
     .await?;
     let html = VariablesTemplate {
+        recorded: query.recorded,
         chrome: app_chrome(&state, &session, &csrf, "configurations"),
         can_apply: session
             .user
@@ -1888,6 +1901,7 @@ async fn change_request_new(
         ChangeRequestNewTemplate {
             chrome: app_chrome(&state, &session, &csrf, "changes"),
             environment: &environment,
+            groups: &variables::group_names(&state.pool, &session, &environment_id).await?,
         }
         .render()?,
     )
@@ -1998,6 +2012,7 @@ async fn request_import_preview(
             preview_token: &preview_token,
             entries: &preview_entries,
             requires_reason,
+            groups: &variables::group_names(&state.pool, &session, &environment_id).await?,
         }
         .render()?,
     )
@@ -2232,9 +2247,53 @@ async fn change_request_preview(
         fingerprint: &preview.fingerprint,
         request_ids: &request_ids,
         item_count: preview.item_count,
+        editable_items: &preview.editable_items,
+        groups: &preview.groups,
+        lines: &preview.lines,
+        deleted_items: &preview.deleted_items,
     }
     .render()?;
     Ok(Html(html).into_response())
+}
+
+#[derive(Deserialize)]
+struct PreviewEditForm {
+    csrf_token: String,
+    request_ids: String,
+    fingerprint: String,
+    item_id: String,
+    value: String,
+    replace_value: Option<String>,
+    group_name: Option<String>,
+    display_order: i64,
+}
+
+async fn change_request_preview_edit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<PreviewEditForm>,
+) -> Result<Response, AppError> {
+    let (_, session) = authenticated(&state, &headers).await?;
+    state.sessions.verify_csrf(&session, &form.csrf_token)?;
+    let request_ids = requests::edit_preview(
+        &state.pool,
+        &state.crypto,
+        &state.sessions,
+        &session,
+        requests::PreviewEdit {
+            request_ids: form.request_ids.split(',').map(str::to_owned).collect(),
+            fingerprint: form.fingerprint,
+            item_id: form.item_id,
+            value: form
+                .replace_value
+                .filter(|choice| choice == "yes")
+                .map(|_| form.value.replace("\r\n", "\n")),
+            group_name: form.group_name,
+            display_order: form.display_order,
+        },
+    )
+    .await?;
+    change_request_preview(state, headers, form.csrf_token, request_ids).await
 }
 
 async fn change_request_apply(
@@ -2513,6 +2572,8 @@ async fn import_preview(
         .collect::<Vec<_>>();
     let (_, reviews) =
         variables::import_review::preview(&state.pool, &session, &environment_id, &keys).await?;
+    let metadata =
+        variables::metadata_for_environment(&state.pool, &session, &environment_id).await?;
     let payload = ImportPreviewPayload {
         purpose: "APPLIED_IMPORT".to_owned(),
         expires_at: time::OffsetDateTime::now_utc().unix_timestamp() + 30 * 60,
@@ -2533,13 +2594,21 @@ async fn import_preview(
         .iter()
         .zip(&payload.reviews)
         .map(|(entry, review)| {
-            let starts_group = entry.group.is_some() && entry.group != previous_group;
-            previous_group.clone_from(&entry.group);
+            let existing = metadata.iter().find(|row| row.key == entry.key);
+            let group_name = entry
+                .group
+                .clone()
+                .or_else(|| existing.and_then(|row| row.group_name.clone()));
+            let starts_group = group_name.is_some() && group_name != previous_group;
+            previous_group.clone_from(&group_name);
             ImportPreviewEntry {
                 key: entry.key.clone(),
-                group_name: entry.group.clone(),
+                group_name,
                 starts_group,
-                suggested_type: variables::suggest_value_type(&entry.value),
+                suggested_type: existing.map_or_else(
+                    || variables::suggest_value_type(&entry.value).to_owned(),
+                    |row| row.value_type.clone(),
+                ),
                 review: review.clone(),
             }
         })
@@ -2618,7 +2687,7 @@ async fn import_commit(
             reason: reason.clone(),
         });
     }
-    variables::import_applied_reviewed(
+    let recorded = variables::import_applied_reviewed(
         &state.pool,
         &state.crypto,
         &session,
@@ -2627,7 +2696,10 @@ async fn import_commit(
         Some(&payload.reviews),
     )
     .await?;
-    Ok(Redirect::to(&format!("/environments/{environment_id}/variables")).into_response())
+    Ok(Redirect::to(&format!(
+        "/environments/{environment_id}/variables?recorded={recorded}"
+    ))
+    .into_response())
 }
 
 async fn environment_preview(
@@ -3506,7 +3578,7 @@ mod tests {
             key: "DATABASE_URL".into(),
             group_name: Some("Database".into()),
             starts_group: true,
-            suggested_type: "string",
+            suggested_type: "string".into(),
             review: variables::import_review::review(&[], "env", &["DATABASE_URL".into()])
                 .remove(0),
         }];
@@ -3579,12 +3651,16 @@ mod tests {
             preview_token: "authenticated-ciphertext-token",
             entries: &entries,
             requires_reason: true,
+            groups: &["Database".into(), "Application".into()],
         }
         .render()
         .unwrap();
         assert!(html.contains("DATABASE_URL"));
         assert!(html.contains("UPDATE"));
         assert!(html.contains("Change reason"));
+        assert!(html.contains("Received · encrypted"));
+        assert!(html.contains("list=\"environment-groups\""));
+        assert!(html.contains("<option value=\"Application\">"));
         assert!(html.contains("authenticated-ciphertext-token"));
         assert!(!html.contains("postgres://"));
     }
@@ -4694,6 +4770,282 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unchanged_import_retains_type_and_reports_zero_without_audit() {
+        let mut fixture = preview_fixture().await;
+        fixture.tokens = fixture
+            .state
+            .sessions
+            .create(
+                &test_session("admin", Role::Administrator).user,
+                AuthenticationState::Full,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query("UPDATE sessions SET privileged_authenticated_at = ?, privileged_auth_level = 'STANDARD' WHERE user_id = 'admin'")
+            .bind(crate::db::now_rfc3339().unwrap()).execute(&fixture.state.pool).await.unwrap();
+        let response = import_review_post(
+            &fixture,
+            "preview",
+            format!(
+                "csrf_token={}&dotenv=API_URL%3Dhttps%3A%2F%2Fexample.test",
+                fixture.tokens.csrf_token
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), 256 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(html.contains("value=\"multiline\" selected"));
+        assert!(html.contains("value=\"Application\""));
+        let token = html
+            .split("name=\"preview_token\" value=\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap();
+        let token =
+            percent_encoding::utf8_percent_encode(token, percent_encoding::NON_ALPHANUMERIC);
+        let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_logs")
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap();
+        let form = format!(
+            "csrf_token={}&preview_token={token}&reason=Test&visibility_0=public&value_type_0=multiline&group_name_0=Application",
+            fixture.tokens.csrf_token
+        );
+        let response = import_review_post(&fixture, "commit", form.clone()).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let target = response.headers()["location"].to_str().unwrap();
+        assert!(target.ends_with("?recorded=0"));
+        let message = preview_get(&fixture, target).await;
+        let html = String::from_utf8(
+            axum::body::to_bytes(message.into_body(), 256 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(html.contains("No changes detected"));
+        let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_logs")
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap();
+        assert_eq!(before, after);
+        let response = import_review_post(
+            &fixture,
+            "commit",
+            form.replace("group_name_0=Application", "group_name_0="),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert!(
+            response.headers()["location"]
+                .to_str()
+                .unwrap()
+                .ends_with("?recorded=1")
+        );
+        let group: Option<String> =
+            sqlx::query_scalar("SELECT group_name FROM variables WHERE key = 'API_URL'")
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap();
+        assert!(group.is_none());
+    }
+
+    async fn correction_post(
+        fixture: &PreviewFixture,
+        path: &str,
+        body: String,
+    ) -> axum::response::Response {
+        router(fixture.state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header(
+                        "cookie",
+                        format!("__Host-configdeck_session={}", fixture.tokens.session_token),
+                    )
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn preview_correction_http_requires_csrf_recent_role_and_refreshes_output() {
+        use crate::requests;
+        let mut fixture = preview_fixture().await;
+        let admin = test_session("admin", Role::Administrator);
+        let id = requests::create(
+            &fixture.state.pool,
+            &fixture.state.crypto,
+            &admin,
+            requests::ChangeRequestInput {
+                environment_id: fixture.environment_id.clone(),
+                title: None,
+                reason: "Review fixture changes".into(),
+                items: vec![
+                    requests::ChangeRequestItemInput {
+                        action: "ADD".into(),
+                        key: "REVIEW_ME".into(),
+                        value: Some("synthetic-before".into()),
+                        value_source: Some("REQUESTER_PROVIDED".into()),
+                        visibility: Some("restricted".into()),
+                        value_type: Some("string".into()),
+                        description: None,
+                        group_name: None,
+                        display_order: None,
+                    },
+                    requests::ChangeRequestItemInput {
+                        action: "UPDATE".into(),
+                        key: "API_URL".into(),
+                        value: Some("https://changed.example.test".into()),
+                        value_source: Some("REQUESTER_PROVIDED".into()),
+                        visibility: Some("public".into()),
+                        value_type: Some("url".into()),
+                        description: None,
+                        group_name: Some("Application".into()),
+                        display_order: None,
+                    },
+                    requests::ChangeRequestItemInput {
+                        action: "DELETE".into(),
+                        key: "MESSAGE".into(),
+                        value: None,
+                        value_source: None,
+                        visibility: None,
+                        value_type: None,
+                        description: None,
+                        group_name: None,
+                        display_order: None,
+                    },
+                ],
+            },
+        )
+        .await
+        .unwrap();
+        requests::approve(&fixture.state.pool, &admin, &id)
+            .await
+            .unwrap();
+        let item: String = sqlx::query_scalar(
+            "SELECT id FROM change_request_items WHERE change_request_id = ? AND key = 'REVIEW_ME'",
+        )
+        .bind(&id)
+        .fetch_one(&fixture.state.pool)
+        .await
+        .unwrap();
+        let fields = format!(
+            "request_ids={id}&fingerprint=invalid&item_id={item}&value=synthetic-after&replace_value=yes&group_name=Application&display_order=3"
+        );
+        for csrf in ["invalid", fixture.tokens.csrf_token.as_str()] {
+            let response = correction_post(
+                &fixture,
+                "/change-requests/preview/edit",
+                format!("csrf_token={csrf}&{fields}"),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+        fixture.tokens = fixture
+            .state
+            .sessions
+            .create(&admin.user, AuthenticationState::Full, None, None)
+            .await
+            .unwrap();
+        let response = correction_post(
+            &fixture,
+            "/change-requests/preview/edit",
+            format!("csrf_token={}&{fields}", fixture.tokens.csrf_token),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        sqlx::query("UPDATE sessions SET privileged_authenticated_at = ?, privileged_auth_level = 'STANDARD' WHERE user_id = 'admin'")
+            .bind(crate::db::now_rfc3339().unwrap()).execute(&fixture.state.pool).await.unwrap();
+        let response = correction_post(
+            &fixture,
+            &format!("/change-requests/{id}/preview"),
+            format!("csrf_token={}", fixture.tokens.csrf_token),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        let html = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), 256 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(html.contains("Edit requested values and groups"));
+        let fingerprint = html
+            .split("name=\"fingerprint\" value=\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap();
+        let fields = fields.replace("fingerprint=invalid", &format!("fingerprint={fingerprint}"));
+        assert_eq!(
+            correction_post(
+                &fixture,
+                "/change-requests/preview/edit",
+                format!("csrf_token=invalid&{fields}")
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        let response = correction_post(
+            &fixture,
+            "/change-requests/preview/edit",
+            format!("csrf_token={}&{fields}", fixture.tokens.csrf_token),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        let html = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), 256 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(html.contains("REVIEW_ME=synthetic-after"));
+        assert!(!html.contains("synthetic-before"));
+        if let Ok(directory) = std::env::var("CONFIGDECK_UI_FIXTURE_DIR") {
+            std::fs::write(
+                std::path::Path::new(&directory).join("correction.html"),
+                &html,
+            )
+            .unwrap();
+        }
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM variables WHERE key = 'REVIEW_ME'")
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 0);
+        let response = correction_post(
+            &fixture,
+            "/change-requests/preview/edit",
+            format!("csrf_token={}&{fields}", fixture.tokens.csrf_token),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
     async fn contributor_multiline_import_preview_is_encrypted_and_atomic_on_errors() {
         let fixture = preview_fixture().await;
         for (source, expected) in [
@@ -4738,6 +5090,7 @@ mod tests {
             if expected == StatusCode::OK {
                 assert!(html.contains("value=\"multiline\" selected"));
                 assert!(html.contains("preview_token"));
+                assert!(html.contains("<option value=\"Application\">"));
             } else {
                 assert!(html.contains("Line 2:"));
                 assert!(!html.contains("name=\"preview_token\""));
