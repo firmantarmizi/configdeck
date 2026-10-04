@@ -105,7 +105,7 @@ function updateValueSource(select) {
   const scope = select.closest("[data-value-scope]") || select.closest("[data-request-item]") || select.closest("form");
   const field = scope?.querySelector(".comparison-value-field, [data-value-field]");
   if (!field) return;
-  const operatorProvides = select.value === "OPERATOR_PROVIDED";
+  const operatorProvides = select.value !== "REQUESTER_PROVIDED";
   field.hidden = operatorProvides;
   const currentMask = scope?.querySelector("[data-current-mask]");
   if (currentMask) currentMask.hidden = !operatorProvides;
@@ -120,6 +120,36 @@ function updateValueSource(select) {
 
 function initializeValueSources() {
   document.querySelectorAll("[data-value-source]").forEach(updateValueSource);
+}
+
+function initializeSharedUpdates() {
+  document.querySelectorAll("[data-shared-update]").forEach((form) => {
+    const detail = document.querySelector(`[data-shared-form="${CSS.escape(form.id)}"]`);
+    if (!detail) return;
+    const cells = Array.from(detail.querySelectorAll("[data-comparison-environment-card]"))
+      .filter((cell) => cell.querySelector(".comparison-value-row [data-value-source]"))
+      .map((cell) => ({ cell, initialValue: cell.querySelector("[data-value-input]").value }));
+    const label = detail.querySelector("[data-shared-update-count]");
+    const button = detail.querySelector('button[type="submit"][form]');
+    const update = () => {
+      const count = cells.filter(({ cell, initialValue }) => {
+        const metadataChanged = form.elements.new_key.value !== form.elements.current_key.value
+          || form.elements.visibility.value !== cell.dataset.currentVisibility
+          || form.elements.value_type.value !== cell.dataset.currentType;
+        const source = cell.querySelector("[data-value-source]").value;
+        return metadataChanged || source === "OPERATOR_PROVIDED"
+          || (source === "REQUESTER_PROVIDED" && (cell.dataset.valueVisible !== "true"
+            || cell.querySelector("[data-value-input]").value !== initialValue));
+      }).length;
+      if (label) label.textContent = count ? `Update ${count} environment${count === 1 ? "" : "s"}` : "No changes";
+      if (button) button.disabled = count === 0;
+    };
+    // Form-associated controls live outside the form. Keep baselines in this closure only.
+    ["input", "change"].forEach((type) => document.addEventListener(type, (event) => {
+      if (event.target.form === form) update();
+    }));
+    update();
+  });
 }
 
 function syncSharedMetadata(select) {
@@ -964,6 +994,7 @@ document.addEventListener("DOMContentLoaded", () => {
   initializeSharedMetadata();
   initializeRequestBuilders();
   initializeCustomSelects();
+  initializeSharedUpdates();
   updateComparison();
 });
 

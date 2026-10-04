@@ -361,7 +361,7 @@ body.card-dialog-open { overflow: hidden; }
 .environment-choice-group { display: inline-flex; align-items: stretch; border: 1px solid var(--border); border-radius: 999px; background: var(--surface-soft); }
 .environment-choice { display: inline-flex; align-items: center; gap: .42rem; min-height: 2.1rem; padding: .3rem .65rem; border: 1px solid var(--border); border-radius: 999px; background: var(--surface-soft); color: var(--muted); font-size: .72rem; font-weight: 700; cursor: pointer; user-select: none; }
 .environment-choice-group .environment-choice { border: 0; background: transparent; }
-.environment-choice input { position: absolute; opacity: 0; pointer-events: none; }
+.environment-choice input { position: absolute; width: 1px; height: 1px; min-height: 0; margin: 0; padding: 0; border: 0; opacity: 0; pointer-events: none; }
 .environment-check { display: inline-grid; place-items: center; width: 1rem; height: 1rem; border: 1px solid var(--border-strong); border-radius: .3rem; background: var(--surface); color: transparent; }
 .environment-check .icon { width: .7rem; height: .7rem; }
 .environment-choice input:checked + .environment-check { border-color: var(--success); background: var(--success); color: #071611; }

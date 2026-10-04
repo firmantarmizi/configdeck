@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 mod review;
+mod shared;
 pub use review::{DeletedPreviewItem, EditablePreviewItem, PreviewEdit, PreviewLine, edit_preview};
 
 use data_encoding::HEXLOWER;
@@ -66,6 +67,7 @@ pub struct InlineEditInput {
 pub struct SharedInlineValueInput {
     pub environment_id: String,
     pub variable_id: String,
+    pub base_version: i64,
     pub value: String,
     pub value_source: String,
     pub description: Option<String>,
@@ -485,9 +487,7 @@ pub async fn create_inline_edit(
     .await
 }
 
-/// Creates one environment-scoped request for every active environment where the logical key
-/// exists. All request headers/items/audit records are inserted in one `SQLite` transaction, so a
-/// conflict in any target prevents the entire coordinated edit from being recorded.
+/// Validates the complete logical-key scope, then records only changed environments atomically.
 pub async fn create_shared_inline_edit(
     pool: &SqlitePool,
     crypto: &CryptoManager,
@@ -501,28 +501,7 @@ pub async fn create_shared_inline_edit(
         return Err(AppError::Forbidden);
     }
 
-    let input = validate_shared_inline_edit(input)?;
-    let expected = shared_edit_targets(pool, session, &input).await?;
-    if expected.len() != input.values.len() {
-        return Err(AppError::Conflict);
-    }
-
-    let mut prepared_requests = Vec::with_capacity(expected.len());
-    for (environment_id, expected_variable_id) in expected {
-        prepared_requests.push(
-            prepare_shared_request(
-                pool,
-                crypto,
-                session,
-                &input,
-                &environment_id,
-                &expected_variable_id,
-            )
-            .await?,
-        );
-    }
-    persist_shared_requests(pool, session, &prepared_requests).await?;
-    Ok(prepared_requests.len())
+    shared::create_changed(pool, crypto, session, validate_shared_inline_edit(input)?).await
 }
 
 fn validate_shared_inline_edit(
@@ -549,26 +528,6 @@ fn validate_shared_inline_edit(
         reason: validate_reason(&input.reason)?,
         values,
     })
-}
-
-async fn shared_edit_targets(
-    pool: &SqlitePool,
-    session: &AuthenticatedSession,
-    input: &ValidatedSharedInlineEdit,
-) -> Result<Vec<(String, String)>, AppError> {
-    Ok(sqlx::query_as(
-        "SELECT v.environment_id, v.id FROM variables v \
-         JOIN environments e ON e.id = v.environment_id \
-         JOIN services s ON s.id = e.service_id \
-         WHERE e.service_id = ? AND s.organization_id = ? AND e.archived_at IS NULL \
-           AND v.key = ? AND v.lifecycle_status = 'ACTIVE' \
-         ORDER BY e.name_normalized, e.id",
-    )
-    .bind(&input.service_id)
-    .bind(&session.user.organization_id)
-    .bind(&input.current_key)
-    .fetch_all(pool)
-    .await?)
 }
 
 async fn prepare_shared_request(
@@ -689,10 +648,13 @@ async fn persist_shared_requests(
     pool: &SqlitePool,
     session: &AuthenticatedSession,
     prepared_requests: &[PreparedSharedRequest],
+    input: &ValidatedSharedInlineEdit,
+    snapshot: &shared::Snapshot,
 ) -> Result<(), AppError> {
     let now = now_rfc3339()?;
     let coordinated_environment_count = prepared_requests.len();
-    let mut transaction = pool.begin().await?;
+    let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
+    snapshot.validate(&mut transaction, input).await?;
     for request in prepared_requests {
         sqlx::query(
             "INSERT INTO change_requests(id, service_id, environment_id, title, reason, status, requested_by, requested_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
@@ -3051,7 +3013,7 @@ mod tests {
         }
     }
 
-    fn session_manager(pool: &SqlitePool, crypto: &CryptoManager) -> SessionManager {
+    pub(super) fn session_manager(pool: &SqlitePool, crypto: &CryptoManager) -> SessionManager {
         SessionManager::new(
             pool.clone(),
             crypto.clone(),
@@ -3065,7 +3027,7 @@ mod tests {
         )
     }
 
-    fn recent(mut session: AuthenticatedSession) -> AuthenticatedSession {
+    pub(super) fn recent(mut session: AuthenticatedSession) -> AuthenticatedSession {
         session.privileged_authenticated_at = Some(OffsetDateTime::now_utc());
         session.privileged_auth_level = Some(PrivilegedAuthLevel::Standard);
         session
@@ -3103,7 +3065,7 @@ mod tests {
         }
     }
 
-    async fn seed_identity(pool: &SqlitePool) {
+    pub(super) async fn seed_identity(pool: &SqlitePool) {
         let now = "2026-08-14T00:00:00Z";
         sqlx::query("INSERT INTO organizations(id, name, created_at, updated_at) VALUES('org', 'ConfigDeck', ?, ?)")
             .bind(now).bind(now).execute(pool).await.unwrap();
@@ -3118,7 +3080,7 @@ mod tests {
         }
     }
 
-    fn session(id: &str, role: Role) -> AuthenticatedSession {
+    pub(super) fn session(id: &str, role: Role) -> AuthenticatedSession {
         AuthenticatedSession {
             id: format!("session-{id}"),
             token_hash: vec![1; 32],

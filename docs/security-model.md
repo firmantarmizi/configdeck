@@ -67,6 +67,8 @@ Inactive users are always denied. Contributor access is App-scoped. The backend 
 
 ## Audit and retention
 
+Comparison update no-op detection only decrypts consistently public current values after service authorization. Restricted/mixed-visibility values are never equality-tested, so request creation cannot confirm a guessed secret. Untouched masked cells are skipped; explicit replacements always create proposals. Submitted variable versions and encrypted current/key/proposal snapshots are revalidated before atomic request creation. Client-side counts and presentation filters do not determine authorization or target scope.
+
 Audit events contain allowlisted metadata, never configuration plaintext or authentication secrets. Configuration history and audit records are durable by design. Login-attempt rows older than 24 hours and sessions older than 30 days past absolute expiry are pruned opportunistically. Audit older than 180 days can be moved to verified archives through Administrator maintenance. Archive files and backups require an off-host lifecycle suitable for recovery and incident response.
 
 ## Reporting vulnerabilities

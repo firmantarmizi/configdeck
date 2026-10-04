@@ -2,6 +2,7 @@
 
 ## 0.1.4
 
+- Request updates from the comparison workspace only for changed environments. Skip identical public values and untouched masked values, show the affected environment count, and reject stale form versions before recording requests.
 - Highlight new and updated assignments in resulting preview, including complete multiline values, and list deleted keys separately. Copy keeps the canonical final `.env` without review markers or removed keys.
 
 - Offer existing groups and new group names when preparing configuration requests; confirm receipt of encrypted imported values without revealing them back to Contributors.

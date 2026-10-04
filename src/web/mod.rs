@@ -147,6 +147,7 @@ struct ServicesTemplate<'a> {
 #[derive(Template)]
 #[template(path = "environments.html")]
 struct EnvironmentsTemplate<'a> {
+    notice: Option<&'static str>,
     chrome: AppChrome<'a>,
     can_manage: bool,
     can_create_request: bool,
@@ -1653,12 +1654,17 @@ async fn environment_list(
     State(state): State<AppState>,
     Path(service_id): Path<String>,
     headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
 ) -> Result<Response, AppError> {
     let (_, session, csrf) = authenticated_full_with_csrf(&state, &headers).await?;
     let workspace =
         environments::comparison_for_service(&state.pool, &state.crypto, &session, &service_id)
             .await?;
     let html = EnvironmentsTemplate {
+        notice: query
+            .get("unchanged")
+            .filter(|value| *value == "1")
+            .map(|_| "No changes detected. No requests were created."),
         chrome: app_chrome(&state, &session, &csrf, "configurations"),
         can_manage: session
             .user
@@ -1744,6 +1750,11 @@ async fn shared_key_request_edit(
         values.push(requests::SharedInlineValueInput {
             environment_id,
             variable_id,
+            base_version: fields
+                .remove(&format!("base_version_{index}"))
+                .ok_or(AppError::InvalidRequest)?
+                .parse()
+                .map_err(|_| AppError::InvalidRequest)?,
             value: fields.remove(&format!("value_{index}")).unwrap_or_default(),
             value_source: fields
                 .remove(&format!("value_source_{index}"))
@@ -1753,7 +1764,8 @@ async fn shared_key_request_edit(
                 .filter(|value| !value.trim().is_empty()),
         });
     }
-    requests::create_shared_inline_edit(
+    let return_path = format!("/services/{service_id}/environments?unchanged=1");
+    let created = requests::create_shared_inline_edit(
         &state.pool,
         &state.crypto,
         &session,
@@ -1768,6 +1780,9 @@ async fn shared_key_request_edit(
         },
     )
     .await?;
+    if created == 0 {
+        return Ok(Redirect::to(&return_path).into_response());
+    }
     Ok(Redirect::to("/change-requests").into_response())
 }
 
@@ -4278,6 +4293,154 @@ mod tests {
         service_id: String,
         environment_id: String,
         tokens: crate::auth::SessionTokens,
+    }
+
+    async fn shared_update_fixture() -> PreviewFixture {
+        let fixture = preview_fixture().await;
+        let admin = test_session("admin", Role::Administrator);
+        for name in ["Production", "Worker Prod", "Worker Stg"] {
+            environments::create(
+                &fixture.state.pool,
+                &fixture.state.crypto,
+                &admin,
+                &fixture.service_id,
+                EnvironmentInput {
+                    name: name.into(),
+                    description: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let ids: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM environments WHERE service_id = ? ORDER BY id")
+                .bind(&fixture.service_id)
+                .fetch_all(&fixture.state.pool)
+                .await
+                .unwrap();
+        for id in ids {
+            for (key, visibility) in [("QUEUE", "public"), ("MASKED_QUEUE", "restricted")] {
+                variables::record_applied(
+                    &fixture.state.pool,
+                    &fixture.state.crypto,
+                    &admin,
+                    &id,
+                    AppliedVariableInput {
+                        key: key.into(),
+                        value: "synthetic-inventory".into(),
+                        visibility: visibility.into(),
+                        value_type: "string".into(),
+                        description: None,
+                        group_name: None,
+                        display_order: 0,
+                        reason: "Synthetic shared fixture".into(),
+                    },
+                )
+                .await
+                .unwrap();
+            }
+        }
+        fixture
+    }
+
+    async fn shared_update_post(
+        fixture: &PreviewFixture,
+        body: String,
+    ) -> axum::response::Response {
+        router(fixture.state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/services/{}/keys/request-edit",
+                        fixture.service_id
+                    ))
+                    .header(
+                        "cookie",
+                        format!("__Host-configdeck_session={}", fixture.tokens.session_token),
+                    )
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn shared_update_http_skips_unchanged_and_checks_csrf_and_versions() {
+        use std::fmt::Write;
+        let fixture = shared_update_fixture().await;
+        let path = format!("/services/{}/environments", fixture.service_id);
+        let response = preview_get(&fixture, &path).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), 512 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(html.contains("data-shared-update-count"));
+        assert!(html.contains("value=\"KEEP_CURRENT\" selected"));
+        assert!(html.contains("name=\"base_version_0\""));
+        if let Ok(directory) = std::env::var("CONFIGDECK_UI_FIXTURE_DIR") {
+            std::fs::write(std::path::Path::new(&directory).join("shared.html"), &html).unwrap();
+        }
+        let rows: Vec<(String, String, i64)> = sqlx::query_as("SELECT environment_id, id, version FROM variables WHERE key = 'QUEUE' ORDER BY environment_id")
+            .fetch_all(&fixture.state.pool).await.unwrap();
+        let mut body = format!(
+            "csrf_token={}&current_key=QUEUE&new_key=QUEUE&visibility=public&value_type=string&reason=Synthetic&item_count={}",
+            fixture.tokens.csrf_token,
+            rows.len()
+        );
+        for (index, (environment, variable, version)) in rows.iter().enumerate() {
+            write!(body, "&environment_id_{index}={environment}&variable_id_{index}={variable}&base_version_{index}={version}&value_source_{index}=REQUESTER_PROVIDED&value_{index}=synthetic-inventory").unwrap();
+        }
+        let response = shared_update_post(&fixture, body.clone()).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            response.headers()["location"],
+            format!("{path}?unchanged=1")
+        );
+        let response = preview_get(&fixture, &format!("{path}?unchanged=1")).await;
+        let html = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), 512 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(html.contains("No changes detected. No requests were created."));
+        assert_eq!(
+            shared_update_post(&fixture, body.replace(&fixture.tokens.csrf_token, "wrong"))
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            shared_update_post(
+                &fixture,
+                body.replace("base_version_0=1", "base_version_0=999")
+            )
+            .await
+            .status(),
+            StatusCode::CONFLICT
+        );
+        let response = shared_update_post(
+            &fixture,
+            body.replace("value_0=synthetic-inventory", "value_0=synthetic-redis"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers()["location"], "/change-requests");
+        let targets: Vec<String> = sqlx::query_scalar(
+            "SELECT environment_id FROM change_requests WHERE requested_by = 'contributor'",
+        )
+        .fetch_all(&fixture.state.pool)
+        .await
+        .unwrap();
+        assert_eq!(targets, vec![rows[0].0.clone()]);
     }
 
     async fn preview_fixture() -> PreviewFixture {

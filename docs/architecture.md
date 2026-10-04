@@ -87,6 +87,10 @@ Resulting preview marks new and updated assignments across their complete physic
 
 ## Operational boundaries
 
+Comparison request updates validate every active environment containing the key, then skip unchanged public values and untouched masked cells. Metadata edits affect only environments where that metadata differs; renaming still applies across existing environments. The browser displays an affected count, while the server decides the request set and validates submitted versions plus an encrypted snapshot under a write transaction. An entirely unchanged submission creates no requests, versions, timestamps, or mutation audit. Browser line-ending normalization does not create a false value change; metadata-only edits preserve the original stored bytes.
+
+Masked cells default to No value change. Explicit replacements and operator-fulfillment requests remain proposals. Shared metadata changes on masked cells require operator fulfillment; this ordinary comparison route never decrypts or equality-tests masked values.
+
 - SQLite is intended for one ConfigDeck process and one persistent local volume, not horizontal replicas or a shared network filesystem.
 - Backup uses SQLite `VACUUM INTO`; restore is an offline operator procedure.
 - KEK rotation re-wraps environment DEKs and re-encrypts TOTP seeds.
