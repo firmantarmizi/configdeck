@@ -87,6 +87,10 @@ Resulting preview marks new and updated assignments across their complete physic
 
 ## Operational boundaries
 
+Manual and bulk request creation validate every submitted item, then omit public UPDATE items only when value and all effective metadata are identical. Request imports retain existing metadata defaults. The encrypted current-state snapshot is checked inside the write transaction before persisting or returning a no-change result. Existing pending requests are not rewritten. Review remains atomic for the whole request.
+
+Comparison metadata selectors can preserve each environment's current type/visibility; choosing a concrete value explicitly normalizes it. The browser initializes hidden detail controls on expansion, creates dropdown options on opening, and delegates affected-count events. Variable lists aggregate group positions once, use a stable group-name tie breaker, and reuse unwrapped keys within the authorized request for public rows only.
+
 Comparison request updates validate every active environment containing the key, then skip unchanged public values and untouched masked cells. Metadata edits affect only environments where that metadata differs; renaming still applies across existing environments. The browser displays an affected count, while the server decides the request set and validates submitted versions plus an encrypted snapshot under a write transaction. An entirely unchanged submission creates no requests, versions, timestamps, or mutation audit. Browser line-ending normalization does not create a false value change; metadata-only edits preserve the original stored bytes.
 
 Masked cells default to No value change. Explicit replacements and operator-fulfillment requests remain proposals. Shared metadata changes on masked cells require operator fulfillment; this ordinary comparison route never decrypts or equality-tests masked values.
@@ -99,3 +103,5 @@ Masked cells default to No value change. Explicit replacements and operator-fulf
 - Deployment-platform integration, dynamic secrets, SSO, and background workers are outside the current scope.
 
 See [Security model](security-model.md), [Deployment](deployment.md), and [Operations](operations.md) for the corresponding controls and procedures.
+
+Bulk proposal review supports an explicit per-key requester/operator value source. Operator fulfillment discards the pasted proposal for that key and creates an unresolved item; literal empty assignments remain requester values by default. Import preview binding, backend validation and atomic request creation remain shared with the manual flow.

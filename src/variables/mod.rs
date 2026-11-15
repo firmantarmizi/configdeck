@@ -1,5 +1,7 @@
 pub mod import_review;
 
+use std::collections::HashMap;
+
 use http::Uri;
 use serde::Serialize;
 use sqlx::{FromRow, SqlitePool};
@@ -24,6 +26,8 @@ pub struct VariableMetadata {
     pub key: String,
     pub group_name: Option<String>,
     pub value_type: String,
+    pub visibility: String,
+    pub description: Option<String>,
 }
 
 pub async fn metadata_for_environment(
@@ -33,7 +37,7 @@ pub async fn metadata_for_environment(
 ) -> Result<Vec<VariableMetadata>, AppError> {
     session.require_full()?;
     environment_context(pool, session, environment_id).await?;
-    Ok(sqlx::query_as("SELECT key, group_name, value_type FROM variables WHERE environment_id = ? AND lifecycle_status = 'ACTIVE' ORDER BY display_order, key")
+    Ok(sqlx::query_as("SELECT key, group_name, value_type, visibility, description FROM variables WHERE environment_id = ? AND lifecycle_status = 'ACTIVE' ORDER BY display_order, key")
         .bind(environment_id).fetch_all(pool).await?)
 }
 
@@ -187,19 +191,20 @@ pub async fn list_for_environment_filtered(
         validate_visibility(visibility)?;
     }
     let rows = sqlx::query_as::<_, VariableRow>(
-        "SELECT v.id, v.key, v.encrypted_value, v.value_nonce, v.dek_version, v.visibility, \
+        "WITH group_positions AS (SELECT group_name, MIN(display_order) AS first_order FROM variables \
+         WHERE environment_id = ? AND lifecycle_status = 'ACTIVE' GROUP BY group_name) \
+         SELECT v.id, v.key, v.encrypted_value, v.value_nonce, v.dek_version, v.visibility, \
                 v.value_type, v.description, v.group_name, v.display_order, v.version, v.deployment_status, v.updated_at, \
                 updater.email AS updated_by, v.last_applied_at \
          FROM variables v JOIN users updater ON updater.id = v.updated_by \
+         LEFT JOIN group_positions g ON g.group_name = v.group_name \
          WHERE v.environment_id = ? AND v.lifecycle_status = 'ACTIVE' \
            AND (? = '' OR instr(lower(v.key), lower(?)) > 0) \
            AND (? = '' OR v.visibility = ?) \
          ORDER BY CASE WHEN v.group_name IS NULL THEN 1 ELSE 0 END, \
-                  COALESCE((SELECT MIN(vg.display_order) FROM variables vg \
-                            WHERE vg.environment_id = v.environment_id \
-                              AND vg.lifecycle_status = 'ACTIVE' AND vg.group_name = v.group_name), v.display_order), \
-                  v.display_order, v.key",
+                  COALESCE(g.first_order, v.display_order), v.group_name, v.display_order, v.key",
     )
+    .bind(environment_id)
     .bind(environment_id)
     .bind(query)
     .bind(query)
@@ -209,10 +214,22 @@ pub async fn list_for_environment_filtered(
     .await?;
 
     let mut result = Vec::with_capacity(rows.len());
+    let mut deks = HashMap::new();
     let mut previous_group: Option<String> = None;
     for row in rows {
         let value = if row.visibility == "public" {
-            Some(decrypt_row_value(pool, crypto, &environment, &row).await?)
+            let version = u64::try_from(row.dek_version).map_err(|_| AppError::Crypto)?;
+            if let std::collections::hash_map::Entry::Vacant(entry) = deks.entry(version) {
+                entry.insert(
+                    environments::dek_by_version(pool, crypto, environment_id, version).await?,
+                );
+            }
+            Some(decrypt_row_with_dek(
+                crypto,
+                &environment,
+                &row,
+                deks.get(&version).ok_or(AppError::Crypto)?,
+            )?)
         } else {
             None
         };
@@ -1302,9 +1319,19 @@ async fn decrypt_row_value(
 ) -> Result<String, AppError> {
     let dek_version = u64::try_from(row.dek_version).map_err(|_| AppError::Crypto)?;
     let dek = environments::dek_by_version(pool, crypto, &environment.id, dek_version).await?;
+    decrypt_row_with_dek(crypto, environment, row, &dek)
+}
+
+fn decrypt_row_with_dek(
+    crypto: &CryptoManager,
+    environment: &EnvironmentContext,
+    row: &VariableRow,
+    dek: &[u8; 32],
+) -> Result<String, AppError> {
+    let dek_version = u64::try_from(row.dek_version).map_err(|_| AppError::Crypto)?;
     let plaintext = crypto
         .decrypt_current_value(
-            &dek,
+            dek,
             &CurrentValueContext {
                 service_id: &environment.service_id,
                 environment_id: &environment.id,
@@ -2017,6 +2044,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn edits_and_reimports_keep_group_order_and_history_is_bounded() {
         let pool = test_pool().await;
         seed_identity(&pool).await;
@@ -2102,6 +2130,24 @@ mod tests {
             .unwrap();
         assert_eq!(older.len(), 6);
         assert!(older.iter().all(|row| row.version < history[24].version));
+        let mut log = input("A_LOG", "info", "public", "string");
+        log.group_name = Some("Log".into());
+        record_applied(&pool, &crypto, &admin, env, log)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE variables SET display_order = 8 WHERE key = 'A_LOG'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (_, grouped) = list_for_environment(&pool, &crypto, &admin, env)
+            .await
+            .unwrap();
+        let headings: Vec<_> = grouped
+            .iter()
+            .filter(|row| row.starts_group)
+            .map(|row| row.group_name.as_deref().unwrap())
+            .collect();
+        assert_eq!(headings, ["Database", "Log"]);
     }
 
     #[tokio::test]

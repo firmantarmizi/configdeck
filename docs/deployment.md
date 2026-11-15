@@ -90,6 +90,8 @@ Monitor health/readiness, restart count, CPU, memory, data/backup free space, ba
 
 ## Upgrades
 
+Version 0.1.5 bundles request submission/fulfillment fixes, comparison no-op and grouping improvements, responsive/accessibility corrections, and patched dependencies. It adds no schema or encryption-format change. SQLx temporarily uses official upstream revision `10462fa4414c6c7f1ed1d39bb31678e3b726878c` for patched SQLite; keep Cargo.lock and the exact pin until a compatible registry release is verified. Session and TOTP timing policies are unchanged.
+
 The original version 0.1.1 release added multiline import and redacted environment preview without schema or encryption-format changes. Version 0.1.2 includes migration `0002_audit_cursor_indexes.sql`, which replaces audit filter indexes for cursor navigation. It preserves all records and encryption formats. Validate the upgrade against a disposable backup copy. The sidebar/account menu displays the version and build identity after deployment. Keep the existing database, data/backup volumes, and master key. Do not reset volumes or rerun bootstrap. Follow the backup and validation steps below.
 
 1. Create a verified backup and copy it off-host.

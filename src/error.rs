@@ -61,6 +61,8 @@ pub enum AppError {
     RateLimited,
     #[error("invalid request")]
     InvalidRequest,
+    #[error("no configuration changes detected")]
+    NoChanges,
     #[error("resource was not found")]
     NotFound,
     #[error("the last active environment cannot be archived")]
@@ -90,6 +92,7 @@ impl IntoResponse for AppError {
             Self::LastActiveEnvironment
                 | Self::EnvironmentHasOpenRequests
                 | Self::ImportReviewConflict
+                | Self::NoChanges
         );
         let (status, message) = match self {
             Self::Authentication | Self::InvalidRequest => {
@@ -113,6 +116,10 @@ impl IntoResponse for AppError {
             Self::Conflict => (
                 StatusCode::CONFLICT,
                 "Unable to save because the resource already exists or changed.",
+            ),
+            Self::NoChanges => (
+                StatusCode::CONFLICT,
+                "No changes detected. No request was created.",
             ),
             Self::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "Please try again later."),
             Self::Database(_)

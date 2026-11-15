@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     net::{IpAddr, SocketAddr},
     sync::atomic::Ordering,
     time::{Duration, Instant},
@@ -202,6 +202,20 @@ struct RequestImportPreviewTemplate<'a> {
     entries: &'a [RequestImportPreviewEntry],
     requires_reason: bool,
     groups: &'a [String],
+}
+
+struct RequestValueIssue {
+    key: String,
+    message: &'static str,
+}
+
+#[derive(Template)]
+#[template(path = "request_value_errors.html")]
+struct RequestValueErrorsTemplate<'a> {
+    chrome: AppChrome<'a>,
+    environment: &'a variables::EnvironmentContext,
+    issues: &'a [RequestValueIssue],
+    restart_path: &'a str,
 }
 
 #[derive(Template)]
@@ -518,6 +532,8 @@ struct RequestImportPreviewPayload {
 struct RequestImportPayloadEntry {
     action: String,
     entry: crate::dotenv::Entry,
+    #[serde(default)]
+    description: Option<String>,
 }
 
 struct RequestImportPreviewEntry {
@@ -525,7 +541,8 @@ struct RequestImportPreviewEntry {
     key: String,
     group_name: Option<String>,
     starts_group: bool,
-    suggested_type: &'static str,
+    suggested_type: String,
+    visibility: String,
 }
 
 #[derive(Default, Deserialize)]
@@ -1686,7 +1703,7 @@ async fn variable_request_edit(
 ) -> Result<Response, AppError> {
     let (_, session) = authenticated(&state, &headers).await?;
     state.sessions.verify_csrf(&session, &form.csrf_token)?;
-    let request_id = requests::create_inline_edit(
+    let result = requests::create_inline_edit(
         &state.pool,
         &state.crypto,
         &session,
@@ -1702,8 +1719,8 @@ async fn variable_request_edit(
             reason: form.reason,
         },
     )
-    .await?;
-    Ok(Redirect::to(&format!("/change-requests/{request_id}")).into_response())
+    .await;
+    request_creation_response(&state, &session, &environment_id, result).await
 }
 
 async fn shared_key_request_edit(
@@ -1976,12 +1993,20 @@ async fn request_import_preview(
         .render()?;
         return Ok((StatusCode::UNPROCESSABLE_ENTITY, Html(html)).into_response());
     }
-    let existing = active_environment_keys(&state.pool, &environment_id).await?;
+    let metadata: HashMap<_, _> =
+        variables::metadata_for_environment(&state.pool, &session, &environment_id)
+            .await?
+            .into_iter()
+            .map(|row| (row.key.clone(), row))
+            .collect();
     let entries = report
         .entries
         .into_iter()
         .map(|entry| RequestImportPayloadEntry {
-            action: if existing.contains(&entry.key) {
+            description: metadata
+                .get(&entry.key)
+                .and_then(|row| row.description.clone()),
+            action: if metadata.contains_key(&entry.key) {
                 "UPDATE".to_owned()
             } else {
                 "ADD".to_owned()
@@ -2008,14 +2033,24 @@ async fn request_import_preview(
         .iter()
         .map(|payload_entry| {
             let entry = &payload_entry.entry;
-            let starts_group = entry.group.is_some() && entry.group != previous_group;
-            previous_group.clone_from(&entry.group);
+            let existing = metadata.get(&entry.key);
+            let group_name = entry
+                .group
+                .clone()
+                .or_else(|| existing.and_then(|row| row.group_name.clone()));
+            let starts_group = group_name.is_some() && group_name != previous_group;
+            previous_group.clone_from(&group_name);
             RequestImportPreviewEntry {
                 action: payload_entry.action.clone(),
                 key: entry.key.clone(),
-                group_name: entry.group.clone(),
+                group_name,
                 starts_group,
-                suggested_type: variables::suggest_value_type(&entry.value),
+                suggested_type: existing.map_or_else(
+                    || variables::suggest_value_type(&entry.value).to_owned(),
+                    |row| row.value_type.clone(),
+                ),
+                visibility: existing
+                    .map_or_else(|| "restricted".to_owned(), |row| row.visibility.clone()),
             }
         })
         .collect::<Vec<_>>();
@@ -2075,45 +2110,122 @@ async fn request_import_commit(
         let value_type = fields
             .remove(&format!("value_type_{index}"))
             .ok_or(AppError::InvalidRequest)?;
+        let value_source = fields
+            .remove(&format!("value_source_{index}"))
+            .unwrap_or_else(|| "REQUESTER_PROVIDED".to_owned());
+        let value = match value_source.as_str() {
+            "REQUESTER_PROVIDED" => Some(std::mem::take(&mut payload_entry.entry.value)),
+            "OPERATOR_PROVIDED" => None,
+            _ => return Err(AppError::InvalidRequest),
+        };
         items.push(requests::ChangeRequestItemInput {
             action: payload_entry.action,
             key: std::mem::take(&mut payload_entry.entry.key),
-            value: Some(std::mem::take(&mut payload_entry.entry.value)),
-            value_source: Some("REQUESTER_PROVIDED".to_owned()),
+            value,
+            value_source: Some(value_source),
             visibility: Some(visibility),
             value_type: Some(value_type),
-            description: None,
+            description: payload_entry.description,
             group_name: fields.remove(&format!("group_name_{index}")),
             display_order: Some(next_order + payload_entry.entry.position),
         });
     }
-    let id = requests::create(
-        &state.pool,
-        &state.crypto,
-        &session,
-        requests::ChangeRequestInput {
-            environment_id,
-            title,
-            reason,
-            items,
-        },
-    )
-    .await?;
-    Ok(Redirect::to(&format!("/change-requests/{id}")).into_response())
+    let input = requests::ChangeRequestInput {
+        environment_id: environment_id.clone(),
+        title,
+        reason,
+        items,
+    };
+    if let Some(response) =
+        request_value_error_response(&state, &session, &csrf, &input, true).await?
+    {
+        return Ok(response);
+    }
+    let result = requests::create(&state.pool, &state.crypto, &session, input).await;
+    request_creation_response(&state, &session, &environment_id, result).await
 }
 
-async fn active_environment_keys(
-    pool: &sqlx::SqlitePool,
+async fn request_value_error_response(
+    state: &AppState,
+    session: &AuthenticatedSession,
+    csrf: &str,
+    input: &requests::ChangeRequestInput,
+    imported: bool,
+) -> Result<Option<Response>, AppError> {
+    session.require_full()?;
+    if !session.user.role.allows(Capability::CreateChangeRequest) {
+        return Err(AppError::Forbidden);
+    }
+    let environment =
+        variables::environment_context(&state.pool, session, &input.environment_id).await?;
+    variables::ensure_mutable(&environment)?;
+    let mut issues = Vec::new();
+    for item in &input.items {
+        if !matches!(item.action.as_str(), "ADD" | "UPDATE")
+            || item.value_source.as_deref() != Some("REQUESTER_PROVIDED")
+        {
+            continue;
+        }
+        let key = variables::validate_key(&item.key)?;
+        let value_type =
+            variables::validate_value_type(item.value_type.as_deref().unwrap_or("string"))?;
+        if item
+            .value
+            .as_deref()
+            .is_none_or(|value| variables::validate_value(value, value_type).is_err())
+        {
+            issues.push(RequestValueIssue {
+                key,
+                message: match value_type {
+                    "url" => "Value must be an HTTP or HTTPS URL.",
+                    "boolean" => "Value must be true or false.",
+                    "integer" => "Value must be a whole number within the supported range.",
+                    _ => "Provide a value within the 32 KiB limit, or choose Operator provides it.",
+                },
+            });
+        }
+    }
+    if issues.is_empty() {
+        return Ok(None);
+    }
+    let suffix = if imported { "import" } else { "new" };
+    let restart_path = format!("/environments/{}/change-requests/{suffix}", environment.id);
+    Ok(Some(
+        (
+            StatusCode::BAD_REQUEST,
+            Html(
+                RequestValueErrorsTemplate {
+                    chrome: app_chrome(state, session, csrf, "changes"),
+                    environment: &environment,
+                    issues: &issues,
+                    restart_path: &restart_path,
+                }
+                .render()?,
+            ),
+        )
+            .into_response(),
+    ))
+}
+
+async fn request_creation_response(
+    state: &AppState,
+    session: &AuthenticatedSession,
     environment_id: &str,
-) -> Result<HashSet<String>, AppError> {
-    Ok(sqlx::query_scalar::<_, String>(
-        "SELECT key FROM variables WHERE environment_id = ? AND lifecycle_status = 'ACTIVE'",
-    )
-    .bind(environment_id)
-    .fetch_all(pool)
-    .await?
-    .into_iter()
-    .collect())
+    result: Result<String, AppError>,
+) -> Result<Response, AppError> {
+    match result {
+        Ok(id) => Ok(Redirect::to(&format!("/change-requests/{id}")).into_response()),
+        Err(AppError::NoChanges) => {
+            let environment =
+                variables::environment_context(&state.pool, session, environment_id).await?;
+            Ok(Redirect::to(&format!(
+                "/services/{}/environments?unchanged=1",
+                environment.service_id
+            ))
+            .into_response())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 async fn change_request_create(
@@ -2126,8 +2238,13 @@ async fn change_request_create(
     let csrf = form.get("csrf_token").ok_or(AppError::Forbidden)?;
     state.sessions.verify_csrf(&session, csrf)?;
     let input = request_input_from_form(&environment_id, &form);
-    let id = requests::create(&state.pool, &state.crypto, &session, input).await?;
-    Ok(Redirect::to(&format!("/change-requests/{id}")).into_response())
+    if let Some(response) =
+        request_value_error_response(&state, &session, csrf, &input, false).await?
+    {
+        return Ok(response);
+    }
+    let result = requests::create(&state.pool, &state.crypto, &session, input).await;
+    request_creation_response(&state, &session, &environment_id, result).await
 }
 
 async fn change_request_list(
@@ -3255,7 +3372,7 @@ fn friendly_error_copy(status: StatusCode, path: &str) -> (&'static str, &'stati
     match status {
         StatusCode::BAD_REQUEST => (
             "We couldn't process that",
-            "Review the highlighted action and check that every required field uses the expected format.",
+            "The request was not saved. Return to the form and check the required fields and formats before submitting again.",
         ),
         StatusCode::UNAUTHORIZED => (
             "Sign in required",
@@ -3645,7 +3762,8 @@ mod tests {
             key: "DATABASE_URL".into(),
             group_name: Some("Database".into()),
             starts_group: true,
-            suggested_type: "string",
+            suggested_type: "string".into(),
+            visibility: "restricted".into(),
         }];
         let html = RequestImportPreviewTemplate {
             chrome: AppChrome {
@@ -4365,6 +4483,423 @@ mod tests {
             )
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn comparison_large_list_fixture() {
+        let fixture = shared_update_fixture().await;
+        let admin = test_session("admin", Role::Administrator);
+        let environments: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM environments WHERE service_id = ?")
+                .bind(&fixture.service_id)
+                .fetch_all(&fixture.state.pool)
+                .await
+                .unwrap();
+        for environment in environments {
+            for index in 0..155 {
+                variables::record_applied(
+                    &fixture.state.pool,
+                    &fixture.state.crypto,
+                    &admin,
+                    &environment,
+                    AppliedVariableInput {
+                        key: format!("PERF_{index:03}"),
+                        value: "synthetic-performance".into(),
+                        visibility: "public".into(),
+                        value_type: "string".into(),
+                        description: None,
+                        group_name: Some(format!("Group {}", index % 8)),
+                        display_order: 0,
+                        reason: "Synthetic performance fixture".into(),
+                    },
+                )
+                .await
+                .unwrap();
+            }
+        }
+        let started = std::time::Instant::now();
+        let response = preview_get(
+            &fixture,
+            &format!("/services/{}/environments", fixture.service_id),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), 16 * 1024 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert_eq!(html.matches("data-comparison-row data-key").count(), 160);
+        println!(
+            "Synthetic 160-key/4-environment response: {} ms, {} bytes",
+            started.elapsed().as_millis(),
+            html.len()
+        );
+        if let Ok(directory) = std::env::var("CONFIGDECK_UI_FIXTURE_DIR") {
+            std::fs::write(
+                std::path::Path::new(&directory).join("large-workspace.html"),
+                html,
+            )
+            .unwrap();
+        }
+    }
+
+    async fn request_import_post(
+        fixture: &PreviewFixture,
+        stage: &str,
+        body: String,
+    ) -> axum::response::Response {
+        router(fixture.state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/environments/{}/change-requests/import/{stage}",
+                        fixture.environment_id
+                    ))
+                    .header(
+                        "cookie",
+                        format!("__Host-configdeck_session={}", fixture.tokens.session_token),
+                    )
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn request_value_feedback_is_scoped_atomic_and_never_reflects_values() {
+        let fixture = preview_fixture().await;
+        let path = format!("/environments/{}/change-requests", fixture.environment_id);
+        let body = format!(
+            "csrf_token={}&action_0=ADD&key_0=BROKEN_URL&value_source_0=REQUESTER_PROVIDED&visibility_0=restricted&value_type_0=url&value_0=ftp%3A%2F%2Fsynthetic-private.example.test%2Fnever-reflect",
+            fixture.tokens.csrf_token
+        );
+        let post = |body: String| {
+            router(fixture.state.clone()).oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(&path)
+                    .header(
+                        "cookie",
+                        format!("__Host-configdeck_session={}", fixture.tokens.session_token),
+                    )
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+        };
+        let response = post(body.clone()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        let html = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), 256 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(html.contains("BROKEN_URL"));
+        assert!(html.contains("HTTP or HTTPS"));
+        assert!(html.contains("Start request again"));
+        assert!(!html.contains("never-reflect"));
+        assert!(!html.contains("synthetic-private.example.test"));
+        let bad_csrf = body.replace(&fixture.tokens.csrf_token, "invalid");
+        assert_eq!(
+            post(bad_csrf).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+        sqlx::query("DELETE FROM user_service_access WHERE user_id = 'contributor'")
+            .execute(&fixture.state.pool)
+            .await
+            .unwrap();
+        assert_eq!(post(body).await.unwrap().status(), StatusCode::NOT_FOUND);
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM change_requests WHERE requested_by = 'contributor'",
+        )
+        .fetch_one(&fixture.state.pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn encrypted_bulk_value_feedback_does_not_reflect_values_or_tokens() {
+        let fixture = preview_fixture().await;
+        let token =
+            bulk_request_token(&fixture, "BROKEN_NUMBER=synthetic-private-invalid-integer").await;
+        let response = request_import_post(
+            &fixture,
+            "commit",
+            format!(
+                "csrf_token={}&preview_token={token}&visibility_0=restricted&value_type_0=integer",
+                fixture.tokens.csrf_token
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let html = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), 256 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(html.contains("BROKEN_NUMBER"));
+        assert!(html.contains("whole number"));
+        assert!(!html.contains("synthetic-private-invalid-integer"));
+        assert!(!html.contains(&token));
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM change_requests WHERE requested_by = 'contributor'",
+        )
+        .fetch_one(&fixture.state.pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    async fn bulk_request_token(fixture: &PreviewFixture, source: &str) -> String {
+        let encoded =
+            percent_encoding::utf8_percent_encode(source, percent_encoding::NON_ALPHANUMERIC);
+        let response = request_import_post(
+            fixture,
+            "preview",
+            format!("csrf_token={}&dotenv={encoded}", fixture.tokens.csrf_token),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), 256 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        if let Ok(directory) = std::env::var("CONFIGDECK_UI_FIXTURE_DIR") {
+            std::fs::write(
+                std::path::Path::new(&directory).join("request-import.html"),
+                &html,
+            )
+            .unwrap();
+        }
+        let token = html
+            .split("name=\"preview_token\" value=\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap();
+        percent_encoding::utf8_percent_encode(token, percent_encoding::NON_ALPHANUMERIC).to_string()
+    }
+
+    #[tokio::test]
+    async fn bulk_request_supports_explicit_operator_fulfillment_and_literal_empty_values() {
+        let fixture = preview_fixture().await;
+        let response = preview_get(
+            &fixture,
+            &format!(
+                "/environments/{}/change-requests/new",
+                fixture.environment_id
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response.headers()["content-security-policy"]
+                .to_str()
+                .unwrap()
+                .contains("script-src 'self';")
+        );
+        let html = axum::body::to_bytes(response.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        if let Ok(directory) = std::env::var("CONFIGDECK_UI_FIXTURE_DIR") {
+            std::fs::write(
+                std::path::Path::new(&directory).join("request-new.html"),
+                &html,
+            )
+            .unwrap();
+        }
+        let token = bulk_request_token(
+            &fixture,
+            "NEW_URL=\nNEW_PORT=\nNEW_FLAG=\nNEW_SECRET=synthetic-discard-me\nNEW_EMPTY=",
+        )
+        .await;
+        let response = request_import_post(&fixture, "commit", format!("csrf_token={}&preview_token={token}&visibility_0=public&value_type_0=url&value_source_0=OPERATOR_PROVIDED&visibility_1=public&value_type_1=integer&value_source_1=OPERATOR_PROVIDED&visibility_2=public&value_type_2=boolean&value_source_2=OPERATOR_PROVIDED&visibility_3=restricted&value_type_3=string&value_source_3=OPERATOR_PROVIDED&visibility_4=public&value_type_4=string&value_source_4=REQUESTER_PROVIDED", fixture.tokens.csrf_token)).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let location = response.headers()["location"].to_str().unwrap();
+        let id = location.rsplit('/').next().unwrap();
+        let (status,): (String,) =
+            sqlx::query_as("SELECT status FROM change_requests WHERE id = ?")
+                .bind(id)
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "NEEDS_INPUT");
+        let (missing,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM change_request_items WHERE change_request_id = ? AND value_source = 'OPERATOR_PROVIDED' AND encrypted_proposed_value IS NULL AND proposed_value_nonce IS NULL AND proposed_dek_version IS NULL AND value_fulfilled_at IS NULL").bind(id).fetch_one(&fixture.state.pool).await.unwrap();
+        assert_eq!(missing, 4);
+        let session = test_session("contributor", Role::Contributor);
+        let (_, items) =
+            crate::requests::detail(&fixture.state.pool, &fixture.state.crypto, &session, id)
+                .await
+                .unwrap();
+        assert_eq!(items.len(), 5);
+        let empty = items.iter().find(|item| item.key == "NEW_EMPTY").unwrap();
+        assert_eq!(empty.value.as_deref(), Some(""));
+        assert!(empty.fulfilled);
+        assert!(
+            items
+                .iter()
+                .filter(|item| item.key != "NEW_EMPTY")
+                .all(|item| !item.fulfilled && item.value.is_none())
+        );
+        let response = preview_get(&fixture, location).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), 256 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(!html.contains("synthetic-discard-me"));
+        let response = router(fixture.state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/change-requests/{id}/preview"))
+                    .header(
+                        "cookie",
+                        format!("__Host-configdeck_session={}", fixture.tokens.session_token),
+                    )
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(format!(
+                        "csrf_token={}",
+                        fixture.tokens.csrf_token
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn bulk_operator_import_rejects_invalid_sources_types_csrf_and_scope_atomically() {
+        let fixture = preview_fixture().await;
+        let token = bulk_request_token(&fixture, "NEW_FIRST=\nNEW_SECOND=").await;
+        let base = format!(
+            "csrf_token={}&preview_token={token}&visibility_0=restricted&value_type_0=url&value_source_0=OPERATOR_PROVIDED&visibility_1=public&value_type_1=integer&value_source_1=OPERATOR_PROVIDED",
+            fixture.tokens.csrf_token
+        );
+        for body in [
+            base.replace("value_source_1=OPERATOR_PROVIDED", "value_source_1=UNKNOWN"),
+            base.replace("value_type_1=integer", "value_type_1=UNKNOWN"),
+            base.replace(
+                "value_source_1=OPERATOR_PROVIDED",
+                "value_source_1=REQUESTER_PROVIDED",
+            ),
+            base.replace(
+                "value_source_0=OPERATOR_PROVIDED",
+                "value_source_0=REQUESTER_PROVIDED",
+            ),
+            base.replace(&format!("preview_token={token}"), "preview_token=tampered"),
+        ] {
+            assert_eq!(
+                request_import_post(&fixture, "commit", body).await.status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+        let bad_csrf = base.replace(
+            &format!("csrf_token={}", fixture.tokens.csrf_token),
+            "csrf_token=wrong",
+        );
+        assert_eq!(
+            request_import_post(&fixture, "commit", bad_csrf)
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        sqlx::query("DELETE FROM user_service_access WHERE user_id = 'contributor'")
+            .execute(&fixture.state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            request_import_post(&fixture, "commit", base).await.status(),
+            StatusCode::NOT_FOUND
+        );
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM change_requests WHERE requested_by = 'contributor'",
+        )
+        .fetch_one(&fixture.state.pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn contributor_bulk_import_skips_identical_public_updates_and_preserves_metadata() {
+        let fixture = preview_fixture().await;
+        sqlx::query(
+            "UPDATE variables SET description = 'Keep this description' WHERE key = 'API_URL'",
+        )
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        for (source, expected_new) in [
+            ("API_URL=https://example.test\nNEW_KEY=5", true),
+            ("API_URL=https://example.test", false),
+        ] {
+            let encoded =
+                percent_encoding::utf8_percent_encode(source, percent_encoding::NON_ALPHANUMERIC);
+            let response = request_import_post(
+                &fixture,
+                "preview",
+                format!("csrf_token={}&dotenv={encoded}", fixture.tokens.csrf_token),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let html = String::from_utf8(
+                axum::body::to_bytes(response.into_body(), 256 * 1024)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            assert!(html.contains("value=\"public\" selected"));
+            assert!(html.contains("value=\"multiline\" selected"));
+            assert!(html.contains("value=\"Application\""));
+            let token = html
+                .split("name=\"preview_token\" value=\"")
+                .nth(1)
+                .unwrap()
+                .split('"')
+                .next()
+                .unwrap();
+            let token =
+                percent_encoding::utf8_percent_encode(token, percent_encoding::NON_ALPHANUMERIC);
+            let extra = if expected_new {
+                "&visibility_1=public&value_type_1=integer&group_name_1=Application"
+            } else {
+                ""
+            };
+            let response = request_import_post(&fixture, "commit", format!("csrf_token={}&preview_token={token}&reason=Synthetic&visibility_0=public&value_type_0=multiline&group_name_0=Application{extra}", fixture.tokens.csrf_token)).await;
+            assert_eq!(response.status(), StatusCode::SEE_OTHER);
+            if !expected_new {
+                assert!(
+                    response.headers()["location"]
+                        .to_str()
+                        .unwrap()
+                        .ends_with("?unchanged=1")
+                );
+            }
+        }
+        let keys: Vec<String> = sqlx::query_scalar("SELECT key FROM change_request_items i JOIN change_requests r ON r.id = i.change_request_id WHERE r.requested_by = 'contributor'").fetch_all(&fixture.state.pool).await.unwrap();
+        assert_eq!(keys, ["NEW_KEY"]);
     }
 
     #[tokio::test]

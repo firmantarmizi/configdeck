@@ -69,7 +69,39 @@ function initializeApplicationShell() {
   const target = document.querySelector("[data-context-breadcrumbs]");
   if (breadcrumb && target) {
     breadcrumb.classList.add("topbar-breadcrumbs");
+    const parts = Array.from(breadcrumb.children);
+    const current = parts.at(-1);
+    current?.setAttribute("aria-current", "page");
+    parts.forEach((part) => { part.title = part.textContent.trim(); });
+    const parents = parts.slice(0, -2);
+    parents.forEach((part) => part.classList.add("breadcrumb-parent"));
+    const overflow = document.createElement("details");
+    overflow.className = "breadcrumb-overflow";
+    const summary = document.createElement("summary");
+    summary.textContent = "…";
+    summary.setAttribute("aria-label", "Show parent pages");
+    const menu = document.createElement("div");
+    menu.className = "breadcrumb-parent-menu";
+    parents.filter((part) => part.textContent.trim() !== "/").forEach((part) => menu.append(part.cloneNode(true)));
+    overflow.append(summary, menu);
+    overflow.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        overflow.open = false;
+        summary.focus();
+      }
+    });
+    breadcrumb.prepend(overflow);
     target.replaceChildren(breadcrumb);
+    const fit = () => {
+      breadcrumb.removeAttribute("data-compact");
+      if (breadcrumb.scrollWidth > breadcrumb.clientWidth || current.scrollWidth > current.clientWidth) {
+        breadcrumb.dataset.compact = "";
+      } else {
+        overflow.open = false;
+      }
+    };
+    new ResizeObserver(fit).observe(target);
+    fit();
   }
 }
 
@@ -95,10 +127,21 @@ function valueControl(type, value, name = "value_0") {
     if (type !== "integer") control.maxLength = 32768;
     control.value = value;
     control.required = type === "integer" || type === "url";
+    if (type === "url") {
+      control.pattern = "[hH][tT][tT][pP][sS]?://.+";
+      control.title = "Use an HTTP or HTTPS URL.";
+    }
   }
   control.name = name;
   control.dataset.valueInput = "";
   return control;
+}
+
+function initializeValueConstraints() {
+  document.querySelectorAll('input[type="url"][name^="value_"]').forEach((input) => {
+    input.pattern = "[hH][tT][tT][pP][sS]?://.+";
+    input.title = "Use an HTTP or HTTPS URL.";
+  });
 }
 
 function updateValueSource(select) {
@@ -111,6 +154,7 @@ function updateValueSource(select) {
   if (currentMask) currentMask.hidden = !operatorProvides;
   field.querySelectorAll("input, textarea, select").forEach((control) => {
     control.disabled = operatorProvides;
+    customSelectInstances.get(control)?.sync();
   });
   const hint = field.querySelector("[data-value-hint]");
   if (hint) hint.textContent = operatorProvides
@@ -118,24 +162,28 @@ function updateValueSource(select) {
     : "Restricted values are write-only here.";
 }
 
-function initializeValueSources() {
-  document.querySelectorAll("[data-value-source]").forEach(updateValueSource);
+function initializeValueSources(root = document) {
+  root.querySelectorAll("[data-value-source]").forEach((select) => {
+    if (!select.closest("[data-comparison-detail]")?.hidden) updateValueSource(select);
+  });
 }
 
 function initializeSharedUpdates() {
+  const updates = new WeakMap();
   document.querySelectorAll("[data-shared-update]").forEach((form) => {
-    const detail = document.querySelector(`[data-shared-form="${CSS.escape(form.id)}"]`);
+    const detail = form.closest("[data-comparison-row]")?.nextElementSibling;
     if (!detail) return;
     const cells = Array.from(detail.querySelectorAll("[data-comparison-environment-card]"))
       .filter((cell) => cell.querySelector(".comparison-value-row [data-value-source]"))
       .map((cell) => ({ cell, initialValue: cell.querySelector("[data-value-input]").value }));
     const label = detail.querySelector("[data-shared-update-count]");
-    const button = detail.querySelector('button[type="submit"][form]');
+    const button = detail.querySelector("[data-shared-submit]");
+    const reason = form.elements.reason;
     const update = () => {
       const count = cells.filter(({ cell, initialValue }) => {
         const metadataChanged = form.elements.new_key.value !== form.elements.current_key.value
-          || form.elements.visibility.value !== cell.dataset.currentVisibility
-          || form.elements.value_type.value !== cell.dataset.currentType;
+          || (form.elements.visibility.value && form.elements.visibility.value !== cell.dataset.currentVisibility)
+          || (form.elements.value_type.value && form.elements.value_type.value !== cell.dataset.currentType);
         const source = cell.querySelector("[data-value-source]").value;
         return metadataChanged || source === "OPERATOR_PROVIDED"
           || (source === "REQUESTER_PROVIDED" && (cell.dataset.valueVisible !== "true"
@@ -143,13 +191,19 @@ function initializeSharedUpdates() {
       }).length;
       if (label) label.textContent = count ? `Update ${count} environment${count === 1 ? "" : "s"}` : "No changes";
       if (button) button.disabled = count === 0;
+      if (reason) reason.required = count > 0;
+      return count;
     };
-    // Form-associated controls live outside the form. Keep baselines in this closure only.
-    ["input", "change"].forEach((type) => document.addEventListener(type, (event) => {
-      if (event.target.form === form) update();
-    }));
+    updates.set(form, update);
+    form.addEventListener("submit", (event) => {
+      if (update() === 0) event.preventDefault();
+    });
     update();
   });
+  // One delegated listener per event, irrespective of key/environment count.
+  ["input", "change"].forEach((type) => document.addEventListener(type, (event) => {
+    updates.get(event.target.form)?.();
+  }));
 }
 
 function syncSharedMetadata(select) {
@@ -174,6 +228,7 @@ function syncSharedMetadata(select) {
         if (openSelectMenu?.trigger === customSelect.trigger) closeCustomSelect();
         customSelect.trigger.remove();
         customSelect.menu.remove();
+        customSelect.error.remove();
       }
       current.replaceWith(replacement);
     });
@@ -184,10 +239,6 @@ function syncSharedMetadata(select) {
     const submit = form.querySelector("[data-missing-add-submit]");
     if (submit) submit.disabled = !complete;
   });
-}
-
-function initializeSharedMetadata() {
-  document.querySelectorAll("[data-shared-visibility], [data-shared-value-type]").forEach(syncSharedMetadata);
 }
 
 function refreshRequestBuilder(builder) {
@@ -234,6 +285,7 @@ function initializeRequestBuilders() {
 
 let openSelectMenu;
 const customSelectInstances = new WeakMap();
+let customSelectIndex = 0;
 
 function closeCustomSelect() {
   if (!openSelectMenu) return;
@@ -262,26 +314,51 @@ function enhanceComparisonSelect(select) {
   select.tabIndex = -1;
 
   const trigger = document.createElement("button");
+  const id = `custom-select-${++customSelectIndex}`;
+  const fieldName = select.getAttribute("aria-label")
+    || Array.from(select.labels || []).map((label) => label.querySelector(".sr-only")?.textContent
+      || Array.from(label.childNodes).filter((node) => node.nodeType === Node.TEXT_NODE).map((node) => node.textContent).join(" ")).join(" ").trim()
+    || "Choose an option";
   trigger.type = "button";
   trigger.className = "custom-select-trigger";
   trigger.setAttribute("aria-haspopup", "listbox");
   trigger.setAttribute("aria-expanded", "false");
+  trigger.setAttribute("aria-controls", id);
   const label = document.createElement("span");
   const arrow = document.createElement("span");
   arrow.className = "custom-select-arrow";
   arrow.textContent = "⌄";
+  arrow.setAttribute("aria-hidden", "true");
   trigger.append(label, arrow);
   select.insertAdjacentElement("afterend", trigger);
 
   const menu = document.createElement("div");
+  menu.id = id;
   menu.className = "custom-select-menu";
   menu.setAttribute("role", "listbox");
+  menu.setAttribute("aria-label", fieldName);
   menu.hidden = true;
   document.body.append(menu);
+
+  const error = document.createElement("small");
+  error.id = `${id}-error`;
+  error.className = "field-error";
+  error.setAttribute("role", "alert");
+  error.hidden = true;
+  trigger.after(error);
 
   const sync = () => {
     const selected = select.options[select.selectedIndex];
     label.textContent = selected?.textContent || "Select";
+    trigger.setAttribute("aria-label", `${fieldName}: ${label.textContent}`);
+    trigger.disabled = select.disabled;
+    if (select.disabled || select.validity.valid) {
+      error.hidden = true;
+      trigger.removeAttribute("aria-invalid");
+      trigger.removeAttribute("aria-describedby");
+    }
+  };
+  const populate = () => {
     menu.replaceChildren();
     Array.from(select.options).forEach((option) => {
       const item = document.createElement("button");
@@ -305,7 +382,7 @@ function enhanceComparisonSelect(select) {
 
   const open = () => {
     closeCustomSelect();
-    sync();
+    populate();
     positionCustomSelect(trigger, menu);
     trigger.setAttribute("aria-expanded", "true");
     openSelectMenu = { trigger, menu };
@@ -337,12 +414,24 @@ function enhanceComparisonSelect(select) {
     }
   });
   select.addEventListener("change", sync);
-  customSelectInstances.set(select, { trigger, menu });
+  select.addEventListener("invalid", (event) => {
+    event.preventDefault();
+    closeCustomSelect();
+    error.textContent = select.validationMessage;
+    error.hidden = false;
+    trigger.setAttribute("aria-invalid", "true");
+    trigger.setAttribute("aria-describedby", error.id);
+    const firstInvalid = Array.from(select.form?.elements || []).find((control) => control.willValidate && !control.validity.valid);
+    if (firstInvalid === select) trigger.focus();
+  });
+  customSelectInstances.set(select, { trigger, menu, error, sync });
   sync();
 }
 
 function initializeCustomSelects(root = document) {
-  root.querySelectorAll(".comparison-shared-fields select, .comparison-value-row select, .comparison-add-form select").forEach(enhanceComparisonSelect);
+  root.querySelectorAll(".comparison-shared-fields select, .comparison-value-row select, .comparison-add-form select").forEach((select) => {
+    if (!select.closest("[data-comparison-detail]")?.hidden) enhanceComparisonSelect(select);
+  });
 }
 
 // The server renders quoted values with real newlines. Select whole records,
@@ -512,6 +601,14 @@ function setComparisonExpanded(row, expanded) {
   button.setAttribute("aria-expanded", String(expanded));
   row.classList.toggle("is-expanded", expanded);
   detail.hidden = !expanded;
+  if (expanded) {
+    if (!detail.dataset.controlsReady) {
+      row.querySelectorAll("[data-shared-visibility], [data-shared-value-type]").forEach(syncSharedMetadata);
+      detail.dataset.controlsReady = "true";
+    }
+    initializeValueSources(detail);
+    initializeCustomSelects(detail);
+  }
 }
 
 function updateEnvironmentSelection(changedToggle) {
@@ -588,6 +685,10 @@ function initializeGlobalSearch() {
   const input = root?.querySelector("[data-global-search-input]");
   const panel = root?.querySelector("[data-global-search-results]");
   if (!root || !input || !panel) return;
+  const status = document.createElement("span");
+  status.className = "sr-only";
+  status.setAttribute("role", "status");
+  root.append(status);
   let timer;
   let controller;
   let activeIndex = -1;
@@ -605,6 +706,7 @@ function initializeGlobalSearch() {
   const message = (text) => {
     const paragraph = document.createElement("p");
     paragraph.textContent = text;
+    status.textContent = text;
     panel.replaceChildren(paragraph);
     activeIndex = -1;
     setOpen(true);
@@ -616,6 +718,7 @@ function initializeGlobalSearch() {
       message("No authorized configuration keys match this search.");
       return;
     }
+    status.textContent = `${results.length} configuration keys found.`;
     results.forEach((result) => {
       const link = document.createElement("a");
       link.className = "global-search-result";
@@ -642,6 +745,9 @@ function initializeGlobalSearch() {
     }
     controller?.abort();
     controller = new AbortController();
+    const pending = controller;
+    message("Searching configuration keys…");
+    input.setAttribute("aria-busy", "true");
     fetch(`/api/search/keys?q=${encodeURIComponent(query)}`, {
       credentials: "same-origin",
       headers: { Accept: "application/json" },
@@ -651,13 +757,22 @@ function initializeGlobalSearch() {
         if (!response.ok) throw new Error("key search failed");
         return response.json();
       })
-      .then(render)
+      .then((results) => {
+        if (pending === controller && input.value.trim() === query) render(results);
+      })
       .catch((error) => {
-        if (error.name !== "AbortError") message("Search is temporarily unavailable.");
+        if (error.name !== "AbortError" && pending === controller && input.value.trim() === query) message("Search is temporarily unavailable. Try typing again.");
+      })
+      .finally(() => {
+        if (pending === controller) input.removeAttribute("aria-busy");
       });
   };
   input.addEventListener("input", () => {
     window.clearTimeout(timer);
+    controller?.abort();
+    controller = undefined;
+    input.removeAttribute("aria-busy");
+    message(input.value.trim().length >= 2 ? "Searching configuration keys…" : "Type at least two characters.");
     timer = window.setTimeout(search, 180);
   });
   input.addEventListener("focus", () => {
@@ -919,7 +1034,8 @@ document.addEventListener("change", (event) => {
       : null;
     syncSharedMetadata(typeSelect);
     detail?.querySelectorAll(".comparison-value-row [data-value-input]").forEach((current) => {
-      const replacement = valueControl(typeSelect.value, current.value, current.name);
+      const effectiveType = typeSelect.value || current.closest("[data-comparison-environment-card]")?.dataset.currentType;
+      const replacement = valueControl(effectiveType, current.value, current.name);
       if (formId) replacement.setAttribute("form", formId);
       replacement.disabled = current.disabled;
       const customSelect = customSelectInstances.get(current);
@@ -927,6 +1043,7 @@ document.addEventListener("change", (event) => {
         if (openSelectMenu?.trigger === customSelect.trigger) closeCustomSelect();
         customSelect.trigger.remove();
         customSelect.menu.remove();
+        customSelect.error.remove();
       }
       current.replaceWith(replacement);
     });
@@ -940,15 +1057,17 @@ document.addEventListener("change", (event) => {
     : form?.querySelector('[name="value_0"]');
   if (!current) return;
   const replacement = valueControl(typeSelect.value, current.value, current.name);
+  replacement.disabled = current.disabled;
   const customSelect = customSelectInstances.get(current);
   if (customSelect) {
     if (openSelectMenu?.trigger === customSelect.trigger) closeCustomSelect();
     customSelect.trigger.remove();
     customSelect.menu.remove();
+    customSelect.error.remove();
   }
   current.replaceWith(replacement);
   initializeCustomSelects(form);
-  (customSelectInstances.get(replacement)?.trigger || replacement).focus();
+  if (!replacement.disabled) (customSelectInstances.get(replacement)?.trigger || replacement).focus();
 });
 
 document.addEventListener("input", (event) => {
@@ -986,12 +1105,12 @@ document.addEventListener("DOMContentLoaded", () => {
   updateThemeControls();
   initializeLineNumbers();
   initializeApplicationShell();
+  initializeValueConstraints();
   initializeGlobalSearch();
   initializeServiceCatalog();
   initializeCardToolDialogs();
   initializeEnvironmentSelector();
   initializeValueSources();
-  initializeSharedMetadata();
   initializeRequestBuilders();
   initializeCustomSelects();
   initializeSharedUpdates();
@@ -999,5 +1118,7 @@ document.addEventListener("DOMContentLoaded", () => {
 });
 
 window.addEventListener("resize", closeCustomSelect);
-window.addEventListener("scroll", closeCustomSelect, true);
+window.addEventListener("scroll", (event) => {
+  if (!(event.target instanceof Element && event.target.closest(".custom-select-menu"))) closeCustomSelect();
+}, true);
 }());

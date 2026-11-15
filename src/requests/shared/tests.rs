@@ -129,6 +129,24 @@ async fn metadata_normalization_skips_matching_rows_and_rename_covers_all() {
         .execute(&pool)
         .await
         .unwrap();
+    let mut preserved = input.clone();
+    preserved.value_type.clear();
+    preserved.visibility.clear();
+    assert_eq!(
+        create_shared_inline_edit(&pool, &crypto, &actor, preserved.clone())
+            .await
+            .unwrap(),
+        0
+    );
+    preserved.values[1].value = "new value".into();
+    assert_eq!(
+        create_shared_inline_edit(&pool, &crypto, &actor, preserved)
+            .await
+            .unwrap(),
+        1
+    );
+    let proposed_type: String = sqlx::query_scalar("SELECT proposed_value_type FROM change_request_items i JOIN change_requests r ON r.id = i.change_request_id WHERE r.requested_by = 'contributor'").fetch_one(&pool).await.unwrap();
+    assert_eq!(proposed_type, "multiline");
     assert_eq!(
         create_shared_inline_edit(&pool, &crypto, &actor, input.clone())
             .await

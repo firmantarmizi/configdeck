@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+mod noop;
 mod review;
 mod shared;
 pub use review::{DeletedPreviewItem, EditablePreviewItem, PreviewEdit, PreviewLine, edit_preview};
@@ -161,7 +162,7 @@ struct WorkflowRequestRow {
     preview_fingerprint: Option<Vec<u8>>,
 }
 
-#[derive(Clone, Debug, FromRow)]
+#[derive(Clone, Debug, FromRow, PartialEq, Eq)]
 struct CurrentRow {
     id: String,
     key: String,
@@ -306,6 +307,8 @@ pub async fn create(
     let (active_dek_version, dek) =
         environments::active_dek(pool, crypto, &input.environment_id).await?;
     let active_dek_version_i64 = i64::try_from(active_dek_version).map_err(|_| AppError::Crypto)?;
+    let snapshot =
+        noop::Snapshot::capture(pool, &input.environment_id, active_dek_version_i64).await?;
     let mut keys = HashSet::with_capacity(input.items.len());
     let mut prepared = Vec::with_capacity(input.items.len());
     let mut next_order = crate::variables::next_display_order(pool, &input.environment_id).await?;
@@ -326,6 +329,7 @@ pub async fn create(
             next_order += 1;
         }
         let item_id = Uuid::new_v4().to_string();
+        let proposed_value = input_item.value.clone().map(Zeroizing::new);
         let item = prepare_item(
             crypto,
             &environment,
@@ -338,7 +342,15 @@ pub async fn create(
             existing,
             &dek,
         )?;
-        prepared.push(item);
+        if !snapshot.unchanged(
+            crypto,
+            &environment,
+            &item,
+            proposed_value.as_deref().map(String::as_str),
+            &dek,
+        )? {
+            prepared.push(item);
+        }
     }
     if title.is_none() {
         title = Some(default_request_title(&prepared));
@@ -352,7 +364,14 @@ pub async fn create(
         "REQUESTED"
     };
     let now = now_rfc3339()?;
-    let mut transaction = pool.begin().await?;
+    let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
+    snapshot
+        .validate(&mut transaction, &input.environment_id)
+        .await?;
+    if prepared.is_empty() {
+        transaction.commit().await?;
+        return Err(AppError::NoChanges);
+    }
     sqlx::query(
         "INSERT INTO change_requests(id, service_id, environment_id, title, reason, status, requested_by, requested_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
     )
@@ -523,8 +542,16 @@ fn validate_shared_inline_edit(
         service_id: input.service_id,
         current_key: validate_key(&input.current_key)?,
         new_key: validate_key(&input.new_key)?,
-        visibility: validate_visibility(&input.visibility)?.to_owned(),
-        value_type: validate_value_type(&input.value_type)?.to_owned(),
+        visibility: if input.visibility.is_empty() {
+            String::new()
+        } else {
+            validate_visibility(&input.visibility)?.to_owned()
+        },
+        value_type: if input.value_type.is_empty() {
+            String::new()
+        } else {
+            validate_value_type(&input.value_type)?.to_owned()
+        },
         reason: validate_reason(&input.reason)?,
         values,
     })
@@ -537,6 +564,7 @@ async fn prepare_shared_request(
     input: &ValidatedSharedInlineEdit,
     environment_id: &str,
     expected_variable_id: &str,
+    metadata: (&str, &str),
 ) -> Result<PreparedSharedRequest, AppError> {
     let submitted = input
         .values
@@ -564,8 +592,8 @@ async fn prepare_shared_request(
         key: input.new_key.clone(),
         value: (submitted.value_source != "OPERATOR_PROVIDED").then(|| submitted.value.clone()),
         value_source: Some(submitted.value_source.clone()),
-        visibility: Some(input.visibility.clone()),
-        value_type: Some(input.value_type.clone()),
+        visibility: Some(metadata.0.to_owned()),
+        value_type: Some(metadata.1.to_owned()),
         description: submitted.description.clone(),
         group_name: source_group,
         display_order: Some(source_order),

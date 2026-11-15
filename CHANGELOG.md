@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.1.5
+
+- Make custom dropdown validation visible and keyboard-focusable; add contextual field labels in comparison, import reviews, and manual-copy preview.
+- Improve action/input contrast in both themes, touch targets, reduced-motion handling, and narrow comparison layouts. Keep the current breadcrumb visible with a parent-page menu when needed.
+- Explain invalid requested values without reflecting plaintext; align browser URL validation with HTTP(S), announce search progress, and ignore stale search responses.
+- Replace ambiguous table placeholders and remove the decorative dot background.
+
+- Fix multi-key request submission after changing the type of an operator-provided value.
+- Let bulk request reviewers explicitly choose operator fulfillment per key while preserving literal empty pasted values.
+- Keep header breadcrumbs on one line and give search its own row at intermediate screen widths.
+- Patch ctutils, Tokio, rustix and SQLite audit findings; remove unused Askama config-file support. Temporarily pin official SQLx revision 10462fa4414c6c7f1ed1d39bb31678e3b726878c until a compatible registry release is available.
+
+- Skip identical public UPDATE items from manual and bulk requests; retain existing type, visibility, description, and group defaults during request import. Entirely unchanged submissions create no request or mutation audit.
+- Keep each group together when group positions tie. Preserve different per-environment types/visibility until explicitly changed.
+- Reduce comparison-page startup work by initializing expanded controls and dropdown choices only when needed, and sharing event handlers. Reuse environment keys during public list rendering and aggregate group positions once.
+
 ## 0.1.4
 
 - Request updates from the comparison workspace only for changed environments. Skip identical public values and untouched masked values, show the affected environment count, and reject stale form versions before recording requests.

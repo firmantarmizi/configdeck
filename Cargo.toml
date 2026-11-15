@@ -1,6 +1,6 @@
 [package]
 name = "configdeck"
-version = "0.1.4"
+version = "0.1.5"
 authors = ["Firman Tarmizi"]
 edition = "2024"
 rust-version = "1.94"
@@ -15,7 +15,7 @@ publish = false
 [dependencies]
 anyhow = "1.0"
 argon2 = { version = "0.5", features = ["std"] }
-askama = "0.16"
+askama = { version = "0.16", default-features = false, features = ["derive", "std", "urlencode"] }
 axum = { version = "0.8", features = ["form", "http1", "json", "multipart", "tokio"] }
 base64 = "0.23"
 chacha20poly1305 = "0.11"
@@ -31,7 +31,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha1 = "0.11"
 sha2 = "0.11"
-sqlx = { version = "0.9", default-features = false, features = ["derive", "macros", "migrate", "runtime-tokio", "sqlite"] }
+sqlx = { version = "0.9", git = "https://github.com/launchbadge/sqlx", rev = "10462fa4414c6c7f1ed1d39bb31678e3b726878c", default-features = false, features = ["derive", "macros", "migrate", "runtime-tokio", "sqlite"] }
 subtle = "2.6"
 thiserror = "2.0"
 time = { version = "0.3", features = ["formatting", "parsing"] }

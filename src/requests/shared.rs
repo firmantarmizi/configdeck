@@ -121,9 +121,19 @@ pub(super) async fn create_changed(
             .filter(|value| value.variable_id == target.id && value.base_version == target.version)
             .ok_or(AppError::Conflict)?;
         submitted.description = validate_description(submitted.description.take())?;
+        let visibility = if input.visibility.is_empty() {
+            &target.visibility
+        } else {
+            &input.visibility
+        };
+        let value_type = if input.value_type.is_empty() {
+            &target.value_type
+        } else {
+            &input.value_type
+        };
         let metadata_changed = input.current_key != input.new_key
-            || input.visibility != target.visibility
-            || input.value_type != target.value_type
+            || *visibility != target.visibility
+            || *value_type != target.value_type
             || submitted.description != target.description;
         match submitted.value_source.as_str() {
             "KEEP_CURRENT" if !metadata_changed => continue,
@@ -131,7 +141,7 @@ pub(super) async fn create_changed(
             _ => return Err(AppError::InvalidRequest),
         }
         if submitted.value_source == "REQUESTER_PROVIDED" {
-            validate_value(&submitted.value, &input.value_type)?;
+            validate_value(&submitted.value, value_type)?;
         }
         if public && submitted.value_source != "OPERATOR_PROVIDED" {
             let value = current_public_value(pool, crypto, &input.service_id, target).await?;
@@ -160,6 +170,7 @@ pub(super) async fn create_changed(
                 &input,
                 &target.environment_id,
                 &target.id,
+                (visibility, value_type),
             )
             .await?,
         );

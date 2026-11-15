@@ -1,0 +1,9 @@
+{% extends "app_base.html" %}
+{% block title %}Check requested values · ConfigDeck{% endblock %}
+{% block content %}
+<nav class="breadcrumbs" aria-label="Breadcrumb"><a href="/services">Configurations</a><span>/</span><a href="/services/{{ environment.service_id }}/environments">{{ environment.service_name }}</a><span>/</span><span>Check requested values</span></nav>
+<div class="hero-heading compact-heading"><div><h1>Check requested values</h1><p class="lead">No changes were saved. Correct the value format or choose Operator provides it for these keys.</p></div></div>
+<section class="error-panel" role="alert" aria-labelledby="value-error-title"><h2 id="value-error-title">Value format issues</h2><ul>{% for issue in issues %}<li><code>{{ issue.key }}</code>: {{ issue.message }}</li>{% endfor %}</ul></section>
+<p>Use your browser's Back button to correct the request. If the form is no longer available, start again. Submitted values are not shown on this page.</p>
+<a class="button-link secondary" href="{{ restart_path }}">Start request again</a>
+{% endblock %}
